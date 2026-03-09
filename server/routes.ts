@@ -1,8 +1,12 @@
 import type { Express } from "express";
 import type { Server } from "http";
+import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { api } from "@shared/routes";
 import { z } from "zod";
+
+// WebSocket connection manager for ESP8266 devices
+const deviceConnections = new Map<string, WebSocket>();
 
 // Helper function to calculate Euclidean distance between two vectors
 function euclideanDistance(v1: number[], v2: number[]): number {
@@ -23,6 +27,127 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  
+  // Setup WebSocket server for real ESP8266 device communication
+  const wss = new WebSocketServer({ server: httpServer, path: "/ws/device" });
+  
+  wss.on("connection", (ws: WebSocket, req) => {
+    const deviceId = new URL(`http://${req.headers.host}${req.url}`).searchParams.get("deviceId") || `device-${Date.now()}`;
+    console.log(`[WebSocket] Device connected: ${deviceId}`);
+    deviceConnections.set(deviceId, ws);
+    
+    ws.send(JSON.stringify({ type: "connected", deviceId, message: "Connected to attendance system" }));
+    
+    ws.on("message", async (data) => {
+      try {
+        const message = JSON.parse(data.toString());
+        
+        // Handle RFID scan from ESP8266 device
+        if (message.type === "rfid_scan") {
+          const { rfidUid, faceDescriptor } = message;
+          const now = new Date();
+          const todayDate = now.toISOString().split('T')[0];
+          
+          // Identify employee by RFID
+          const employee = await storage.getEmployeeByRfid(rfidUid);
+          
+          if (!employee) {
+            ws.send(JSON.stringify({
+              type: "scan_result",
+              success: false,
+              message: "Unknown RFID card rejected.",
+              rfidUid
+            }));
+            return;
+          }
+          
+          // Face verification
+          let confidence = 0;
+          let faceMatched = false;
+          
+          if (faceDescriptor && employee.faceDescriptor) {
+            const distance = euclideanDistance(faceDescriptor, employee.faceDescriptor as number[]);
+            confidence = calculateMatchConfidence(distance);
+            faceMatched = confidence > 0.6;
+          } else {
+            faceMatched = false;
+          }
+          
+          if (!faceMatched) {
+            const attendance = await storage.createAttendance({
+              employeeId: employee.id,
+              date: todayDate,
+              entryTime: now,
+              verificationStatus: "FAILED_FACE",
+              deviceId
+            });
+            
+            ws.send(JSON.stringify({
+              type: "scan_result",
+              success: false,
+              message: "Face verification failed. Access denied.",
+              employee: { id: employee.id, name: employee.name },
+              matchConfidence: confidence,
+              rfidUid
+            }));
+            return;
+          }
+          
+          // Mark Entry or Exit
+          const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
+          
+          if (openEntry) {
+            // Mark EXIT
+            const workingHoursMs = now.getTime() - (openEntry.entryTime?.getTime() || now.getTime());
+            const workingHours = workingHoursMs / (1000 * 60 * 60);
+            
+            const attendance = await storage.updateAttendance(openEntry.id, {
+              exitTime: now,
+              workingHours: Number(workingHours.toFixed(2)),
+              verificationStatus: "EXIT"
+            });
+            
+            ws.send(JSON.stringify({
+              type: "scan_result",
+              success: true,
+              message: "Exit marked successfully.",
+              action: "EXIT",
+              employee: { id: employee.id, name: employee.name },
+              matchConfidence: confidence,
+              rfidUid
+            }));
+          } else {
+            // Mark ENTRY
+            const attendance = await storage.createAttendance({
+              employeeId: employee.id,
+              date: todayDate,
+              entryTime: now,
+              verificationStatus: "ENTRY",
+              deviceId
+            });
+            
+            ws.send(JSON.stringify({
+              type: "scan_result",
+              success: true,
+              message: "Entry marked successfully.",
+              action: "ENTRY",
+              employee: { id: employee.id, name: employee.name },
+              matchConfidence: confidence,
+              rfidUid
+            }));
+          }
+        }
+      } catch (error) {
+        console.error("[WebSocket] Error processing message:", error);
+        ws.send(JSON.stringify({ type: "error", message: "Error processing request" }));
+      }
+    });
+    
+    ws.on("close", () => {
+      console.log(`[WebSocket] Device disconnected: ${deviceId}`);
+      deviceConnections.delete(deviceId);
+    });
+  });
   
   // Seed Database on startup if empty
   setTimeout(async () => {
