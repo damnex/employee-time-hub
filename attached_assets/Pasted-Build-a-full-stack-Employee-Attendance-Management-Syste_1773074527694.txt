@@ -1,0 +1,193 @@
+Build a full-stack **Employee Attendance Management System** designed for a large industry with up to **14,000 employees**. The system must support **RFID-based identification and camera-based face verification running in parallel**, and it must calculate **entry time, exit time, and working hours in real time**.
+
+The entire project should be implemented as a **production-style web application**.
+
+Use the following technology stack:
+
+Backend:
+Python with **FastAPI**
+
+Frontend:
+HTML, CSS, JavaScript (clean dashboard UI)
+
+Database:
+**PostgreSQL** with SQLAlchemy ORM
+
+Face Recognition:
+Python using **OpenCV + face_recognition library**
+
+RFID Integration:
+Accept UID input from an RFID device through an API endpoint.
+
+Time System:
+Use the **server's real-time clock synchronized with NTP**.
+
+The project must include the following modules:
+
+1. Employee Registration Module
+   Create a page where an admin can register a new employee.
+   Fields:
+
+* employee_id
+* employee_name
+* department
+* phone
+* email
+* RFID UID
+* face image capture from camera
+
+During registration:
+
+* Capture multiple face images
+* Convert them to face encodings
+* Store encoding in the database.
+
+2. Database Schema
+
+Create the following tables:
+
+Employees table:
+
+* id (primary key)
+* employee_code
+* name
+* department
+* rfid_uid
+* face_encoding
+* created_at
+
+Attendance table:
+
+* id
+* employee_id
+* date
+* entry_time
+* exit_time
+* working_hours
+* verification_status
+* device_id
+
+Devices table:
+
+* device_id
+* location
+* device_type
+
+3. RFID Scanning API
+
+Create an endpoint:
+
+POST /scan-rfid
+
+Input JSON:
+{
+"rfid_uid": "string",
+"device_id": "string"
+}
+
+Flow:
+
+* identify employee by RFID UID
+* capture camera frame
+* run face recognition
+* verify identity
+
+Both RFID verification and face verification must run **in parallel**.
+
+If verification succeeds:
+
+* mark entry or exit automatically.
+
+Logic:
+If employee has no entry today → mark ENTRY
+If entry exists but no exit → mark EXIT
+
+Calculate working hours automatically.
+
+4. Face Verification System
+
+When RFID scan occurs:
+
+* capture camera frame
+* detect face
+* compare with stored encoding
+* allow attendance only if match confidence > 0.6.
+
+5. Working Hours Calculation
+
+working_hours = exit_time - entry_time
+
+Example record:
+
+Employee: John
+Entry: 09:05
+Exit: 17:40
+Hours: 8.35
+
+6. Admin Dashboard
+
+Build a dashboard with:
+
+Employee Management
+
+* add employee
+* edit employee
+* deactivate employee
+
+Attendance Monitoring
+
+* live gate activity
+* today's attendance
+* employee search
+
+Reports
+
+* daily report
+* monthly report
+* export CSV or Excel
+
+7. Real-Time Activity Panel
+
+Show:
+
+Employee name
+Scan time
+Entry or exit status
+Verification status
+
+8. Security
+
+* Reject unknown RFID
+* Reject face mismatch
+* Log suspicious attempts.
+
+9. Project Structure
+
+Create the following project structure:
+
+/backend
+main.py
+database.py
+models.py
+attendance_service.py
+face_verification.py
+
+/frontend
+dashboard.html
+register_employee.html
+attendance_table.html
+
+/static
+css
+js
+
+10. Performance Requirements
+
+System must support:
+
+* up to 14,000 employees
+* multiple gate devices
+* face verification under 500ms.
+
+Ensure the code is modular and production-ready.
+Provide full implementation for backend, database models, API routes, and frontend dashboard pages.
