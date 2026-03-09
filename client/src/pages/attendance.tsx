@@ -6,6 +6,15 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Clock3, CalendarDays } from "lucide-react";
 
+function formatWorkingDuration(workingHours: number) {
+  const totalSeconds = Math.max(0, Math.round(workingHours * 60 * 60));
+  const hours = Math.floor(totalSeconds / 3600);
+  const remainingSeconds = totalSeconds % 3600;
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = remainingSeconds % 60;
+  return `${hours}h ${minutes}m ${seconds}s`;
+}
+
 export default function Attendance() {
   const { data: logs, isLoading } = useAttendances();
 
@@ -26,7 +35,7 @@ export default function Attendance() {
                 <TableHead>Event Status</TableHead>
                 <TableHead>Entry Time</TableHead>
                 <TableHead>Exit Time</TableHead>
-                <TableHead>Total Hours</TableHead>
+                <TableHead>Total Time</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -86,7 +95,7 @@ export default function Attendance() {
                       </TableCell>
                       <TableCell>
                         {log.workingHours != null ? (
-                          <span className="font-mono font-medium">{log.workingHours.toFixed(2)}h</span>
+                          <span className="font-mono font-medium">{formatWorkingDuration(log.workingHours)}</span>
                         ) : <span className="text-muted-foreground">-</span>}
                       </TableCell>
                     </TableRow>

@@ -7,125 +7,207 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Camera, Scan, KeyRound, AlertCircle, CheckCircle2, Wifi, WifiOff } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { averageFaceSamples, captureFaceSample } from "@/lib/biometrics";
+
+const GATE_DEVICE_ID = "GATE-TERMINAL-01";
+const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
+const GATE_FACE_SAMPLE_COUNT = 3;
+const GATE_FACE_SAMPLE_DELAY_MS = 140;
 
 export default function GateSimulator() {
   const [rfidUid, setRfidUid] = useState("");
-  const [useRealCamera, setUseRealCamera] = useState(true);
-  const [useRealDevice, setUseRealDevice] = useState(true);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [cameraActive, setCameraActive] = useState(false);
-  const [lastResult, setLastResult] = useState<{success: boolean, message: string, employee?: {name: string}} | null>(null);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [cameraRetryToken, setCameraRetryToken] = useState(0);
+  const [isSamplingFace, setIsSamplingFace] = useState(false);
+  const [readerMessage, setReaderMessage] = useState<string | null>(null);
+  const [readerSourceDeviceId, setReaderSourceDeviceId] = useState<string | null>(null);
+  const [liveTapUid, setLiveTapUid] = useState<string | null>(null);
+  const [lastResult, setLastResult] = useState<{
+    success: boolean;
+    message: string;
+    employee?: { name: string };
+    matchConfidence?: number;
+  } | null>(null);
   
   const scanMutation = useScanRFID();
-  const { isConnected, lastScanResult, sendRFIDScan, clearResult } = useDeviceWS("GATE-TERMINAL-01");
+  const { isConnected, lastScanResult, clearResult } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
 
   // Initialize real camera
   useEffect(() => {
-    if (!useRealCamera) return;
+    let stream: MediaStream | null = null;
+    let cancelled = false;
 
     const initCamera = async () => {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        setCameraActive(false);
+        setCameraError("This browser does not support camera access.");
+        return;
+      }
+
+      setCameraActive(false);
+      setCameraError(null);
+
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 } },
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: "user",
+          },
           audio: false
         });
-        
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          setCameraActive(true);
+
+        if (cancelled) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
         }
+
+        if (!videoRef.current) {
+          setCameraError("Camera preview could not be attached.");
+          return;
+        }
+
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+        setCameraActive(true);
       } catch (error) {
         console.error("Camera access denied:", error);
-        setUseRealCamera(false);
+        setCameraActive(false);
+        setCameraError("Allow camera access in the browser to show the live feed.");
       }
     };
 
-    initCamera();
+    void initCamera();
 
     return () => {
-      if (videoRef.current && videoRef.current.srcObject) {
-        (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+      cancelled = true;
+
+      if (videoRef.current) {
+        videoRef.current.pause();
+        videoRef.current.srcObject = null;
+      }
+
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
       }
     };
-  }, [useRealCamera]);
+  }, [cameraRetryToken]);
 
-  // Extract face descriptor from camera frame (simulated ML)
-  const extractFaceDescriptor = (): number[] => {
+  const extractFaceDescriptor = (): number[] | null => {
     if (!cameraActive || !videoRef.current || !canvasRef.current) {
-      return Array.from({ length: 128 }, () => Number(Math.random().toFixed(4)));
+      return null;
     }
 
     try {
-      const ctx = canvasRef.current.getContext('2d');
-      if (!ctx) return Array.from({ length: 128 }, () => Number(Math.random().toFixed(4)));
-
-      ctx.drawImage(videoRef.current, 0, 0, 128, 128);
-      const imageData = ctx.getImageData(0, 0, 128, 128);
-      
-      // Simple: convert pixels to normalized vector (128 elements)
-      const descriptor = [];
-      for (let i = 0; i < imageData.data.length; i += 4) {
-        descriptor.push(imageData.data[i] / 255);
-        if (descriptor.length >= 128) break;
-      }
-      
-      while (descriptor.length < 128) {
-        descriptor.push(Math.random());
-      }
-
-      return descriptor.slice(0, 128);
+      const sample = captureFaceSample(videoRef.current, canvasRef.current);
+      return sample?.descriptor ?? null;
     } catch (error) {
       console.error("Error extracting face descriptor:", error);
-      return Array.from({ length: 128 }, () => Number(Math.random().toFixed(4)));
+      return null;
+    }
+  };
+
+  const captureLiveFaceDescriptor = async () => {
+    if (!cameraActive || !videoRef.current || !canvasRef.current) {
+      return null;
+    }
+
+    const descriptors: number[][] = [];
+
+    for (let sampleIndex = 0; sampleIndex < GATE_FACE_SAMPLE_COUNT; sampleIndex++) {
+      const sample = captureFaceSample(videoRef.current, canvasRef.current);
+      if (!sample) {
+        return null;
+      }
+
+      descriptors.push(sample.descriptor);
+
+      if (sampleIndex < GATE_FACE_SAMPLE_COUNT - 1) {
+        await new Promise((resolve) => setTimeout(resolve, GATE_FACE_SAMPLE_DELAY_MS));
+      }
+    }
+
+    return averageFaceSamples(descriptors);
+  };
+
+  const authenticateScan = async (
+    inputUid: string,
+    source: "manual" | "reader" = "manual",
+    sourceDeviceId?: string,
+  ) => {
+    const normalizedUid = inputUid.trim().toUpperCase();
+    if (!normalizedUid || scanMutation.isPending || isSamplingFace) return;
+
+    setIsSamplingFace(true);
+
+    try {
+      const descriptor = await captureLiveFaceDescriptor();
+      if (!descriptor) {
+        setLastResult({
+          success: false,
+          message: "Live camera verification is required before authenticating a badge.",
+        });
+        return;
+      }
+
+      setRfidUid(normalizedUid);
+      if (source === "reader") {
+        setReaderMessage(`Badge ${normalizedUid} detected. Verifying against live face data...`);
+        setLiveTapUid(normalizedUid);
+      }
+
+      const data = await scanMutation.mutateAsync({
+        rfidUid: normalizedUid,
+        deviceId: source === "reader" ? (sourceDeviceId ?? GATE_DEVICE_ID) : GATE_DEVICE_ID,
+        faceDescriptor: descriptor
+      });
+
+      setLastResult({
+        success: data.success,
+        message: data.message,
+        employee: data.employee,
+        matchConfidence: data.matchConfidence,
+      });
+
+      if (data.success) {
+        setRfidUid("");
+      }
+    } catch (error) {
+      setLastResult({
+        success: false,
+        message: error instanceof Error ? error.message : "Authentication failed.",
+      });
+    } finally {
+      setIsSamplingFace(false);
     }
   };
 
   const handleScan = () => {
-    if (!rfidUid.trim()) return;
-
-    if (useRealDevice && isConnected) {
-      // Send to real ESP8266 device via WebSocket
-      const descriptor = extractFaceDescriptor();
-      sendRFIDScan(rfidUid.trim(), descriptor);
-      setRfidUid("");
-    } else {
-      // Fallback to HTTP API
-      const faceDescriptor = extractFaceDescriptor();
-      scanMutation.mutate({
-        rfidUid: rfidUid.trim(),
-        deviceId: "GATE-TERMINAL-01",
-        faceDescriptor
-      }, {
-        onSuccess: (data) => {
-          setLastResult({ success: data.success, message: data.message, employee: data.employee });
-          if (data.success) {
-            setRfidUid("");
-          }
-        },
-        onError: (error) => {
-          setLastResult({ success: false, message: error.message });
-        }
-      });
-    }
+    void authenticateScan(rfidUid, "manual");
   };
 
   // Handle WebSocket scan results
   useEffect(() => {
-    if (lastScanResult?.type === 'scan_result') {
-      setLastResult({
-        success: lastScanResult.success ?? false,
-        message: lastScanResult.message,
-        employee: lastScanResult.employee
-      });
-      
-      if (lastScanResult.success) {
-        setRfidUid("");
+    if (lastScanResult?.type === "rfid_detected") {
+      const detectedUid = lastScanResult.rfidUid?.trim().toUpperCase();
+      if (!detectedUid) {
+        return;
       }
-      
-      // Clear result after 5 seconds
-      const timer = setTimeout(() => clearResult(), 5000);
-      return () => clearTimeout(timer);
+
+      setRfidUid(detectedUid);
+      const sourceDeviceId = lastScanResult.deviceId ?? GATE_DEVICE_ID;
+      setReaderSourceDeviceId(sourceDeviceId);
+      setReaderMessage(
+        sourceDeviceId === GATE_DEVICE_ID
+          ? (lastScanResult.message || "Badge detected from physical reader.")
+          : `Badge detected from ${sourceDeviceId}. Processing it on this gate terminal.`,
+      );
+      void authenticateScan(detectedUid, "reader", sourceDeviceId);
+      clearResult();
+      return;
     }
   }, [lastScanResult, clearResult]);
 
@@ -164,31 +246,44 @@ export default function GateSimulator() {
           {/* Real/Simulated Webcam View */}
           <div className="space-y-2">
             <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider text-center">
-              {cameraActive ? 'Live Camera Feed' : 'Camera Feed (Simulated)'}
+              {cameraActive ? 'Live Camera Feed' : cameraError ? 'Camera Permission Required' : 'Starting Camera'}
             </div>
             <div className="aspect-video bg-black rounded-xl border border-border flex flex-col items-center justify-center relative overflow-hidden group">
-              {cameraActive ? (
+              <video
+                ref={videoRef}
+                autoPlay
+                muted
+                playsInline
+                className={`w-full h-full object-cover transition-opacity duration-300 ${cameraActive ? "opacity-100" : "opacity-0"}`}
+              />
+              <canvas
+                ref={canvasRef}
+                width={128}
+                height={128}
+                className="hidden"
+              />
+              {!cameraActive && (
                 <>
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    playsInline
-                    className="w-full h-full object-cover"
-                  />
-                  <canvas
-                    ref={canvasRef}
-                    width={128}
-                    height={128}
-                    className="hidden"
-                  />
-                </>
-              ) : (
-                <>
-                  <Camera className="size-10 text-muted-foreground/40 group-hover:scale-110 transition-transform duration-300" />
+                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+                    <Camera className="size-10 text-muted-foreground/40 group-hover:scale-110 transition-transform duration-300" />
+                    <p className="text-sm text-muted-foreground">
+                      {cameraError ?? "Waiting for browser camera access..."}
+                    </p>
+                    {cameraError && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => setCameraRetryToken((token) => token + 1)}
+                      >
+                        Retry Camera
+                      </Button>
+                    )}
+                  </div>
                   <div className="absolute inset-0 border-2 border-primary/20 rounded-xl m-4 pointer-events-none opacity-50" />
                 </>
               )}
-              {(scanMutation.isPending || (useRealDevice && !isConnected && rfidUid)) && (
+              {(scanMutation.isPending || isSamplingFace) && (
                 <div className="absolute inset-0 bg-primary/10 backdrop-blur-[2px] flex items-center justify-center">
                   <div className="w-16 h-1 bg-primary/80 animate-pulse rounded-full shadow-[0_0_15px_rgba(var(--primary),0.5)]" />
                 </div>
@@ -198,13 +293,47 @@ export default function GateSimulator() {
 
           {/* Form / Inputs */}
           <div className="space-y-4">
+            <div className="rounded-xl border border-border/70 bg-muted/20 p-4 space-y-2">
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="text-muted-foreground">Gate event channel</span>
+                <span className={isConnected ? "text-foreground font-medium" : "text-muted-foreground"}>
+                  {isConnected ? "Listening for reader taps" : "Browser socket offline"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="text-muted-foreground">Preferred device</span>
+                <span className="font-mono text-foreground">{GATE_DEVICE_ID}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="text-muted-foreground">Browser client</span>
+                <span className="font-mono text-foreground">{GATE_BROWSER_CLIENT_ID}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="text-muted-foreground">Last physical tap</span>
+                <span className="font-mono text-foreground">{liveTapUid ?? "--"}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="text-muted-foreground">Face samples / scan</span>
+                <span className="font-mono text-foreground">{GATE_FACE_SAMPLE_COUNT}</span>
+              </div>
+              {readerSourceDeviceId && (
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-muted-foreground">Reader source</span>
+                  <span className="font-mono text-foreground">{readerSourceDeviceId}</span>
+                </div>
+              )}
+              {readerMessage && (
+                <p className="text-sm text-muted-foreground">{readerMessage}</p>
+              )}
+            </div>
+
             <div className="space-y-2">
               <Label htmlFor="rfid" className="flex items-center gap-2 text-foreground/80">
-                <KeyRound className="size-4" /> Tap Badge (RFID UID)
+                <KeyRound className="size-4" /> RFID Badge
               </Label>
               <Input 
                 id="rfid"
-                placeholder="e.g. A1B2C3D4" 
+                placeholder="Tap on the real reader or enter UID manually" 
                 className="font-mono text-lg py-6 text-center tracking-widest bg-background border-2 focus-visible:ring-primary/20"
                 value={rfidUid}
                 onChange={(e) => setRfidUid(e.target.value.toUpperCase())}
@@ -217,9 +346,9 @@ export default function GateSimulator() {
               size="lg" 
               className="w-full h-14 text-lg font-semibold shadow-md active:scale-[0.98] transition-transform" 
               onClick={handleScan}
-              disabled={scanMutation.isPending || !rfidUid.trim()}
+              disabled={scanMutation.isPending || isSamplingFace || !rfidUid.trim() || !cameraActive}
             >
-              {scanMutation.isPending ? "Verifying..." : "Scan & Authenticate"}
+              {isSamplingFace ? "Capturing Face..." : scanMutation.isPending ? "Verifying..." : "Scan & Authenticate"}
             </Button>
           </div>
 
@@ -237,6 +366,11 @@ export default function GateSimulator() {
                 </AlertTitle>
                 <AlertDescription className={lastResult.success ? "text-emerald-700 dark:text-emerald-400" : ""}>
                   {lastResult.message}
+                  {typeof lastResult.matchConfidence === "number" && (
+                    <span className="block mt-1 font-mono">
+                      Match confidence: {(lastResult.matchConfidence * 100).toFixed(1)}%
+                    </span>
+                  )}
                 </AlertDescription>
               </Alert>
             )}

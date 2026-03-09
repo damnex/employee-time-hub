@@ -30,6 +30,11 @@ export const api = {
       path: '/api/employees/:id' as const,
       input: insertEmployeeSchema.partial(),
       responses: { 200: z.custom<typeof employees.$inferSelect>(), 400: errorSchemas.validation, 404: errorSchemas.notFound },
+    },
+    delete: {
+      method: 'DELETE' as const,
+      path: '/api/employees/:id' as const,
+      responses: { 200: z.custom<typeof employees.$inferSelect>(), 404: errorSchemas.notFound },
     }
   },
   attendances: {

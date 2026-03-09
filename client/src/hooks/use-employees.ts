@@ -12,6 +12,8 @@ export function useEmployees() {
       const data = await res.json();
       return api.employees.list.responses[200].parse(data);
     },
+    refetchInterval: 5000,
+    refetchIntervalInBackground: true,
   });
 }
 
@@ -48,5 +50,41 @@ export function useCreateEmployee() {
     onError: (error: Error) => {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
+  });
+}
+
+export function useDeleteEmployee() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+
+  return useMutation({
+    mutationFn: async (employeeId: number) => {
+      const res = await fetch(buildUrl(api.employees.delete.path, { id: employeeId }), {
+        method: api.employees.delete.method,
+        credentials: "include",
+      });
+
+      const resData = await res.json();
+
+      if (!res.ok) {
+        if (res.status === 404) {
+          const error = api.employees.delete.responses[404].parse(resData);
+          throw new Error(error.message || "Employee not found");
+        }
+
+        throw new Error("Failed to delete employee");
+      }
+
+      return api.employees.delete.responses[200].parse(resData);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [api.employees.list.path] });
+      queryClient.invalidateQueries({ queryKey: [api.attendances.list.path] });
+      queryClient.invalidateQueries({ queryKey: [api.stats.dashboard.path] });
+      toast({ title: "Success", description: "Employee deleted successfully." });
+    },
+    onError: (error: Error) => {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    },
   });
 }

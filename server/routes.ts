@@ -5,22 +5,70 @@ import { storage } from "./storage";
 import { api } from "@shared/routes";
 import { z } from "zod";
 
-// WebSocket connection manager for ESP8266 devices
-const deviceConnections = new Map<string, WebSocket>();
+type ClientType = "browser" | "device";
 
-// Helper function to calculate Euclidean distance between two vectors
-function euclideanDistance(v1: number[], v2: number[]): number {
-  if (!v1 || !v2 || v1.length !== v2.length) return Infinity;
-  let sum = 0;
-  for (let i = 0; i < v1.length; i++) {
-    sum += Math.pow(v1[i] - v2[i], 2);
-  }
-  return Math.sqrt(sum);
+interface ClientConnection {
+  ws: WebSocket;
+  deviceId: string;
+  clientType: ClientType;
 }
 
-// Face recognition match confidence (1.0 - distance). Usually distance < 0.6 is a match for FaceNet models
-function calculateMatchConfidence(distance: number): number {
-  return Math.max(0, 1 - distance);
+const activeConnections = new Set<ClientConnection>();
+
+function normalizeDescriptor(descriptor: number[]) {
+  if (!descriptor.length) {
+    return [];
+  }
+
+  const mean =
+    descriptor.reduce((sum, value) => sum + value, 0) / descriptor.length;
+  const centered = descriptor.map((value) => value - mean);
+  const magnitude = Math.sqrt(
+    centered.reduce((sum, value) => sum + value * value, 0),
+  );
+
+  if (!magnitude) {
+    return centered.map(() => 0);
+  }
+
+  return centered.map((value) => value / magnitude);
+}
+
+function calculateMatchConfidence(v1: number[], v2: number[]): number {
+  if (!v1 || !v2 || v1.length !== v2.length || !v1.length) {
+    return 0;
+  }
+
+  const normalizedV1 = normalizeDescriptor(v1);
+  const normalizedV2 = normalizeDescriptor(v2);
+
+  let dotProduct = 0;
+  for (let i = 0; i < normalizedV1.length; i++) {
+    dotProduct += normalizedV1[i] * normalizedV2[i];
+  }
+
+  return Number((((dotProduct + 1) / 2)).toFixed(4));
+}
+
+const FACE_MATCH_THRESHOLD = 0.72;
+
+function broadcastMessage(
+  payload: Record<string, unknown>,
+  predicate?: (connection: ClientConnection) => boolean,
+) {
+  const message = JSON.stringify(payload);
+
+  activeConnections.forEach((connection) => {
+    if (connection.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (predicate && !predicate(connection)) {
+      return;
+    }
+
+    connection.ws.send(message);
+  });
 }
 
 export async function registerRoutes(
@@ -32,19 +80,63 @@ export async function registerRoutes(
   const wss = new WebSocketServer({ server: httpServer, path: "/ws/device" });
   
   wss.on("connection", (ws: WebSocket, req) => {
-    const deviceId = new URL(`http://${req.headers.host}${req.url}`).searchParams.get("deviceId") || `device-${Date.now()}`;
-    console.log(`[WebSocket] Device connected: ${deviceId}`);
-    deviceConnections.set(deviceId, ws);
+    const searchParams = new URL(
+      `http://${req.headers.host}${req.url}`,
+    ).searchParams;
+    const deviceId =
+      searchParams.get("deviceId") || `device-${Date.now()}`;
+    const clientType = (searchParams.get("clientType") === "device"
+      ? "device"
+      : "browser") as ClientType;
+    const connection: ClientConnection = { ws, deviceId, clientType };
+
+    console.log(`[WebSocket] ${clientType} connected: ${deviceId}`);
+    activeConnections.add(connection);
     
-    ws.send(JSON.stringify({ type: "connected", deviceId, message: "Connected to attendance system" }));
+    ws.send(JSON.stringify({
+      type: "connected",
+      deviceId,
+      message: "Connected to attendance system",
+    }));
     
     ws.on("message", async (data) => {
       try {
         const message = JSON.parse(data.toString());
+
+        if (message.type === "rfid_detected") {
+          const rfidUid = String(message.rfidUid || "").trim().toUpperCase();
+
+          if (!rfidUid) {
+            ws.send(JSON.stringify({
+              type: "error",
+              message: "RFID UID is required.",
+            }));
+            return;
+          }
+
+          const mappedEmployee = await storage.getEmployeeByRfid(rfidUid);
+          const payload = {
+            type: "rfid_detected",
+            message: mappedEmployee
+              ? `Badge already mapped to ${mappedEmployee.name}.`
+              : "Badge detected and ready to assign.",
+            rfidUid,
+            available: !mappedEmployee,
+            employee: mappedEmployee
+              ? { id: mappedEmployee.id, name: mappedEmployee.name }
+              : undefined,
+            deviceId,
+          };
+
+          ws.send(JSON.stringify(payload));
+          broadcastMessage(payload, (client) => client.clientType === "browser");
+          return;
+        }
         
         // Handle RFID scan from ESP8266 device
         if (message.type === "rfid_scan") {
-          const { rfidUid, faceDescriptor } = message;
+          const rfidUid = String(message.rfidUid || "").trim().toUpperCase();
+          const { faceDescriptor } = message;
           const now = new Date();
           const todayDate = now.toISOString().split('T')[0];
           
@@ -66,9 +158,11 @@ export async function registerRoutes(
           let faceMatched = false;
           
           if (faceDescriptor && employee.faceDescriptor) {
-            const distance = euclideanDistance(faceDescriptor, employee.faceDescriptor as number[]);
-            confidence = calculateMatchConfidence(distance);
-            faceMatched = confidence > 0.6;
+            confidence = calculateMatchConfidence(
+              faceDescriptor,
+              employee.faceDescriptor as number[],
+            );
+            faceMatched = confidence >= FACE_MATCH_THRESHOLD;
           } else {
             faceMatched = false;
           }
@@ -144,66 +238,48 @@ export async function registerRoutes(
     });
     
     ws.on("close", () => {
-      console.log(`[WebSocket] Device disconnected: ${deviceId}`);
-      deviceConnections.delete(deviceId);
+      console.log(`[WebSocket] ${clientType} disconnected: ${deviceId}`);
+      activeConnections.delete(connection);
     });
   });
   
-  // Seed Database on startup if empty
-  setTimeout(async () => {
-    try {
-      const existing = await storage.getEmployees();
-      if (existing.length === 0) {
-        console.log("Seeding database...");
-        
-        // Add sample device
-        await storage.createDevice({
-          deviceId: "gate-1",
-          location: "Main Entrance",
-          deviceType: "Turnstile"
-        });
+  async function validateEmployeeIdentityConflicts(
+    input: { employeeCode?: string; rfidUid?: string },
+    currentEmployeeId?: number,
+  ) {
+    const employees = await storage.getEmployees();
 
-        // Add sample employees
-        const emp1 = await storage.createEmployee({
-          employeeCode: "EMP001",
-          name: "John Doe",
-          department: "Engineering",
-          email: "john@example.com",
-          phone: "555-0101",
-          rfidUid: "A1B2C3D4",
-          faceDescriptor: Array.from({length: 128}, () => Math.random()),
-          isActive: true
-        });
+    if (input.employeeCode) {
+      const existingByCode = employees.find((employee) => {
+        return employee.employeeCode === input.employeeCode
+          && employee.id !== currentEmployeeId;
+      });
 
-        const emp2 = await storage.createEmployee({
-          employeeCode: "EMP002",
-          name: "Jane Smith",
-          department: "HR",
-          email: "jane@example.com",
-          phone: "555-0102",
-          rfidUid: "E5F6G7H8",
-          faceDescriptor: Array.from({length: 128}, () => Math.random()),
-          isActive: true
-        });
-        
-        // Add sample attendances
-        const today = new Date().toISOString().split('T')[0];
-        const entryTime = new Date();
-        entryTime.setHours(9, 0, 0, 0);
-        
-        await storage.createAttendance({
-          employeeId: emp1.id,
-          date: today,
-          entryTime: entryTime,
-          verificationStatus: "ENTRY",
-          deviceId: "gate-1",
-        });
-
+      if (existingByCode) {
+        return {
+          field: "employeeCode",
+          message: `Employee code already belongs to ${existingByCode.name}.`,
+        };
       }
-    } catch (e) {
-      console.error("Failed to seed database:", e);
     }
-  }, 1000);
+
+    if (input.rfidUid) {
+      const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
+      const existingByRfid = employees.find((employee) => {
+        return employee.rfidUid.toUpperCase() === normalizedRfidUid
+          && employee.id !== currentEmployeeId;
+      });
+
+      if (existingByRfid) {
+        return {
+          field: "rfidUid",
+          message: `RFID badge already mapped to ${existingByRfid.name}.`,
+        };
+      }
+    }
+
+    return null;
+  }
 
   // Employees API
   app.get(api.employees.list.path, async (req, res) => {
@@ -222,6 +298,13 @@ export async function registerRoutes(
   app.post(api.employees.create.path, async (req, res) => {
     try {
       const input = api.employees.create.input.parse(req.body);
+      input.rfidUid = input.rfidUid.trim().toUpperCase();
+
+      const conflict = await validateEmployeeIdentityConflicts(input);
+      if (conflict) {
+        return res.status(400).json(conflict);
+      }
+
       const employee = await storage.createEmployee(input);
       res.status(201).json(employee);
     } catch (err) {
@@ -235,7 +318,17 @@ export async function registerRoutes(
   app.patch(api.employees.update.path, async (req, res) => {
     try {
       const input = api.employees.update.input.parse(req.body);
-      const employee = await storage.updateEmployee(Number(req.params.id), input);
+      if (input.rfidUid) {
+        input.rfidUid = input.rfidUid.trim().toUpperCase();
+      }
+
+      const employeeId = Number(req.params.id);
+      const conflict = await validateEmployeeIdentityConflicts(input, employeeId);
+      if (conflict) {
+        return res.status(400).json(conflict);
+      }
+
+      const employee = await storage.updateEmployee(employeeId, input);
       if (!employee) {
         return res.status(404).json({ message: "Employee not found" });
       }
@@ -248,11 +341,26 @@ export async function registerRoutes(
     }
   });
 
+  app.delete(api.employees.delete.path, async (req, res) => {
+    try {
+      const employeeId = Number(req.params.id);
+      const deletedEmployee = await storage.deleteEmployee(employeeId);
+
+      if (!deletedEmployee) {
+        return res.status(404).json({ message: "Employee not found" });
+      }
+
+      res.json(deletedEmployee);
+    } catch (err) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
   // Attendances API
   app.get(api.attendances.list.path, async (req, res) => {
     try {
-      // @ts-ignore
-      const input = api.attendances.list.input ? api.attendances.list.input.parse(req.query) : req.query;
+      const parsedInput = api.attendances.list.input?.safeParse(req.query);
+      const input = parsedInput?.success ? parsedInput.data : undefined;
       const attendances = await storage.getAttendances(input?.date, input?.employeeId);
       res.json(attendances);
     } catch (err) {
@@ -270,6 +378,7 @@ export async function registerRoutes(
   app.post(api.scan.rfid.path, async (req, res) => {
     try {
       const input = api.scan.rfid.input.parse(req.body);
+      input.rfidUid = input.rfidUid.trim().toUpperCase();
       const now = new Date();
       const todayDate = now.toISOString().split('T')[0];
 
@@ -301,17 +410,12 @@ export async function registerRoutes(
       let faceMatched = false;
 
       if (input.faceDescriptor && employee.faceDescriptor) {
-        // Compare descriptors
-        const distance = euclideanDistance(input.faceDescriptor, employee.faceDescriptor as number[]);
-        confidence = calculateMatchConfidence(distance);
-        
-        // typical threshold for facenet is distance < 0.6, which means confidence > 0.4. Let's use 0.6 as confidence threshold as requested
-        faceMatched = confidence > 0.6;
+        confidence = calculateMatchConfidence(
+          input.faceDescriptor,
+          employee.faceDescriptor as number[],
+        );
+        faceMatched = confidence >= FACE_MATCH_THRESHOLD;
       } else {
-        // If the gate didn't provide a face, or employee has no face enrolled, we might allow it or fail it.
-        // The requirements say "allow attendance only if match confidence > 0.6".
-        // For testing/simulator purposes, if no face was provided by simulator, we simulate success for simplicity? 
-        // No, let's strictly enforce face descriptor check.
         faceMatched = false;
       }
 

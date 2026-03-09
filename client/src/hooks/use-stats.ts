@@ -10,5 +10,7 @@ export function useDashboardStats() {
       const data = await res.json();
       return api.stats.dashboard.responses[200].parse(data);
     },
+    refetchInterval: 3000,
+    refetchIntervalInBackground: true,
   });
 }

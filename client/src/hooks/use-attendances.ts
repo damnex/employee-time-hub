@@ -10,5 +10,7 @@ export function useAttendances() {
       const data = await res.json();
       return api.attendances.list.responses[200].parse(data);
     },
+    refetchInterval: 3000,
+    refetchIntervalInBackground: true,
   });
 }

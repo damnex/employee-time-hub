@@ -4,4 +4,4 @@ lucide-react | Standard icons for the dashboard
 
 ## Notes
 The backend provides /api/stats, /api/employees, /api/attendances, and /api/scan-rfid.
-Face descriptor is simulated on the frontend by generating an array of 128 random numbers.
+Face enrollment now captures a live browser camera feed and derives a deterministic 128-value biometric profile from multiple samples.
