@@ -367,7 +367,7 @@ export default function GateSimulator() {
 
   return (
     <div className="min-h-full bg-[radial-gradient(circle_at_top,_#f8fbff_0%,_#eef5ff_42%,_#e5eefb_100%)] text-slate-950">
-      <div className="mx-auto flex min-h-full max-w-5xl flex-col items-center justify-center px-6 py-10 md:px-8">
+      <div className="mx-auto flex min-h-full max-w-6xl flex-col items-center justify-center px-6 py-10 md:px-8">
         <div className="mb-8 text-center">
         <h1 className="text-3xl font-display font-bold text-slate-950">Gate Terminal</h1>
         <p className="mt-2 max-w-md mx-auto text-slate-600">
@@ -375,7 +375,7 @@ export default function GateSimulator() {
         </p>
       </div>
 
-      <Card className="w-full max-w-md overflow-hidden border border-sky-100 bg-white/90 shadow-[0_24px_80px_rgba(30,64,175,0.12)] backdrop-blur">
+      <Card className="w-full max-w-5xl overflow-hidden border border-sky-100 bg-white/90 shadow-[0_24px_80px_rgba(30,64,175,0.12)] backdrop-blur">
         <div className="flex items-center justify-between bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 p-4 text-white">
           <div className="flex items-center justify-center gap-2">
             <Scan className="size-5" />
@@ -396,19 +396,18 @@ export default function GateSimulator() {
           </div>
         </div>
 
-        <CardContent className="space-y-8 p-8">
-          {/* Real/Simulated Webcam View */}
-          <div className="space-y-2">
-            <div className="text-center text-xs font-medium uppercase tracking-wider text-slate-500">
-              {cameraActive ? 'Live Camera Feed' : cameraError ? 'Camera Permission Required' : 'Starting Camera'}
+        <CardContent className="grid gap-6 p-6 md:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.9fr)] md:gap-8 md:p-8 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.85fr)]">
+          <div className="space-y-3">
+            <div className="text-center text-xs font-medium uppercase tracking-wider text-slate-500 md:text-left">
+              {cameraActive ? "Live Camera Feed" : cameraError ? "Camera Permission Required" : "Starting Camera"}
             </div>
-            <div className="group relative aspect-video overflow-hidden rounded-2xl border border-sky-100 bg-slate-950 shadow-inner">
+            <div className="group relative aspect-[16/9] overflow-hidden rounded-3xl border border-sky-100 bg-slate-950 shadow-inner">
               <video
                 ref={videoRef}
                 autoPlay
                 muted
                 playsInline
-                className={`w-full h-full object-cover transition-opacity duration-300 ${cameraActive ? "opacity-100" : "opacity-0"}`}
+                className={`h-full w-full object-cover transition-opacity duration-300 ${cameraActive ? "opacity-100" : "opacity-0"}`}
               />
               <canvas
                 ref={canvasRef}
@@ -434,18 +433,18 @@ export default function GateSimulator() {
                       </Button>
                     )}
                   </div>
-                  <div className="absolute inset-0 border-2 border-primary/20 rounded-xl m-4 pointer-events-none opacity-50" />
+                  <div className="absolute inset-0 m-4 rounded-xl border-2 border-primary/20 opacity-50 pointer-events-none" />
                 </>
               )}
               <div className="pointer-events-none absolute inset-0">
-                <div className="absolute inset-3">
-                  <div className="absolute left-0 top-0 h-10 w-10 rounded-tl-xl border-l-[3px] border-t-[3px] border-rose-400/80" />
-                  <div className="absolute right-0 top-0 h-10 w-10 rounded-tr-xl border-r-[3px] border-t-[3px] border-rose-400/80" />
-                  <div className="absolute bottom-0 left-0 h-10 w-10 rounded-bl-xl border-b-[3px] border-l-[3px] border-rose-400/80" />
-                  <div className="absolute bottom-0 right-0 h-10 w-10 rounded-br-xl border-b-[3px] border-r-[3px] border-rose-400/80" />
+                <div className="absolute inset-5">
+                  <div className="absolute left-0 top-0 h-12 w-12 rounded-tl-2xl border-l-[3px] border-t-[3px] border-rose-400/80" />
+                  <div className="absolute right-0 top-0 h-12 w-12 rounded-tr-2xl border-r-[3px] border-t-[3px] border-rose-400/80" />
+                  <div className="absolute bottom-0 left-0 h-12 w-12 rounded-bl-2xl border-b-[3px] border-l-[3px] border-rose-400/80" />
+                  <div className="absolute bottom-0 right-0 h-12 w-12 rounded-br-2xl border-b-[3px] border-r-[3px] border-rose-400/80" />
                 </div>
                 <div
-                  className={`absolute inset-x-[22%] inset-y-[18%] rounded-[1.75rem] border-[3px] transition-all duration-300 ease-out ${faceFrameTone}`}
+                  className={`absolute inset-x-[26%] inset-y-[16%] rounded-[2rem] border-[3px] transition-all duration-300 ease-out ${faceFrameTone}`}
                 />
                 {faceBounds && cameraActive && (
                   <div
@@ -459,7 +458,7 @@ export default function GateSimulator() {
                   />
                 )}
               </div>
-              <div className="pointer-events-none absolute inset-x-[22%] inset-y-[18%] rounded-[1.75rem]">
+              <div className="pointer-events-none absolute inset-x-[26%] inset-y-[16%] rounded-[2rem]">
                 <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
                   {frameStatusLabel}
                 </div>
@@ -467,109 +466,119 @@ export default function GateSimulator() {
                 <div className="absolute left-1/2 inset-y-6 w-px -translate-x-1/2 bg-gradient-to-b from-transparent via-rose-300/55 to-transparent" />
               </div>
               {(scanMutation.isPending || isSamplingFace) && (
-                <div className="absolute inset-0 bg-primary/10 backdrop-blur-[2px] flex items-center justify-center">
-                  <div className="w-16 h-1 bg-primary/80 animate-pulse rounded-full shadow-[0_0_15px_rgba(var(--primary),0.5)]" />
+                <div className="absolute inset-0 flex items-center justify-center bg-primary/10 backdrop-blur-[2px]">
+                  <div className="h-1 w-16 animate-pulse rounded-full bg-primary/80 shadow-[0_0_15px_rgba(var(--primary),0.5)]" />
                 </div>
               )}
             </div>
-            <p className="text-center text-xs text-slate-500">{faceGuideMessage}</p>
+            <p className="text-center text-xs text-slate-500 md:text-left">{faceGuideMessage}</p>
           </div>
 
-          {/* Form / Inputs */}
-          <div className="space-y-4">
-            <div className="space-y-2 rounded-2xl border border-slate-200 bg-slate-50/80 p-4">
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-slate-500">Gate event channel</span>
-                <span className={isConnected ? "font-medium text-slate-900" : "text-slate-500"}>
-                  {isConnected ? "Listening for reader taps" : "Browser socket offline"}
+          <div className="flex flex-col gap-4 md:justify-center">
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-slate-900">Gate Status</p>
+                  <p className="text-xs text-slate-500">Real-time reader and face verification state.</p>
+                </div>
+                <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${isConnected ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}>
+                  {isConnected ? "Live" : "Offline"}
                 </span>
               </div>
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-slate-500">Preferred device</span>
-                <span className="font-mono text-slate-900">{GATE_DEVICE_ID}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-slate-500">Browser client</span>
-                <span className="font-mono text-slate-900">{GATE_BROWSER_CLIENT_ID}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-slate-500">Last physical tap</span>
-                <span className="font-mono text-slate-900">{liveTapUid ?? "--"}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-slate-500">Face samples / scan</span>
-                <span className="font-mono text-slate-900">{GATE_FACE_SAMPLE_COUNT}</span>
-              </div>
-              <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-slate-500">Face alignment</span>
-                <span className={faceAlignmentState === "aligned" ? "font-medium text-emerald-600" : "text-rose-500"}>
-                  {faceAlignmentState === "aligned"
-                    ? "Ready"
-                    : faceAlignmentState === "unsupported"
-                      ? "Detector off"
-                      : "Adjust"}
-                </span>
-              </div>
-              {readerSourceDeviceId && (
+              <div className="space-y-2">
                 <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Reader source</span>
-                  <span className="font-mono text-slate-900">{readerSourceDeviceId}</span>
+                  <span className="text-slate-500">Gate event channel</span>
+                  <span className={isConnected ? "font-medium text-slate-900" : "text-slate-500"}>
+                    {isConnected ? "Listening for reader taps" : "Browser socket offline"}
+                  </span>
                 </div>
-              )}
-              {readerMessage && (
-                <p className="text-sm text-slate-600">{readerMessage}</p>
-              )}
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor="rfid" className="flex items-center gap-2 text-slate-700">
-                <KeyRound className="size-4" /> RFID Badge
-              </Label>
-              <Input 
-                id="rfid"
-                placeholder="Tap on the real reader or enter UID manually" 
-                className="bg-white font-mono text-lg tracking-widest text-center py-6 border-2 border-slate-200 focus-visible:ring-primary/20"
-                value={rfidUid}
-                onChange={(e) => setRfidUid(e.target.value.toUpperCase())}
-                disabled={scanMutation.isPending}
-                onKeyDown={(e) => e.key === 'Enter' && handleScan()}
-              />
-            </div>
-            
-            <Button 
-              size="lg" 
-              className="h-14 w-full bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 text-lg font-semibold text-white shadow-md transition-transform active:scale-[0.98]" 
-              onClick={handleScan}
-              disabled={scanMutation.isPending || isSamplingFace || !rfidUid.trim() || !cameraActive}
-            >
-              {isSamplingFace ? "Capturing Face..." : scanMutation.isPending ? "Verifying..." : "Scan & Authenticate"}
-            </Button>
-          </div>
-
-          {/* Results Area */}
-          <div className="min-h-[80px]">
-            {lastResult && (
-              <Alert variant={lastResult.success ? "default" : "destructive"} className={`border-2 ${lastResult.success ? 'border-emerald-200 bg-emerald-50' : 'border-rose-200 bg-rose-50 text-rose-900'}`}>
-                {lastResult.success ? (
-                  <CheckCircle2 className="size-5 text-emerald-600" />
-                ) : (
-                  <AlertCircle className="size-5" />
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Preferred device</span>
+                  <span className="font-mono text-slate-900">{GATE_DEVICE_ID}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Browser client</span>
+                  <span className="font-mono text-slate-900">{GATE_BROWSER_CLIENT_ID}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Last physical tap</span>
+                  <span className="font-mono text-slate-900">{liveTapUid ?? "--"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Face samples / scan</span>
+                  <span className="font-mono text-slate-900">{GATE_FACE_SAMPLE_COUNT}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Face alignment</span>
+                  <span className={faceAlignmentState === "aligned" ? "font-medium text-emerald-600" : "text-rose-500"}>
+                    {faceAlignmentState === "aligned"
+                      ? "Ready"
+                      : faceAlignmentState === "unsupported"
+                        ? "Detector off"
+                        : "Adjust"}
+                  </span>
+                </div>
+                {readerSourceDeviceId && (
+                  <div className="flex items-center justify-between gap-3 text-sm">
+                    <span className="text-slate-500">Reader source</span>
+                    <span className="font-mono text-slate-900">{readerSourceDeviceId}</span>
+                  </div>
                 )}
-                <AlertTitle className={lastResult.success ? "font-bold text-emerald-800" : "font-bold"}>
-                  {lastResult.success ? "Access Granted" : "Access Denied"}
-                </AlertTitle>
-                <AlertDescription className={lastResult.success ? "text-emerald-700" : ""}>
-                  {lastResult.message}
-                  {typeof lastResult.matchConfidence === "number" && (
-                    <span className="block mt-1 font-mono">
-                      Match confidence: {(lastResult.matchConfidence * 100).toFixed(1)}%
-                    </span>
-                  )}
-                </AlertDescription>
-              </Alert>
-            )}
-          </div>
+              </div>
+              {readerMessage && (
+                <p className="mt-3 text-sm text-slate-600">{readerMessage}</p>
+              )}
+            </div>
 
+            <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+              <div className="space-y-2">
+                <Label htmlFor="rfid" className="flex items-center gap-2 text-slate-700">
+                  <KeyRound className="size-4" /> RFID Badge
+                </Label>
+                <Input
+                  id="rfid"
+                  placeholder="Tap on the real reader or enter UID manually"
+                  className="border-2 border-slate-200 bg-white py-6 text-center font-mono text-lg tracking-widest focus-visible:ring-primary/20"
+                  value={rfidUid}
+                  onChange={(e) => setRfidUid(e.target.value.toUpperCase())}
+                  disabled={scanMutation.isPending}
+                  onKeyDown={(e) => e.key === "Enter" && handleScan()}
+                />
+              </div>
+
+              <Button
+                size="lg"
+                className="h-14 w-full bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 text-lg font-semibold text-white shadow-md transition-transform active:scale-[0.98]"
+                onClick={handleScan}
+                disabled={scanMutation.isPending || isSamplingFace || !rfidUid.trim() || !cameraActive}
+              >
+                {isSamplingFace ? "Capturing Face..." : scanMutation.isPending ? "Verifying..." : "Scan & Authenticate"}
+              </Button>
+            </div>
+
+            <div className="min-h-[88px]">
+              {lastResult && (
+                <Alert variant={lastResult.success ? "default" : "destructive"} className={`border-2 ${lastResult.success ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50 text-rose-900"}`}>
+                  {lastResult.success ? (
+                    <CheckCircle2 className="size-5 text-emerald-600" />
+                  ) : (
+                    <AlertCircle className="size-5" />
+                  )}
+                  <AlertTitle className={lastResult.success ? "font-bold text-emerald-800" : "font-bold"}>
+                    {lastResult.success ? "Access Granted" : "Access Denied"}
+                  </AlertTitle>
+                  <AlertDescription className={lastResult.success ? "text-emerald-700" : ""}>
+                    {lastResult.message}
+                    {typeof lastResult.matchConfidence === "number" && (
+                      <span className="mt-1 block font-mono">
+                        Match confidence: {(lastResult.matchConfidence * 100).toFixed(1)}%
+                      </span>
+                    )}
+                  </AlertDescription>
+                </Alert>
+              )}
+            </div>
+          </div>
         </CardContent>
       </Card>
       </div>
