@@ -14,6 +14,31 @@ const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
 const GATE_FACE_SAMPLE_COUNT = 3;
 const GATE_FACE_SAMPLE_DELAY_MS = 140;
 
+type FaceAlignmentState =
+  | "unsupported"
+  | "searching"
+  | "aligned"
+  | "off-center"
+  | "no-face"
+  | "multiple";
+
+type DetectedFaceLike = {
+  boundingBox: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+};
+
+declare global {
+  interface Window {
+    FaceDetector?: new (options?: { fastMode?: boolean; maxDetectedFaces?: number }) => {
+      detect: (source: CanvasImageSource) => Promise<DetectedFaceLike[]>;
+    };
+  }
+}
+
 export default function GateSimulator() {
   const [rfidUid, setRfidUid] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -22,6 +47,8 @@ export default function GateSimulator() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryToken, setCameraRetryToken] = useState(0);
   const [isSamplingFace, setIsSamplingFace] = useState(false);
+  const [faceAlignmentState, setFaceAlignmentState] = useState<FaceAlignmentState>("searching");
+  const [faceBounds, setFaceBounds] = useState<DetectedFaceLike["boundingBox"] | null>(null);
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [readerSourceDeviceId, setReaderSourceDeviceId] = useState<string | null>(null);
   const [liveTapUid, setLiveTapUid] = useState<string | null>(null);
@@ -31,9 +58,44 @@ export default function GateSimulator() {
     employee?: { name: string };
     matchConfidence?: number;
   } | null>(null);
-  
+
   const scanMutation = useScanRFID();
   const { isConnected, lastScanResult, clearResult } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
+  const faceFrameTone = !cameraActive
+    ? "border-slate-300 shadow-none"
+    : lastResult?.success
+      ? "border-emerald-400 shadow-[0_0_0_1px_rgba(74,222,128,0.85),0_0_30px_rgba(74,222,128,0.32)]"
+      : lastResult
+        ? "border-rose-400 shadow-[0_0_0_1px_rgba(251,113,133,0.85),0_0_30px_rgba(251,113,133,0.28)]"
+        : isSamplingFace || scanMutation.isPending
+          ? "border-amber-300 shadow-[0_0_0_1px_rgba(253,224,71,0.75),0_0_24px_rgba(253,224,71,0.22)]"
+          : faceAlignmentState === "aligned"
+            ? "border-emerald-400/80 shadow-[0_0_0_1px_rgba(74,222,128,0.72),0_0_24px_rgba(74,222,128,0.2)]"
+            : "border-rose-400/80 shadow-[0_0_0_1px_rgba(251,113,133,0.72),0_0_24px_rgba(251,113,133,0.18)]";
+  const frameStatusLabel = !cameraActive
+    ? "CAMERA OFF"
+    : lastResult?.success
+      ? "MATCHED"
+      : lastResult
+        ? "RETRY"
+        : isSamplingFace || scanMutation.isPending
+          ? "SCANNING"
+          : faceAlignmentState === "aligned"
+            ? "ALIGNMENT OK"
+            : "ALIGN FACE";
+  const faceGuideMessage = !cameraActive
+    ? cameraError ?? "Waiting for browser camera access..."
+    : faceAlignmentState === "unsupported"
+      ? "Face detector is unavailable in this browser. Matching can still run, but alignment guidance is limited."
+      : faceAlignmentState === "multiple"
+        ? "Keep only one face inside the frame."
+        : faceAlignmentState === "off-center"
+          ? "Center your face inside the green guide."
+          : faceAlignmentState === "no-face"
+            ? "Face not detected. Step into the camera frame."
+            : faceAlignmentState === "aligned"
+              ? "Face detected and aligned."
+              : "Searching for face alignment...";
 
   // Initialize real camera
   useEffect(() => {
@@ -96,6 +158,90 @@ export default function GateSimulator() {
     };
   }, [cameraRetryToken]);
 
+  useEffect(() => {
+    if (!cameraActive || !videoRef.current) {
+      setFaceAlignmentState((current) => (current === "unsupported" ? current : "searching"));
+      setFaceBounds(null);
+      return;
+    }
+
+    if (!window.FaceDetector) {
+      setFaceAlignmentState("unsupported");
+      setFaceBounds(null);
+      return;
+    }
+
+    let cancelled = false;
+    const detector = new window.FaceDetector({
+      fastMode: true,
+      maxDetectedFaces: 2,
+    });
+
+    const detectFace = async () => {
+      if (!videoRef.current || videoRef.current.readyState < 2) {
+        return;
+      }
+
+      try {
+        const faces = await detector.detect(videoRef.current);
+        if (cancelled) {
+          return;
+        }
+
+        if (faces.length === 0) {
+          setFaceBounds(null);
+          setFaceAlignmentState("no-face");
+          return;
+        }
+
+        if (faces.length > 1) {
+          setFaceBounds(null);
+          setFaceAlignmentState("multiple");
+          return;
+        }
+
+        const [face] = faces;
+        const bounds = face.boundingBox;
+        const video = videoRef.current;
+        const centerX = bounds.x + bounds.width / 2;
+        const centerY = bounds.y + bounds.height / 2;
+        const normalizedCenterX = centerX / video.videoWidth;
+        const normalizedCenterY = centerY / video.videoHeight;
+        const normalizedWidth = bounds.width / video.videoWidth;
+        const normalizedHeight = bounds.height / video.videoHeight;
+        const centeredEnough =
+          normalizedCenterX > 0.34
+          && normalizedCenterX < 0.66
+          && normalizedCenterY > 0.24
+          && normalizedCenterY < 0.76;
+        const sizeEnough =
+          normalizedWidth > 0.18
+          && normalizedWidth < 0.6
+          && normalizedHeight > 0.24
+          && normalizedHeight < 0.82;
+
+        setFaceBounds(bounds);
+        setFaceAlignmentState(centeredEnough && sizeEnough ? "aligned" : "off-center");
+      } catch (error) {
+        console.error("Face detection failed:", error);
+        if (!cancelled) {
+          setFaceAlignmentState("unsupported");
+          setFaceBounds(null);
+        }
+      }
+    };
+
+    void detectFace();
+    const intervalId = window.setInterval(() => {
+      void detectFace();
+    }, 320);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [cameraActive]);
+
   const extractFaceDescriptor = (): number[] | null => {
     if (!cameraActive || !videoRef.current || !canvasRef.current) {
       return null;
@@ -144,6 +290,14 @@ export default function GateSimulator() {
     setIsSamplingFace(true);
 
     try {
+      if (faceAlignmentState !== "aligned" && faceAlignmentState !== "unsupported") {
+        setLastResult({
+          success: false,
+          message: "Center a single face inside the guide before scanning.",
+        });
+        return;
+      }
+
       const descriptor = await captureLiveFaceDescriptor();
       if (!descriptor) {
         setLastResult({
@@ -212,17 +366,17 @@ export default function GateSimulator() {
   }, [lastScanResult, clearResult]);
 
   return (
-    <div className="p-6 md:p-8 h-full flex flex-col items-center justify-center bg-slate-50 dark:bg-slate-950">
-      
-      <div className="text-center mb-8">
-        <h1 className="text-3xl font-display font-bold text-foreground">Gate Terminal</h1>
-        <p className="text-muted-foreground mt-2 max-w-md mx-auto">
+    <div className="min-h-full bg-[radial-gradient(circle_at_top,_#f8fbff_0%,_#eef5ff_42%,_#e5eefb_100%)] text-slate-950">
+      <div className="mx-auto flex min-h-full max-w-5xl flex-col items-center justify-center px-6 py-10 md:px-8">
+        <div className="mb-8 text-center">
+        <h1 className="text-3xl font-display font-bold text-slate-950">Gate Terminal</h1>
+        <p className="mt-2 max-w-md mx-auto text-slate-600">
           Real-time attendance with live camera and RFID scanning
         </p>
       </div>
 
-      <Card className="w-full max-w-md shadow-xl border-border/60 overflow-hidden">
-        <div className="bg-primary p-4 text-primary-foreground flex items-center justify-between">
+      <Card className="w-full max-w-md overflow-hidden border border-sky-100 bg-white/90 shadow-[0_24px_80px_rgba(30,64,175,0.12)] backdrop-blur">
+        <div className="flex items-center justify-between bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 p-4 text-white">
           <div className="flex items-center justify-center gap-2">
             <Scan className="size-5" />
             <span className="font-semibold tracking-wide">GATE-01 TERMINAL</span>
@@ -234,21 +388,21 @@ export default function GateSimulator() {
                 <span>Device</span>
               </div>
             ) : (
-              <div className="flex items-center gap-1 text-xs bg-red-500/20 px-2 py-1 rounded">
+              <div className="flex items-center gap-1 rounded bg-white/20 px-2 py-1 text-xs">
                 <WifiOff className="size-3" />
-                <span>API</span>
+                <span>Offline</span>
               </div>
             )}
           </div>
         </div>
-        
-        <CardContent className="p-8 space-y-8">
+
+        <CardContent className="space-y-8 p-8">
           {/* Real/Simulated Webcam View */}
           <div className="space-y-2">
-            <div className="text-xs font-medium text-muted-foreground uppercase tracking-wider text-center">
+            <div className="text-center text-xs font-medium uppercase tracking-wider text-slate-500">
               {cameraActive ? 'Live Camera Feed' : cameraError ? 'Camera Permission Required' : 'Starting Camera'}
             </div>
-            <div className="aspect-video bg-black rounded-xl border border-border flex flex-col items-center justify-center relative overflow-hidden group">
+            <div className="group relative aspect-video overflow-hidden rounded-2xl border border-sky-100 bg-slate-950 shadow-inner">
               <video
                 ref={videoRef}
                 autoPlay
@@ -265,9 +419,9 @@ export default function GateSimulator() {
               {!cameraActive && (
                 <>
                   <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
-                    <Camera className="size-10 text-muted-foreground/40 group-hover:scale-110 transition-transform duration-300" />
-                    <p className="text-sm text-muted-foreground">
-                      {cameraError ?? "Waiting for browser camera access..."}
+                    <Camera className="size-10 text-white/35 transition-transform duration-300 group-hover:scale-110" />
+                    <p className="text-sm text-white/70">
+                      {faceGuideMessage}
                     </p>
                     {cameraError && (
                       <Button
@@ -283,58 +437,98 @@ export default function GateSimulator() {
                   <div className="absolute inset-0 border-2 border-primary/20 rounded-xl m-4 pointer-events-none opacity-50" />
                 </>
               )}
+              <div className="pointer-events-none absolute inset-0">
+                <div className="absolute inset-3">
+                  <div className="absolute left-0 top-0 h-10 w-10 rounded-tl-xl border-l-[3px] border-t-[3px] border-rose-400/80" />
+                  <div className="absolute right-0 top-0 h-10 w-10 rounded-tr-xl border-r-[3px] border-t-[3px] border-rose-400/80" />
+                  <div className="absolute bottom-0 left-0 h-10 w-10 rounded-bl-xl border-b-[3px] border-l-[3px] border-rose-400/80" />
+                  <div className="absolute bottom-0 right-0 h-10 w-10 rounded-br-xl border-b-[3px] border-r-[3px] border-rose-400/80" />
+                </div>
+                <div
+                  className={`absolute inset-x-[22%] inset-y-[18%] rounded-[1.75rem] border-[3px] transition-all duration-300 ease-out ${faceFrameTone}`}
+                />
+                {faceBounds && cameraActive && (
+                  <div
+                    className="absolute border-2 border-cyan-300/70 transition-all duration-200"
+                    style={{
+                      left: `${(faceBounds.x / (videoRef.current?.videoWidth || 1)) * 100}%`,
+                      top: `${(faceBounds.y / (videoRef.current?.videoHeight || 1)) * 100}%`,
+                      width: `${(faceBounds.width / (videoRef.current?.videoWidth || 1)) * 100}%`,
+                      height: `${(faceBounds.height / (videoRef.current?.videoHeight || 1)) * 100}%`,
+                    }}
+                  />
+                )}
+              </div>
+              <div className="pointer-events-none absolute inset-x-[22%] inset-y-[18%] rounded-[1.75rem]">
+                <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
+                  {frameStatusLabel}
+                </div>
+                <div className="absolute inset-x-6 top-1/2 h-px -translate-y-1/2 bg-gradient-to-r from-transparent via-emerald-300/70 to-transparent" />
+                <div className="absolute left-1/2 inset-y-6 w-px -translate-x-1/2 bg-gradient-to-b from-transparent via-rose-300/55 to-transparent" />
+              </div>
               {(scanMutation.isPending || isSamplingFace) && (
                 <div className="absolute inset-0 bg-primary/10 backdrop-blur-[2px] flex items-center justify-center">
                   <div className="w-16 h-1 bg-primary/80 animate-pulse rounded-full shadow-[0_0_15px_rgba(var(--primary),0.5)]" />
                 </div>
               )}
             </div>
+            <p className="text-center text-xs text-slate-500">{faceGuideMessage}</p>
           </div>
 
           {/* Form / Inputs */}
           <div className="space-y-4">
-            <div className="rounded-xl border border-border/70 bg-muted/20 p-4 space-y-2">
+            <div className="space-y-2 rounded-2xl border border-slate-200 bg-slate-50/80 p-4">
               <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-muted-foreground">Gate event channel</span>
-                <span className={isConnected ? "text-foreground font-medium" : "text-muted-foreground"}>
+                <span className="text-slate-500">Gate event channel</span>
+                <span className={isConnected ? "font-medium text-slate-900" : "text-slate-500"}>
                   {isConnected ? "Listening for reader taps" : "Browser socket offline"}
                 </span>
               </div>
               <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-muted-foreground">Preferred device</span>
-                <span className="font-mono text-foreground">{GATE_DEVICE_ID}</span>
+                <span className="text-slate-500">Preferred device</span>
+                <span className="font-mono text-slate-900">{GATE_DEVICE_ID}</span>
               </div>
               <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-muted-foreground">Browser client</span>
-                <span className="font-mono text-foreground">{GATE_BROWSER_CLIENT_ID}</span>
+                <span className="text-slate-500">Browser client</span>
+                <span className="font-mono text-slate-900">{GATE_BROWSER_CLIENT_ID}</span>
               </div>
               <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-muted-foreground">Last physical tap</span>
-                <span className="font-mono text-foreground">{liveTapUid ?? "--"}</span>
+                <span className="text-slate-500">Last physical tap</span>
+                <span className="font-mono text-slate-900">{liveTapUid ?? "--"}</span>
               </div>
               <div className="flex items-center justify-between gap-3 text-sm">
-                <span className="text-muted-foreground">Face samples / scan</span>
-                <span className="font-mono text-foreground">{GATE_FACE_SAMPLE_COUNT}</span>
+                <span className="text-slate-500">Face samples / scan</span>
+                <span className="font-mono text-slate-900">{GATE_FACE_SAMPLE_COUNT}</span>
+              </div>
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="text-slate-500">Face alignment</span>
+                <span className={faceAlignmentState === "aligned" ? "font-medium text-emerald-600" : "text-rose-500"}>
+                  {faceAlignmentState === "aligned"
+                    ? "Ready"
+                    : faceAlignmentState === "unsupported"
+                      ? "Detector off"
+                      : "Adjust"}
+                </span>
               </div>
               {readerSourceDeviceId && (
                 <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-muted-foreground">Reader source</span>
-                  <span className="font-mono text-foreground">{readerSourceDeviceId}</span>
+                  <span className="text-slate-500">Reader source</span>
+                  <span className="font-mono text-slate-900">{readerSourceDeviceId}</span>
                 </div>
               )}
               {readerMessage && (
-                <p className="text-sm text-muted-foreground">{readerMessage}</p>
+                <p className="text-sm text-slate-600">{readerMessage}</p>
               )}
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="rfid" className="flex items-center gap-2 text-foreground/80">
+              <Label htmlFor="rfid" className="flex items-center gap-2 text-slate-700">
                 <KeyRound className="size-4" /> RFID Badge
               </Label>
               <Input 
                 id="rfid"
                 placeholder="Tap on the real reader or enter UID manually" 
-                className="font-mono text-lg py-6 text-center tracking-widest bg-background border-2 focus-visible:ring-primary/20"
+                className="bg-white font-mono text-lg tracking-widest text-center py-6 border-2 border-slate-200 focus-visible:ring-primary/20"
                 value={rfidUid}
                 onChange={(e) => setRfidUid(e.target.value.toUpperCase())}
                 disabled={scanMutation.isPending}
@@ -344,7 +538,7 @@ export default function GateSimulator() {
             
             <Button 
               size="lg" 
-              className="w-full h-14 text-lg font-semibold shadow-md active:scale-[0.98] transition-transform" 
+              className="h-14 w-full bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 text-lg font-semibold text-white shadow-md transition-transform active:scale-[0.98]" 
               onClick={handleScan}
               disabled={scanMutation.isPending || isSamplingFace || !rfidUid.trim() || !cameraActive}
             >
@@ -355,16 +549,16 @@ export default function GateSimulator() {
           {/* Results Area */}
           <div className="min-h-[80px]">
             {lastResult && (
-              <Alert variant={lastResult.success ? "default" : "destructive"} className={`border-2 ${lastResult.success ? 'bg-emerald-50 border-emerald-200 dark:bg-emerald-950 dark:border-emerald-900' : ''}`}>
+              <Alert variant={lastResult.success ? "default" : "destructive"} className={`border-2 ${lastResult.success ? 'border-emerald-200 bg-emerald-50' : 'border-rose-200 bg-rose-50 text-rose-900'}`}>
                 {lastResult.success ? (
-                  <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-400" />
+                  <CheckCircle2 className="size-5 text-emerald-600" />
                 ) : (
                   <AlertCircle className="size-5" />
                 )}
-                <AlertTitle className={lastResult.success ? "text-emerald-800 dark:text-emerald-300 font-bold" : "font-bold"}>
+                <AlertTitle className={lastResult.success ? "font-bold text-emerald-800" : "font-bold"}>
                   {lastResult.success ? "Access Granted" : "Access Denied"}
                 </AlertTitle>
-                <AlertDescription className={lastResult.success ? "text-emerald-700 dark:text-emerald-400" : ""}>
+                <AlertDescription className={lastResult.success ? "text-emerald-700" : ""}>
                   {lastResult.message}
                   {typeof lastResult.matchConfidence === "number" && (
                     <span className="block mt-1 font-mono">
@@ -378,6 +572,7 @@ export default function GateSimulator() {
 
         </CardContent>
       </Card>
+      </div>
     </div>
   );
 }
