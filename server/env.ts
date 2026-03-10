@@ -63,3 +63,39 @@ export function getDatabaseUrl() {
 
   return process.env.DATABASE_URL ?? process.env.SUPABASE_DB_URL ?? null;
 }
+
+export function normalizeConnectionString(databaseUrl: string) {
+  try {
+    const parsedUrl = new URL(databaseUrl);
+
+    parsedUrl.searchParams.delete("sslmode");
+    parsedUrl.searchParams.delete("ssl");
+    parsedUrl.searchParams.delete("sslcert");
+    parsedUrl.searchParams.delete("sslkey");
+    parsedUrl.searchParams.delete("sslrootcert");
+
+    return parsedUrl.toString();
+  } catch {
+    return databaseUrl;
+  }
+}
+
+export function shouldEnableSsl(databaseUrl: string) {
+  const sslMode = process.env.PGSSLMODE?.toLowerCase();
+  if (sslMode && sslMode !== "disable") {
+    return true;
+  }
+
+  try {
+    const parsedUrl = new URL(databaseUrl);
+    const urlSslMode = parsedUrl.searchParams.get("sslmode")?.toLowerCase();
+
+    if (urlSslMode && urlSslMode !== "disable") {
+      return true;
+    }
+
+    return parsedUrl.hostname.includes("supabase");
+  } catch {
+    return false;
+  }
+}

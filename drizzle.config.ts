@@ -1,5 +1,5 @@
 import { defineConfig } from "drizzle-kit";
-import { getDatabaseUrl, loadEnvironment } from "./server/env";
+import { getDatabaseUrl, loadEnvironment, normalizeConnectionString, shouldEnableSsl } from "./server/env";
 
 loadEnvironment();
 
@@ -14,6 +14,7 @@ export default defineConfig({
   schema: "./shared/schema.ts",
   dialect: "postgresql",
   dbCredentials: {
-    url: databaseUrl,
+    url: normalizeConnectionString(databaseUrl),
+    ...(shouldEnableSsl(databaseUrl) ? { ssl: "require" as const } : {}),
   },
 });

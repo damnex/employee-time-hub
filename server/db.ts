@@ -1,7 +1,7 @@
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
 import * as schema from "@shared/schema";
-import { getDatabaseUrl, loadEnvironment } from "./env";
+import { getDatabaseUrl, loadEnvironment, normalizeConnectionString, shouldEnableSsl } from "./env";
 
 const { Pool } = pg;
 
@@ -9,29 +9,9 @@ loadEnvironment();
 
 const connectionString = getDatabaseUrl();
 
-function shouldEnableSsl(databaseUrl: string) {
-  const sslMode = process.env.PGSSLMODE?.toLowerCase();
-  if (sslMode && sslMode !== "disable") {
-    return true;
-  }
-
-  try {
-    const parsedUrl = new URL(databaseUrl);
-    const urlSslMode = parsedUrl.searchParams.get("sslmode")?.toLowerCase();
-
-    if (urlSslMode && urlSslMode !== "disable") {
-      return true;
-    }
-
-    return parsedUrl.hostname.includes("supabase");
-  } catch {
-    return false;
-  }
-}
-
 export const pool = connectionString
   ? new Pool({
-      connectionString,
+      connectionString: normalizeConnectionString(connectionString),
       ssl: shouldEnableSsl(connectionString) ? { rejectUnauthorized: false } : undefined,
       max: 10,
       idleTimeoutMillis: 30_000,
