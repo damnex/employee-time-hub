@@ -3,6 +3,18 @@ import { relations } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
+export const faceCaptureModeSchema = z.enum(["detected", "fallback"]);
+
+export const faceProfileSchema = z.object({
+  version: z.literal(2),
+  captureMode: faceCaptureModeSchema.optional(),
+  primaryDescriptor: z.array(z.number()).min(1),
+  anchorDescriptors: z.array(z.array(z.number()).min(1)).min(1),
+  averageQuality: z.number().min(0).max(1),
+  sampleCount: z.number().int().min(1),
+  consistency: z.number().min(0).max(1),
+});
+
 export const employees = pgTable("employees", {
   id: serial("id").primaryKey(),
   employeeCode: text("employee_code").notNull().unique(),
@@ -11,7 +23,7 @@ export const employees = pgTable("employees", {
   phone: text("phone"),
   email: text("email"),
   rfidUid: text("rfid_uid").notNull().unique(),
-  faceDescriptor: jsonb("face_descriptor"), // Array of 128 numbers representing the face
+  faceDescriptor: jsonb("face_descriptor"), // Legacy descriptor array or structured face profile
   isActive: boolean("is_active").default(true),
   createdAt: timestamp("created_at").defaultNow(),
 });
@@ -55,6 +67,12 @@ export type Device = typeof devices.$inferSelect;
 export type InsertDevice = z.infer<typeof insertDeviceSchema>;
 export type Attendance = typeof attendances.$inferSelect;
 export type InsertAttendance = z.infer<typeof insertAttendanceSchema>;
+export type FaceProfile = z.infer<typeof faceProfileSchema>;
+export type FaceCaptureMode = z.infer<typeof faceCaptureModeSchema>;
 
 export type CreateEmployeeRequest = InsertEmployee;
 export type UpdateEmployeeRequest = Partial<InsertEmployee>;
+
+export function isFaceProfile(value: unknown): value is FaceProfile {
+  return faceProfileSchema.safeParse(value).success;
+}

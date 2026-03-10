@@ -17,6 +17,15 @@ function parseEnvValue(rawValue: string) {
   return trimmed;
 }
 
+function isTruthyEnvValue(value?: string | null) {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
 function loadEnvFile(filePath: string) {
   if (!fs.existsSync(filePath)) {
     return;
@@ -98,4 +107,13 @@ export function shouldEnableSsl(databaseUrl: string) {
   } catch {
     return false;
   }
+}
+
+export function allowInsecureFaceFallback() {
+  loadEnvironment();
+  return isTruthyEnvValue(
+    process.env.ALLOW_INSECURE_FACE_FALLBACK
+    ?? process.env.VITE_ALLOW_INSECURE_FACE_FALLBACK
+    ?? null,
+  );
 }

@@ -1,13 +1,46 @@
 import { z } from 'zod';
-import { insertEmployeeSchema, employees, devices, attendances } from './schema';
+import { insertEmployeeSchema, employees, devices, attendances, faceCaptureModeSchema } from './schema';
 
 const movementDirectionSchema = z.enum(["ENTRY", "EXIT", "UNKNOWN"]);
+const attendanceStatusSchema = z.enum([
+  "ENTRY",
+  "EXIT",
+  "FAILED_FACE",
+  "FAILED_DIRECTION",
+  "UNKNOWN_RFID",
+]);
+const attendanceFiltersSchema = z.object({
+  date: z.string().optional(),
+  dateFrom: z.string().optional(),
+  dateTo: z.string().optional(),
+  employeeId: z.coerce.number().optional(),
+  status: attendanceStatusSchema.optional(),
+  search: z.string().trim().optional(),
+}).optional();
+const matchDetailsSchema = z.object({
+  primaryConfidence: z.number(),
+  anchorAverage: z.number(),
+  peakAnchorConfidence: z.number(),
+  strongAnchorRatio: z.number(),
+  liveConsistency: z.number(),
+});
 
 export const errorSchemas = {
   validation: z.object({ message: z.string(), field: z.string().optional() }),
   notFound: z.object({ message: z.string() }),
   internal: z.object({ message: z.string() }),
 };
+
+const attendanceWithEmployeeSchema = z.custom<
+  typeof attendances.$inferSelect & { employee?: typeof employees.$inferSelect }
+>();
+
+const dashboardStatsResponseSchema = z.object({
+  totalEmployees: z.number(),
+  presentToday: z.number(),
+  absentToday: z.number(),
+  recentScans: z.array(attendanceWithEmployeeSchema),
+});
 
 export const api = {
   employees: {
@@ -43,11 +76,8 @@ export const api = {
     list: {
       method: 'GET' as const,
       path: '/api/attendances' as const,
-      input: z.object({
-        date: z.string().optional(),
-        employeeId: z.coerce.number().optional()
-      }).optional(),
-      responses: { 200: z.array(z.custom<typeof attendances.$inferSelect & { employee?: typeof employees.$inferSelect }>()) },
+      input: attendanceFiltersSchema,
+      responses: { 200: z.array(attendanceWithEmployeeSchema) },
     }
   },
   scan: {
@@ -58,6 +88,9 @@ export const api = {
         rfidUid: z.string(),
         deviceId: z.string(),
         faceDescriptor: z.array(z.number()).optional(),
+        faceAnchorDescriptors: z.array(z.array(z.number())).optional(),
+        faceConsistency: z.number().min(0).max(1).optional(),
+        faceCaptureMode: faceCaptureModeSchema.optional(),
         movementDirection: movementDirectionSchema.optional(),
         movementConfidence: z.number().min(0).max(1).optional(),
       }),
@@ -68,6 +101,7 @@ export const api = {
           employee: z.custom<typeof employees.$inferSelect>().optional(),
           attendance: z.custom<typeof attendances.$inferSelect>().optional(),
           matchConfidence: z.number().optional(),
+          matchDetails: matchDetailsSchema.optional(),
           action: z.enum(["ENTRY", "EXIT"]).optional(),
           movementDirection: movementDirectionSchema.optional(),
           movementConfidence: z.number().optional(),
@@ -82,12 +116,7 @@ export const api = {
       method: 'GET' as const,
       path: '/api/stats' as const,
       responses: {
-        200: z.object({
-          totalEmployees: z.number(),
-          presentToday: z.number(),
-          absentToday: z.number(),
-          recentScans: z.array(z.custom<typeof attendances.$inferSelect & { employee?: typeof employees.$inferSelect }>())
-        })
+        200: dashboardStatsResponseSchema,
       }
     }
   }

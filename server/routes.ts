@@ -1,8 +1,10 @@
 import type { Express } from "express";
-import type { Server } from "http";
+import type { IncomingMessage, Server } from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
+import { allowInsecureFaceFallback } from "./env";
 import { api } from "@shared/routes";
+import { faceProfileSchema, type Attendance, type Employee, type FaceCaptureMode } from "@shared/schema";
 import { z } from "zod";
 
 type ClientType = "browser" | "device";
@@ -14,6 +16,48 @@ interface ClientConnection {
 }
 
 const activeConnections = new Set<ClientConnection>();
+type AttendanceAction = "ENTRY" | "EXIT";
+type MovementDirection = AttendanceAction | "UNKNOWN";
+
+interface ProcessScanInput {
+  rfidUid: string;
+  deviceId: string;
+  faceDescriptor?: number[];
+  faceAnchorDescriptors?: number[][];
+  faceConsistency?: number;
+  faceCaptureMode?: FaceCaptureMode;
+  movementDirection?: MovementDirection;
+  movementConfidence?: number;
+}
+
+interface ProcessedScanResult {
+  success: boolean;
+  message: string;
+  employee?: Employee;
+  attendance?: Attendance;
+  matchConfidence?: number;
+  matchDetails?: FaceMatchDetails;
+  action?: AttendanceAction;
+  movementDirection?: MovementDirection;
+  movementConfidence?: number;
+}
+
+interface NormalizedFaceProfile {
+  primaryDescriptor: number[];
+  anchorDescriptors: number[][];
+  consistency: number;
+  captureMode: FaceCaptureMode | "legacy" | "unknown";
+  secureCapture: boolean;
+  legacy: boolean;
+}
+
+interface FaceMatchDetails {
+  primaryConfidence: number;
+  anchorAverage: number;
+  peakAnchorConfidence: number;
+  strongAnchorRatio: number;
+  liveConsistency: number;
+}
 
 function normalizeDescriptor(descriptor: number[]) {
   if (!descriptor.length) {
@@ -50,7 +94,520 @@ function calculateMatchConfidence(v1: number[], v2: number[]): number {
   return Number((((dotProduct + 1) / 2)).toFixed(4));
 }
 
-const FACE_MATCH_THRESHOLD = 0.72;
+function average(values: number[]) {
+  if (!values.length) {
+    return 0;
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function normalizeStoredFaceProfile(faceDescriptor: unknown): NormalizedFaceProfile | null {
+  if (!faceDescriptor) {
+    return null;
+  }
+
+  if (Array.isArray(faceDescriptor) && faceDescriptor.every((value) => typeof value === "number")) {
+    return {
+      primaryDescriptor: faceDescriptor,
+      anchorDescriptors: [faceDescriptor],
+      consistency: 1,
+      captureMode: "legacy",
+      secureCapture: false,
+      legacy: true,
+    };
+  }
+
+  const parsedProfile = faceProfileSchema.safeParse(faceDescriptor);
+  if (!parsedProfile.success) {
+    return null;
+  }
+
+  return {
+    primaryDescriptor: parsedProfile.data.primaryDescriptor,
+    anchorDescriptors: parsedProfile.data.anchorDescriptors,
+    consistency: parsedProfile.data.consistency,
+    captureMode: parsedProfile.data.captureMode ?? "unknown",
+    secureCapture: parsedProfile.data.captureMode === "detected",
+    legacy: false,
+  };
+}
+
+function normalizeLiveFaceProfile(input: ProcessScanInput): NormalizedFaceProfile | null {
+  if (!input.faceDescriptor?.length) {
+    return null;
+  }
+
+  const anchorDescriptors = input.faceAnchorDescriptors?.filter((descriptor) => {
+    return descriptor.length === input.faceDescriptor?.length;
+  });
+
+  return {
+    primaryDescriptor: input.faceDescriptor,
+    anchorDescriptors: anchorDescriptors?.length ? anchorDescriptors : [input.faceDescriptor],
+    consistency: input.faceConsistency ?? 1,
+    captureMode: input.faceCaptureMode ?? "fallback",
+    secureCapture: input.faceCaptureMode === "detected",
+    legacy: false,
+  };
+}
+
+function calculateProfileMatchMetrics(
+  liveProfile: NormalizedFaceProfile,
+  storedProfile: NormalizedFaceProfile,
+) {
+  const primaryConfidence = Math.max(
+    calculateMatchConfidence(liveProfile.primaryDescriptor, storedProfile.primaryDescriptor),
+    ...storedProfile.anchorDescriptors.map((anchor) => {
+      return calculateMatchConfidence(liveProfile.primaryDescriptor, anchor);
+    }),
+  );
+  const anchorScores = liveProfile.anchorDescriptors.map((liveAnchor) => {
+    return Math.max(
+      calculateMatchConfidence(liveAnchor, storedProfile.primaryDescriptor),
+      ...storedProfile.anchorDescriptors.map((storedAnchor) => {
+        return calculateMatchConfidence(liveAnchor, storedAnchor);
+      }),
+    );
+  });
+  const anchorAverage = average(anchorScores);
+  const peakAnchorConfidence = Math.max(...anchorScores, 0);
+  const strongAnchorRatio =
+    anchorScores.filter((score) => score >= FACE_ANCHOR_AVG_THRESHOLD).length
+    / Math.max(1, anchorScores.length);
+  const finalConfidence = Number((
+    primaryConfidence * 0.45
+    + anchorAverage * 0.45
+    + strongAnchorRatio * 0.1
+  ).toFixed(4));
+
+  return {
+    primaryConfidence,
+    anchorAverage: Number(anchorAverage.toFixed(4)),
+    peakAnchorConfidence: Number(peakAnchorConfidence.toFixed(4)),
+    strongAnchorRatio: Number(strongAnchorRatio.toFixed(4)),
+    finalConfidence,
+  };
+}
+
+const FACE_MATCH_THRESHOLD = 0.87;
+const FACE_PRIMARY_THRESHOLD = 0.88;
+const FACE_ANCHOR_AVG_THRESHOLD = 0.85;
+const FACE_ANCHOR_RATIO_THRESHOLD = 0.8;
+const FACE_SCAN_CONSISTENCY_THRESHOLD = 0.88;
+const INSECURE_FACE_MATCH_THRESHOLD = 0.94;
+const INSECURE_FACE_PRIMARY_THRESHOLD = 0.95;
+const INSECURE_FACE_ANCHOR_AVG_THRESHOLD = 0.93;
+const INSECURE_FACE_ANCHOR_RATIO_THRESHOLD = 0.9;
+const INSECURE_FACE_SCAN_CONSISTENCY_THRESHOLD = 0.94;
+const LEGACY_FACE_MATCH_THRESHOLD = 0.9;
+const DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
+
+async function createFailureAttendance(
+  employeeId: number,
+  date: string,
+  now: Date,
+  deviceId: string,
+  verificationStatus: "FAILED_FACE" | "FAILED_DIRECTION",
+) {
+  return storage.createAttendance({
+    employeeId,
+    date,
+    entryTime: now,
+    verificationStatus,
+    deviceId,
+  });
+}
+
+async function createEntryAttendance(
+  employeeId: number,
+  date: string,
+  now: Date,
+  deviceId: string,
+) {
+  return storage.createAttendance({
+    employeeId,
+    date,
+    entryTime: now,
+    verificationStatus: "ENTRY",
+    deviceId,
+  });
+}
+
+async function closeOpenAttendance(openEntry: Attendance, now: Date) {
+  const workingHoursMs = now.getTime() - (openEntry.entryTime?.getTime() || now.getTime());
+  const workingHours = workingHoursMs / (1000 * 60 * 60);
+
+  return storage.updateAttendance(openEntry.id, {
+    exitTime: now,
+    workingHours: Number(workingHours.toFixed(2)),
+    verificationStatus: "EXIT",
+  });
+}
+
+async function resolveAttendanceDecision(
+  employee: Employee,
+  now: Date,
+  todayDate: string,
+  deviceId: string,
+  matchConfidence: number,
+  movementDirection?: MovementDirection,
+  movementConfidence?: number,
+): Promise<ProcessedScanResult> {
+  const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
+  const hasDirectionSignal = movementDirection !== undefined;
+  const directionIsConfident =
+    (movementDirection === "ENTRY" || movementDirection === "EXIT")
+    && (movementConfidence ?? 0) >= DIRECTION_CONFIDENCE_THRESHOLD;
+
+  if (hasDirectionSignal) {
+    if (!directionIsConfident) {
+      const attendance = await createFailureAttendance(
+        employee.id,
+        todayDate,
+        now,
+        deviceId,
+        "FAILED_DIRECTION",
+      );
+
+      return {
+        success: false,
+        message: "Movement direction was unclear. Walk fully through the frame and scan again.",
+        employee,
+        attendance,
+        matchConfidence,
+        movementDirection,
+        movementConfidence,
+      };
+    }
+
+    if (movementDirection === "ENTRY") {
+      if (openEntry) {
+        const attendance = await createFailureAttendance(
+          employee.id,
+          todayDate,
+          now,
+          deviceId,
+          "FAILED_DIRECTION",
+        );
+
+        return {
+          success: false,
+          message: "An entry is already open. Exit direction is required before another entry.",
+          employee,
+          attendance,
+          matchConfidence,
+          movementDirection,
+          movementConfidence,
+        };
+      }
+
+      const attendance = await createEntryAttendance(employee.id, todayDate, now, deviceId);
+
+      return {
+        success: true,
+        message: "Entry marked successfully.",
+        employee,
+        attendance,
+        matchConfidence,
+        action: "ENTRY",
+        movementDirection,
+        movementConfidence,
+      };
+    }
+
+    if (!openEntry) {
+      const attendance = await createFailureAttendance(
+        employee.id,
+        todayDate,
+        now,
+        deviceId,
+        "FAILED_DIRECTION",
+      );
+
+      return {
+        success: false,
+        message: "No active entry was found. Capture an entry direction before exiting.",
+        employee,
+        attendance,
+        matchConfidence,
+        movementDirection,
+        movementConfidence,
+      };
+    }
+
+    const attendance = await closeOpenAttendance(openEntry, now);
+    if (!attendance) {
+      return {
+        success: false,
+        message: "Exit could not be recorded. Please retry the scan.",
+        employee,
+        matchConfidence,
+        movementDirection,
+        movementConfidence,
+      };
+    }
+
+    return {
+      success: true,
+      message: "Exit marked successfully.",
+      employee,
+      attendance,
+      matchConfidence,
+      action: "EXIT",
+      movementDirection,
+      movementConfidence,
+    };
+  }
+
+  if (openEntry) {
+    const attendance = await closeOpenAttendance(openEntry, now);
+    if (!attendance) {
+      return {
+        success: false,
+        message: "Exit could not be recorded. Please retry the scan.",
+        employee,
+        matchConfidence,
+      };
+    }
+
+    return {
+      success: true,
+      message: "Exit marked successfully.",
+      employee,
+      attendance,
+      matchConfidence,
+      action: "EXIT",
+    };
+  }
+
+  const attendance = await createEntryAttendance(employee.id, todayDate, now, deviceId);
+
+  return {
+    success: true,
+    message: "Entry marked successfully.",
+    employee,
+    attendance,
+    matchConfidence,
+    action: "ENTRY",
+  };
+}
+
+async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanResult> {
+  const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
+  const now = new Date();
+  const todayDate = now.toISOString().split("T")[0];
+  const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
+
+  if (!employee) {
+    return {
+      success: false,
+      message: "Unknown RFID card rejected.",
+    };
+  }
+
+  let matchConfidence = 0;
+  let faceMatched = false;
+  let matchDetails: FaceMatchDetails | undefined;
+  const insecureFallbackAllowed = allowInsecureFaceFallback();
+  const liveFaceProfile = normalizeLiveFaceProfile(input);
+  const storedFaceProfile = normalizeStoredFaceProfile(employee.faceDescriptor);
+
+  if (!storedFaceProfile) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return {
+      success: false,
+      message: "No secure face profile is stored for this employee. Re-enroll the employee in Chrome or Edge.",
+      employee,
+      attendance,
+      matchConfidence,
+    };
+  }
+
+  if (!liveFaceProfile) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return {
+      success: false,
+      message: "Live face verification data was not captured. Retry the scan.",
+      employee,
+      attendance,
+      matchConfidence,
+      movementDirection: input.movementDirection,
+      movementConfidence: input.movementConfidence,
+    };
+  }
+
+  if (!storedFaceProfile.secureCapture && !insecureFallbackAllowed) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return {
+      success: false,
+      message: "This employee face profile was enrolled with an insecure fallback flow. Re-enroll in Chrome or Edge.",
+      employee,
+      attendance,
+      matchConfidence,
+    };
+  }
+
+  if (!liveFaceProfile?.secureCapture && !insecureFallbackAllowed) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return {
+      success: false,
+      message: "Secure live face detection is unavailable. Use Chrome or Edge on the gate terminal.",
+      employee,
+      attendance,
+      matchConfidence,
+      movementDirection: input.movementDirection,
+      movementConfidence: input.movementConfidence,
+    };
+  }
+
+  if (storedFaceProfile.legacy) {
+    matchConfidence = calculateMatchConfidence(
+      liveFaceProfile.primaryDescriptor,
+      storedFaceProfile.primaryDescriptor,
+    );
+    faceMatched = matchConfidence >= LEGACY_FACE_MATCH_THRESHOLD;
+    matchDetails = {
+      primaryConfidence: matchConfidence,
+      anchorAverage: matchConfidence,
+      peakAnchorConfidence: matchConfidence,
+      strongAnchorRatio: matchConfidence >= LEGACY_FACE_MATCH_THRESHOLD ? 1 : 0,
+      liveConsistency: Number(liveFaceProfile.consistency.toFixed(4)),
+    };
+  } else {
+    const metrics = calculateProfileMatchMetrics(liveFaceProfile, storedFaceProfile);
+    matchConfidence = metrics.finalConfidence;
+    matchDetails = {
+      primaryConfidence: metrics.primaryConfidence,
+      anchorAverage: metrics.anchorAverage,
+      peakAnchorConfidence: metrics.peakAnchorConfidence,
+      strongAnchorRatio: metrics.strongAnchorRatio,
+      liveConsistency: Number(liveFaceProfile.consistency.toFixed(4)),
+    };
+
+    const securePair = storedFaceProfile.secureCapture && liveFaceProfile.secureCapture;
+    faceMatched = securePair
+      ? (
+          metrics.finalConfidence >= FACE_MATCH_THRESHOLD
+          && metrics.primaryConfidence >= FACE_PRIMARY_THRESHOLD
+          && metrics.anchorAverage >= FACE_ANCHOR_AVG_THRESHOLD
+          && metrics.strongAnchorRatio >= FACE_ANCHOR_RATIO_THRESHOLD
+          && liveFaceProfile.consistency >= FACE_SCAN_CONSISTENCY_THRESHOLD
+        )
+      : (
+          metrics.finalConfidence >= INSECURE_FACE_MATCH_THRESHOLD
+          && metrics.primaryConfidence >= INSECURE_FACE_PRIMARY_THRESHOLD
+          && metrics.anchorAverage >= INSECURE_FACE_ANCHOR_AVG_THRESHOLD
+          && metrics.strongAnchorRatio >= INSECURE_FACE_ANCHOR_RATIO_THRESHOLD
+          && liveFaceProfile.consistency >= INSECURE_FACE_SCAN_CONSISTENCY_THRESHOLD
+        );
+  }
+
+  if (!faceMatched) {
+    if (matchDetails) {
+      console.warn(
+        `[Biometrics] Face rejected for ${employee.employeeCode} (${employee.name}) on ${input.deviceId}: `
+        + `final=${matchConfidence.toFixed(4)} `
+        + `primary=${matchDetails.primaryConfidence.toFixed(4)} `
+        + `anchors=${matchDetails.anchorAverage.toFixed(4)} `
+        + `peak=${matchDetails.peakAnchorConfidence.toFixed(4)} `
+        + `ratio=${matchDetails.strongAnchorRatio.toFixed(4)} `
+        + `consistency=${matchDetails.liveConsistency.toFixed(4)}`,
+      );
+    }
+
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return {
+      success: false,
+      message: storedFaceProfile?.legacy
+        ? "Face verification failed. Access denied. Re-enroll this employee for stricter biometric matching."
+        : "Face verification failed. Access denied.",
+      employee,
+      attendance,
+      matchConfidence,
+      matchDetails,
+      movementDirection: input.movementDirection,
+      movementConfidence: input.movementConfidence,
+    };
+  }
+
+  const result = await resolveAttendanceDecision(
+    employee,
+    now,
+    todayDate,
+    input.deviceId,
+    matchConfidence,
+    input.movementDirection,
+    input.movementConfidence,
+  );
+
+  return {
+    ...result,
+    matchDetails,
+  };
+}
+
+function toSocketScanResult(result: ProcessedScanResult, rfidUid: string) {
+  return {
+    type: "scan_result",
+    success: result.success,
+    message: result.message,
+    employee: result.employee
+      ? { id: result.employee.id, name: result.employee.name }
+      : undefined,
+    action: result.action,
+    matchConfidence: result.matchConfidence,
+    matchDetails: result.matchDetails,
+    movementDirection: result.movementDirection,
+    movementConfidence: result.movementConfidence,
+    rfidUid,
+  };
+}
+
+function getConnectionIp(req: IncomingMessage) {
+  const forwardedFor = req.headers["x-forwarded-for"];
+  const forwardedIp = Array.isArray(forwardedFor)
+    ? forwardedFor[0]
+    : forwardedFor?.split(",")[0];
+
+  return (forwardedIp || req.socket.remoteAddress || "unknown")
+    .replace(/^::ffff:/, "");
+}
 
 function broadcastMessage(
   payload: Record<string, unknown>,
@@ -71,15 +628,41 @@ function broadcastMessage(
   });
 }
 
+function replaceExistingConnection(deviceId: string, clientType: ClientType) {
+  activeConnections.forEach((connection) => {
+    if (connection.deviceId !== deviceId || connection.clientType !== clientType) {
+      return;
+    }
+
+    activeConnections.delete(connection);
+
+    if (
+      connection.ws.readyState === WebSocket.OPEN
+      || connection.ws.readyState === WebSocket.CONNECTING
+    ) {
+      connection.ws.close(4002, "Replaced by newer connection");
+    }
+  });
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
   
   // Setup WebSocket server for real ESP8266 device communication
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws/device" });
+  const wss = new WebSocketServer({
+    server: httpServer,
+    path: "/ws/device",
+    perMessageDeflate: false,
+  });
+
+  wss.on("error", (error) => {
+    console.error("[WebSocket] Server startup error:", error);
+  });
   
   wss.on("connection", (ws: WebSocket, req) => {
+    req.socket.setNoDelay(true);
     const searchParams = new URL(
       `http://${req.headers.host}${req.url}`,
     ).searchParams;
@@ -88,9 +671,18 @@ export async function registerRoutes(
     const clientType = (searchParams.get("clientType") === "device"
       ? "device"
       : "browser") as ClientType;
+    const connectionIp = getConnectionIp(req);
     const connection: ClientConnection = { ws, deviceId, clientType };
 
-    console.log(`[WebSocket] ${clientType} connected: ${deviceId}`);
+    replaceExistingConnection(deviceId, clientType);
+
+    if (clientType === "device") {
+      console.log(
+        `[WebSocket] Reader connected: ${deviceId} from ${connectionIp}. Reader is online and ready to read badges.`,
+      );
+    } else {
+      console.log(`[WebSocket] ${clientType} connected: ${deviceId} from ${connectionIp}`);
+    }
     activeConnections.add(connection);
     
     ws.send(JSON.stringify({
@@ -136,109 +728,55 @@ export async function registerRoutes(
         // Handle RFID scan from ESP8266 device
         if (message.type === "rfid_scan") {
           const rfidUid = String(message.rfidUid || "").trim().toUpperCase();
-          const { faceDescriptor } = message;
-          const now = new Date();
-          const todayDate = now.toISOString().split('T')[0];
-          
-          // Identify employee by RFID
-          const employee = await storage.getEmployeeByRfid(rfidUid);
-          
-          if (!employee) {
-            ws.send(JSON.stringify({
-              type: "scan_result",
-              success: false,
-              message: "Unknown RFID card rejected.",
-              rfidUid
-            }));
-            return;
-          }
-          
-          // Face verification
-          let confidence = 0;
-          let faceMatched = false;
-          
-          if (faceDescriptor && employee.faceDescriptor) {
-            confidence = calculateMatchConfidence(
-              faceDescriptor,
-              employee.faceDescriptor as number[],
-            );
-            faceMatched = confidence >= FACE_MATCH_THRESHOLD;
-          } else {
-            faceMatched = false;
-          }
-          
-          if (!faceMatched) {
-            const attendance = await storage.createAttendance({
-              employeeId: employee.id,
-              date: todayDate,
-              entryTime: now,
-              verificationStatus: "FAILED_FACE",
-              deviceId
-            });
-            
-            ws.send(JSON.stringify({
-              type: "scan_result",
-              success: false,
-              message: "Face verification failed. Access denied.",
-              employee: { id: employee.id, name: employee.name },
-              matchConfidence: confidence,
-              rfidUid
-            }));
-            return;
-          }
-          
-          // Mark Entry or Exit
-          const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
-          
-          if (openEntry) {
-            // Mark EXIT
-            const workingHoursMs = now.getTime() - (openEntry.entryTime?.getTime() || now.getTime());
-            const workingHours = workingHoursMs / (1000 * 60 * 60);
-            
-            const attendance = await storage.updateAttendance(openEntry.id, {
-              exitTime: now,
-              workingHours: Number(workingHours.toFixed(2)),
-              verificationStatus: "EXIT"
-            });
-            
-            ws.send(JSON.stringify({
-              type: "scan_result",
-              success: true,
-              message: "Exit marked successfully.",
-              action: "EXIT",
-              employee: { id: employee.id, name: employee.name },
-              matchConfidence: confidence,
-              rfidUid
-            }));
-          } else {
-            // Mark ENTRY
-            const attendance = await storage.createAttendance({
-              employeeId: employee.id,
-              date: todayDate,
-              entryTime: now,
-              verificationStatus: "ENTRY",
-              deviceId
-            });
-            
-            ws.send(JSON.stringify({
-              type: "scan_result",
-              success: true,
-              message: "Entry marked successfully.",
-              action: "ENTRY",
-              employee: { id: employee.id, name: employee.name },
-              matchConfidence: confidence,
-              rfidUid
-            }));
-          }
+          const result = await processRfidScan({
+            rfidUid,
+            deviceId,
+            faceDescriptor: Array.isArray(message.faceDescriptor)
+              ? message.faceDescriptor
+              : undefined,
+            faceAnchorDescriptors: Array.isArray(message.faceAnchorDescriptors)
+              ? message.faceAnchorDescriptors.filter((value: unknown) => {
+                  return Array.isArray(value) && value.every((item) => typeof item === "number");
+                }) as number[][]
+              : undefined,
+            faceConsistency:
+              typeof message.faceConsistency === "number"
+                ? message.faceConsistency
+                : undefined,
+            movementDirection:
+              message.movementDirection === "ENTRY"
+              || message.movementDirection === "EXIT"
+              || message.movementDirection === "UNKNOWN"
+                ? message.movementDirection
+                : undefined,
+            movementConfidence:
+              typeof message.movementConfidence === "number"
+                ? message.movementConfidence
+                : undefined,
+          });
+
+          ws.send(JSON.stringify(toSocketScanResult(result, rfidUid)));
+          return;
         }
       } catch (error) {
         console.error("[WebSocket] Error processing message:", error);
         ws.send(JSON.stringify({ type: "error", message: "Error processing request" }));
       }
     });
+
+    ws.on("error", (error) => {
+      console.error(`[WebSocket] ${clientType} socket error for ${deviceId}:`, error);
+      activeConnections.delete(connection);
+    });
     
     ws.on("close", () => {
-      console.log(`[WebSocket] ${clientType} disconnected: ${deviceId}`);
+      if (clientType === "device") {
+        console.log(
+          `[WebSocket] Reader disconnected: ${deviceId} from ${connectionIp}. Reader is no longer ready.`,
+        );
+      } else {
+        console.log(`[WebSocket] ${clientType} disconnected: ${deviceId} from ${connectionIp}`);
+      }
       activeConnections.delete(connection);
     });
   });
@@ -360,11 +898,17 @@ export async function registerRoutes(
   app.get(api.attendances.list.path, async (req, res) => {
     try {
       const parsedInput = api.attendances.list.input?.safeParse(req.query);
-      const input = parsedInput?.success ? parsedInput.data : undefined;
-      const attendances = await storage.getAttendances(input?.date, input?.employeeId);
+      if (parsedInput && !parsedInput.success) {
+        return res.status(400).json({
+          message: parsedInput.error.errors[0]?.message ?? "Invalid attendance filter.",
+          field: parsedInput.error.errors[0]?.path.join("."),
+        });
+      }
+
+      const attendances = await storage.getAttendances(parsedInput?.data);
       res.json(attendances);
     } catch (err) {
-      res.json(await storage.getAttendances());
+      res.status(500).json({ message: "Internal server error" });
     }
   });
 
@@ -379,103 +923,8 @@ export async function registerRoutes(
     try {
       const input = api.scan.rfid.input.parse(req.body);
       input.rfidUid = input.rfidUid.trim().toUpperCase();
-      const now = new Date();
-      const todayDate = now.toISOString().split('T')[0];
-
-      // 1. Identify employee by RFID
-      const employee = await storage.getEmployeeByRfid(input.rfidUid);
-      
-      if (!employee) {
-        // Unknown RFID
-        const failRecord = await storage.createAttendance({
-          // Provide a dummy ID or make employeeId nullable in reality, but since our schema requires employeeId,
-          // If we want to record failed attempts without employee, we'd need employeeId to be nullable.
-          // For now, since schema requires employeeId, we will skip saving unknown RFID completely or we return early.
-          // In a real prod environment we'd have a separate table for generic failed access logs.
-          employeeId: 0, // This will fail foreign key constraint if we try to insert. Let's just return error.
-          date: todayDate,
-          entryTime: now,
-          verificationStatus: "UNKNOWN_RFID",
-          deviceId: input.deviceId
-        }).catch(() => null);
-
-        return res.json({
-          success: false,
-          message: "Unknown RFID card rejected.",
-        });
-      }
-
-      // 2. Face Verification
-      let confidence = 0;
-      let faceMatched = false;
-
-      if (input.faceDescriptor && employee.faceDescriptor) {
-        confidence = calculateMatchConfidence(
-          input.faceDescriptor,
-          employee.faceDescriptor as number[],
-        );
-        faceMatched = confidence >= FACE_MATCH_THRESHOLD;
-      } else {
-        faceMatched = false;
-      }
-
-      if (!faceMatched) {
-        const attendance = await storage.createAttendance({
-          employeeId: employee.id,
-          date: todayDate,
-          entryTime: now,
-          verificationStatus: "FAILED_FACE",
-          deviceId: input.deviceId
-        });
-
-        return res.json({
-          success: false,
-          message: "Face verification failed. Access denied.",
-          employee,
-          attendance,
-          matchConfidence: confidence
-        });
-      }
-
-      // 3. Mark Entry or Exit automatically
-      const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
-
-      if (openEntry) {
-        // Mark EXIT
-        const workingHoursMs = now.getTime() - (openEntry.entryTime?.getTime() || now.getTime());
-        const workingHours = workingHoursMs / (1000 * 60 * 60); // Convert to hours
-
-        const attendance = await storage.updateAttendance(openEntry.id, {
-          exitTime: now,
-          workingHours: Number(workingHours.toFixed(2)),
-          verificationStatus: "EXIT"
-        });
-
-        return res.json({
-          success: true,
-          message: "Exit marked successfully.",
-          employee,
-          attendance,
-          matchConfidence: confidence
-        });
-      } else {
-        // Mark ENTRY
-        const attendance = await storage.createAttendance({
-          employeeId: employee.id,
-          date: todayDate,
-          entryTime: now,
-          verificationStatus: "ENTRY",
-          deviceId: input.deviceId
-        });
-
-        return res.json({
-          success: true,
-          message: "Entry marked successfully.",
-          employee,
-          attendance,
-          matchConfidence: confidence
-        });
-      }
+      const result = await processRfidScan(input);
+      return res.json(result);
 
     } catch (err) {
       if (err instanceof z.ZodError) {

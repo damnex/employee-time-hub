@@ -34,6 +34,20 @@ export function log(message: string, source = "express") {
   console.log(`${formattedTime} [${source}] ${message}`);
 }
 
+function handleListenError(error: NodeJS.ErrnoException, port: number) {
+  if (error.code === "EADDRINUSE") {
+    log(
+      `port ${port} is already in use. Another dev server is already running. Stop the existing process or reuse the running server.`,
+      "server",
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  console.error("[server] Failed to start HTTP server:", error);
+  process.exitCode = 1;
+}
+
 app.use((req, res, next) => {
   const start = Date.now();
   const path = req.path;
@@ -104,6 +118,8 @@ app.use((req, res, next) => {
     host: "0.0.0.0",
     ...(process.platform === "win32" ? {} : { reusePort: true }),
   };
+
+  httpServer.once("error", (error) => handleListenError(error as NodeJS.ErrnoException, port));
 
   httpServer.listen(
     listenOptions,

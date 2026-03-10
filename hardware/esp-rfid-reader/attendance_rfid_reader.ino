@@ -38,8 +38,15 @@ const char* WS_HOST = "192.168.0.100";
 const uint16_t WS_PORT = 5000;
 const char* WS_PATH = "/ws/device?deviceId=GATE-TERMINAL-01&clientType=device";
 
-const unsigned long WIFI_RETRY_MS = 5000;
-const unsigned long CARD_DEBOUNCE_MS = 1500;
+const unsigned long WIFI_RETRY_MS = 2000;
+const unsigned long CARD_DEBOUNCE_MS = 500;
+const unsigned long RFID_LOOP_SETTLE_MS = 35;
+const unsigned long WS_RECONNECT_MS = 1000;
+const unsigned long WS_HEARTBEAT_INTERVAL_MS = 15000;
+const unsigned long WS_HEARTBEAT_TIMEOUT_MS = 4000;
+const unsigned long RFID_HEALTHCHECK_MS = 2500;
+const unsigned long RFID_REINIT_COOLDOWN_MS = 1200;
+const uint8_t RFID_SERIAL_READ_RETRIES = 3;
 
 #if defined(ESP8266)
 const uint8_t SS_PIN = 2;    // D4
@@ -59,9 +66,114 @@ String lastUid = "";
 unsigned long lastCardSentAt = 0;
 unsigned long lastWifiRetryAt = 0;
 bool socketConnected = false;
+bool readerInitialized = false;
+bool readerReadyAnnounced = false;
+byte readerVersion = 0;
+unsigned long lastRfidHealthcheckAt = 0;
+unsigned long lastRfidInitAt = 0;
+
+bool isReaderVersionValid(byte version) {
+  return version != 0x00 && version != 0xFF;
+}
+
+String formatHexByte(byte value) {
+  String hex = String(value, HEX);
+  hex.toUpperCase();
+  if (hex.length() < 2) {
+    hex = "0" + hex;
+  }
+  return hex;
+}
 
 void printDivider() {
   Serial.println(F("--------------------------------------------------"));
+}
+
+bool initializeRfidReader(bool forceLog = false) {
+  const unsigned long now = millis();
+  if (!forceLog && lastRfidInitAt != 0 && (now - lastRfidInitAt) < RFID_REINIT_COOLDOWN_MS) {
+    return readerInitialized;
+  }
+
+  lastRfidInitAt = now;
+
+#if defined(ESP32)
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+#else
+  SPI.begin();
+#endif
+
+  mfrc522.PCD_Init();
+  delay(4);
+  mfrc522.PCD_AntennaOn();
+  delay(2);
+
+  readerVersion = mfrc522.PCD_ReadRegister(MFRC522::VersionReg);
+  readerInitialized = isReaderVersionValid(readerVersion);
+
+  if (!readerInitialized) {
+    readerReadyAnnounced = false;
+    printDivider();
+    Serial.println(F("[RFID] MFRC522 not responding."));
+    Serial.println(F("[RFID] Check 3.3V power, GND, and SPI wiring."));
+    Serial.print(F("[RFID] Version register: 0x"));
+    Serial.println(formatHexByte(readerVersion));
+    printDivider();
+    return false;
+  }
+
+  if (forceLog) {
+    printDivider();
+    Serial.print(F("[RFID] MFRC522 detected. Version register: 0x"));
+    Serial.println(formatHexByte(readerVersion));
+    Serial.println(F("[RFID] Antenna on. Reader is ready to detect tags."));
+    printDivider();
+  }
+
+  return true;
+}
+
+void ensureRfidReaderReady() {
+  const unsigned long now = millis();
+  if ((now - lastRfidHealthcheckAt) < RFID_HEALTHCHECK_MS) {
+    return;
+  }
+
+  lastRfidHealthcheckAt = now;
+  byte currentVersion = mfrc522.PCD_ReadRegister(MFRC522::VersionReg);
+
+  if (!isReaderVersionValid(currentVersion)) {
+    readerInitialized = false;
+    initializeRfidReader(true);
+    return;
+  }
+
+  readerVersion = currentVersion;
+}
+
+void announceReaderReadyIfAvailable() {
+  if (
+    readerReadyAnnounced
+    || !readerInitialized
+    || !socketConnected
+    || WiFi.status() != WL_CONNECTED
+  ) {
+    return;
+  }
+
+  printDivider();
+  Serial.println(F("[READY] Reader connected through IP and ready for reading."));
+  Serial.print(F("[READY] Reader IP: "));
+  Serial.println(WiFi.localIP());
+  Serial.print(F("[READY] Server endpoint: ws://"));
+  Serial.print(WS_HOST);
+  Serial.print(':');
+  Serial.print(WS_PORT);
+  Serial.println(WS_PATH);
+  Serial.println(F("[READY] Tap a badge on the reader."));
+  printDivider();
+
+  readerReadyAnnounced = true;
 }
 
 void connectToWifi() {
@@ -87,6 +199,7 @@ void connectToWifi() {
     Serial.println(WS_PATH);
   } else {
     Serial.println(F("Wi-Fi connect timeout. Will retry automatically."));
+    readerReadyAnnounced = false;
   }
 }
 
@@ -94,6 +207,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
       socketConnected = false;
+      readerReadyAnnounced = false;
       Serial.println(F("[WS] Disconnected from server."));
       break;
 
@@ -101,6 +215,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       socketConnected = true;
       Serial.print(F("[WS] Connected to: "));
       Serial.println(reinterpret_cast<const char*>(payload));
+      announceReaderReadyIfAvailable();
       break;
 
     case WStype_TEXT:
@@ -113,6 +228,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
     case WStype_ERROR:
       socketConnected = false;
+      readerReadyAnnounced = false;
       Serial.println(F("[WS] Error."));
       break;
 
@@ -124,16 +240,32 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 void connectWebSocket() {
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(3000);
-  webSocket.enableHeartbeat(15000, 3000, 2);
+  webSocket.setReconnectInterval(WS_RECONNECT_MS);
+  webSocket.enableHeartbeat(WS_HEARTBEAT_INTERVAL_MS, WS_HEARTBEAT_TIMEOUT_MS, 2);
 }
 
 String readCardUid() {
+  if (!readerInitialized) {
+    return "";
+  }
+
   if (!mfrc522.PICC_IsNewCardPresent()) {
     return "";
   }
 
-  if (!mfrc522.PICC_ReadCardSerial()) {
+  bool uidRead = false;
+  for (uint8_t attempt = 0; attempt < RFID_SERIAL_READ_RETRIES; attempt++) {
+    if (mfrc522.PICC_ReadCardSerial()) {
+      uidRead = true;
+      break;
+    }
+    delay(5);
+  }
+
+  if (!uidRead) {
+    Serial.println(F("[RFID] Card detected but UID read failed. Reinitializing reader."));
+    readerInitialized = false;
+    initializeRfidReader(true);
     return "";
   }
 
@@ -170,6 +302,8 @@ void ensureWifi() {
     return;
   }
 
+  readerReadyAnnounced = false;
+
   if (millis() - lastWifiRetryAt < WIFI_RETRY_MS) {
     return;
   }
@@ -191,23 +325,17 @@ void setup() {
 
   connectToWifi();
   connectWebSocket();
-
-#if defined(ESP32)
-  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
-#else
-  SPI.begin();
-#endif
-
-  mfrc522.PCD_Init();
-  delay(4);
-
+  initializeRfidReader(true);
   Serial.println(F("MFRC522 initialized. Tap a badge on the reader."));
+  announceReaderReadyIfAvailable();
   printDivider();
 }
 
 void loop() {
   ensureWifi();
   webSocket.loop();
+  ensureRfidReaderReady();
+  announceReaderReadyIfAvailable();
 
   const String uid = readCardUid();
   if (uid.isEmpty()) {
@@ -224,5 +352,5 @@ void loop() {
   lastUid = uid;
   lastCardSentAt = now;
   sendRfidDetected(uid);
-  delay(250);
+  delay(RFID_LOOP_SETTLE_MS);
 }

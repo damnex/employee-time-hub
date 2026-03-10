@@ -45,9 +45,11 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { insertEmployeeSchema } from "@shared/schema";
+import { faceProfileSchema, insertEmployeeSchema } from "@shared/schema";
 import {
+  allowInsecureFaceFallback,
   captureFaceTemplate,
+  isFaceDetectorAvailable,
 } from "@/lib/biometrics";
 import { useDeviceWS } from "@/hooks/use-device-ws";
 
@@ -67,10 +69,10 @@ const defaultFormValues = {
 
 const formSchema = insertEmployeeSchema
   .extend({
-    faceDescriptor: z.array(z.number()).length(128).nullable().optional(),
+    faceDescriptor: faceProfileSchema.nullable().optional(),
   })
   .superRefine((values, ctx) => {
-    if (!values.faceDescriptor?.length) {
+    if (!values.faceDescriptor?.primaryDescriptor?.length) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["faceDescriptor"],
@@ -106,13 +108,15 @@ export default function Employees() {
   });
 
   const faceDescriptor = form.watch("faceDescriptor");
+  const faceDetectorAvailable = isFaceDetectorAvailable();
+  const fallbackCaptureAllowed = allowInsecureFaceFallback();
   const watchedRfidUid = form.watch("rfidUid");
   const normalizedRfidUid = watchedRfidUid.trim().toUpperCase();
   const mappedBadgeOwner = employees?.find((employee) => {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const rfidReady = Boolean(normalizedRfidUid) && !mappedBadgeOwner;
-  const faceProfileReady = Boolean(faceDescriptor?.length);
+  const faceProfileReady = Boolean(faceDescriptor?.primaryDescriptor?.length);
   const faceError = form.formState.errors.faceDescriptor?.message;
 
   useEffect(() => {
@@ -258,6 +262,14 @@ export default function Employees() {
   };
 
   const handleCaptureFace = async () => {
+    if (!faceDetectorAvailable && !fallbackCaptureAllowed) {
+      form.setError("faceDescriptor", {
+        type: "manual",
+        message: "Use Chrome or Edge for secure biometric enrollment. Fallback capture is disabled.",
+      });
+      return;
+    }
+
     if (!videoRef.current || !canvasRef.current || !cameraActive) {
       form.setError("faceDescriptor", {
         type: "manual",
@@ -277,12 +289,13 @@ export default function Employees() {
         sampleDelayMs: ENROLLMENT_SAMPLE_DELAY_MS,
         minQuality: 0.24,
         maxAttempts: ENROLLMENT_SAMPLE_COUNT * 3,
+        requireDetector: !fallbackCaptureAllowed,
         onProgress: (acceptedSamples) => {
           setCapturedSamples(acceptedSamples);
         },
       });
 
-      form.setValue("faceDescriptor", template.descriptor, {
+      form.setValue("faceDescriptor", template.profile, {
         shouldDirty: true,
         shouldTouch: true,
         shouldValidate: true,
@@ -541,7 +554,7 @@ export default function Employees() {
                         <div>
                           <p className="text-sm font-semibold">Biometric Profile</p>
                           <p className="text-xs text-muted-foreground">
-                            Twenty-five clear live samples are merged into one enrollment template.
+                            Twenty-five face crops are merged into a biometric profile. Detector-backed capture is recommended; fallback mode is for compatibility only.
                           </p>
                         </div>
                         {faceProfileReady ? (
@@ -576,7 +589,9 @@ export default function Employees() {
                           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
                             <Camera className="size-10 text-white/40" />
                             <p className="max-w-xs text-sm text-white/70">
-                              {cameraError ?? "Starting live camera feed..."}
+                              {cameraError ?? (!faceDetectorAvailable && !fallbackCaptureAllowed
+                                ? "Use Chrome or Edge for secure biometric enrollment."
+                                : "Starting live camera feed...")}
                             </p>
                           </div>
                         )}
@@ -625,7 +640,7 @@ export default function Employees() {
                           type="button"
                           className="flex-1"
                           onClick={handleCaptureFace}
-                          disabled={!cameraActive || isCapturingFace}
+                          disabled={!cameraActive || (!faceDetectorAvailable && !fallbackCaptureAllowed) || isCapturingFace}
                         >
                           {isCapturingFace ? (
                             <>
@@ -673,7 +688,7 @@ export default function Employees() {
                           <div className="flex items-start gap-2 text-emerald-700">
                             <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
                             <p>
-                              Live facial template captured. This employee can now use
+                              Live facial profile captured. This employee can now use
                               gate verification on the same camera setup.
                             </p>
                           </div>
@@ -681,8 +696,11 @@ export default function Employees() {
                           <div className="flex items-start gap-2 text-muted-foreground">
                             <AlertCircle className="mt-0.5 size-4 shrink-0" />
                             <p>
-                              Center the face in frame, keep still for one second, then
-                              capture all 25 samples.
+                              {faceDetectorAvailable
+                                ? "Center the face in frame, keep still for one second, then capture all 25 samples."
+                                : fallbackCaptureAllowed
+                                  ? "Compatibility fallback capture is enabled in this environment. Accuracy is lower than detector-backed enrollment."
+                                  : "Open this page in Chrome or Edge before enrolling. Insecure fallback capture is blocked."}
                             </p>
                           </div>
                         )}

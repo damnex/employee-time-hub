@@ -17,57 +17,117 @@ interface UseDeviceWSOptions {
 }
 
 export function useDeviceWS(
-  deviceId: string = `web-${Date.now()}`,
+  deviceId?: string,
   options: UseDeviceWSOptions = {},
 ) {
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const shouldReconnectRef = useRef(true);
+  const generatedDeviceIdRef = useRef(`web-${Math.random().toString(36).slice(2, 10)}`);
   const [isConnected, setIsConnected] = useState(false);
   const [lastScanResult, setLastScanResult] = useState<DeviceScanResult | null>(null);
   const clientType = options.clientType ?? 'browser';
+  const resolvedDeviceId = deviceId ?? generatedDeviceIdRef.current;
 
   useEffect(() => {
-    // Get the WebSocket protocol
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/device?deviceId=${encodeURIComponent(deviceId)}&clientType=${encodeURIComponent(clientType)}`;
+    const wsUrl = `${protocol}//${window.location.host}/ws/device?deviceId=${encodeURIComponent(resolvedDeviceId)}&clientType=${encodeURIComponent(clientType)}`;
+    shouldReconnectRef.current = true;
 
-    try {
-      wsRef.current = new WebSocket(wsUrl);
-
-      wsRef.current.onopen = () => {
-        console.log('[DeviceWS] Connected to device server');
-        setIsConnected(true);
-      };
-
-      wsRef.current.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data) as DeviceScanResult;
-          setLastScanResult(message);
-          console.log('[DeviceWS] Received:', message);
-        } catch (error) {
-          console.error('[DeviceWS] Error parsing message:', error);
-        }
-      };
-
-      wsRef.current.onerror = (error) => {
-        console.error('[DeviceWS] Error:', error);
-        setIsConnected(false);
-      };
-
-      wsRef.current.onclose = () => {
-        console.log('[DeviceWS] Disconnected');
-        setIsConnected(false);
-      };
-    } catch (error) {
-      console.error('[DeviceWS] Failed to create WebSocket:', error);
-      setIsConnected(false);
-    }
-
-    return () => {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.close();
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
     };
-  }, [clientType, deviceId]);
+
+    const scheduleReconnect = () => {
+      if (!shouldReconnectRef.current) {
+        return;
+      }
+
+      clearReconnectTimer();
+      const retryDelayMs = Math.min(2000, 250 * Math.max(1, reconnectAttemptRef.current));
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connect();
+      }, retryDelayMs);
+    };
+
+    const connect = () => {
+      if (!shouldReconnectRef.current) {
+        return;
+      }
+
+      if (
+        wsRef.current
+        && (
+          wsRef.current.readyState === WebSocket.OPEN
+          || wsRef.current.readyState === WebSocket.CONNECTING
+        )
+      ) {
+        return;
+      }
+
+      try {
+        const socket = new WebSocket(wsUrl);
+        socket.binaryType = 'arraybuffer';
+        wsRef.current = socket;
+
+        socket.onopen = () => {
+          console.log('[DeviceWS] Connected to device server:', wsUrl);
+          reconnectAttemptRef.current = 0;
+          setIsConnected(true);
+        };
+
+        socket.onmessage = (event) => {
+          try {
+            const message = JSON.parse(event.data) as DeviceScanResult;
+            setLastScanResult(message);
+            console.log('[DeviceWS] Received:', message);
+          } catch (error) {
+            console.error('[DeviceWS] Error parsing message:', error);
+          }
+        };
+
+        socket.onerror = (error) => {
+          console.error('[DeviceWS] Error:', error);
+        };
+
+        socket.onclose = (event) => {
+          if (wsRef.current === socket) {
+            wsRef.current = null;
+          }
+
+          setIsConnected(false);
+          reconnectAttemptRef.current += 1;
+          console.log(
+            `[DeviceWS] Disconnected (code=${event.code}). Reconnecting attempt ${reconnectAttemptRef.current}...`,
+          );
+          scheduleReconnect();
+        };
+      } catch (error) {
+        console.error('[DeviceWS] Failed to create WebSocket:', error);
+        setIsConnected(false);
+        reconnectAttemptRef.current += 1;
+        scheduleReconnect();
+      }
+    };
+
+    connect();
+
+    return () => {
+      shouldReconnectRef.current = false;
+      clearReconnectTimer();
+
+      if (wsRef.current) {
+        const socket = wsRef.current;
+        wsRef.current = null;
+        socket.close();
+      }
+    };
+  }, [clientType, resolvedDeviceId]);
 
   const sendRFIDScan = useCallback((rfidUid: string, faceDescriptor?: number[]) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {

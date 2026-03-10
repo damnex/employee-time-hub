@@ -12,8 +12,8 @@ export function useEmployees() {
       const data = await res.json();
       return api.employees.list.responses[200].parse(data);
     },
-    refetchInterval: 5000,
-    refetchIntervalInBackground: true,
+    staleTime: 15000,
+    refetchOnWindowFocus: true,
   });
 }
 

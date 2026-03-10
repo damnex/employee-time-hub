@@ -1,5 +1,5 @@
 import { db } from "./db";
-import { eq, and, desc, gte, sql } from "drizzle-orm";
+import { eq, and, desc, gte, ilike, lte, or, sql } from "drizzle-orm";
 import {
   employees,
   devices,
@@ -26,7 +26,7 @@ export interface IStorage {
   createDevice(device: InsertDevice): Promise<Device>;
   
   // Attendances
-  getAttendances(date?: string, employeeId?: number): Promise<(Attendance & { employee?: Employee })[]>;
+  getAttendances(filters?: AttendanceFilters): Promise<(Attendance & { employee?: Employee })[]>;
   getOpenAttendance(employeeId: number, date: string): Promise<Attendance | undefined>;
   createAttendance(attendance: InsertAttendance): Promise<Attendance>;
   updateAttendance(id: number, updates: Partial<InsertAttendance>): Promise<Attendance | undefined>;
@@ -36,6 +36,14 @@ export interface IStorage {
 }
 
 type AttendanceWithEmployee = Attendance & { employee?: Employee };
+export interface AttendanceFilters {
+  date?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  employeeId?: number;
+  status?: Attendance["verificationStatus"];
+  search?: string;
+}
 
 function requireDb() {
   if (!db) {
@@ -88,7 +96,7 @@ export class DatabaseStorage implements IStorage {
     return newDevice;
   }
 
-  async getAttendances(date?: string, employeeId?: number): Promise<(Attendance & { employee?: Employee })[]> {
+  async getAttendances(filters: AttendanceFilters = {}): Promise<(Attendance & { employee?: Employee })[]> {
     let query = requireDb().select({
       attendance: attendances,
       employee: employees
@@ -98,8 +106,25 @@ export class DatabaseStorage implements IStorage {
     .orderBy(desc(attendances.id));
 
     const conditions = [];
-    if (date) conditions.push(eq(attendances.date, date));
-    if (employeeId) conditions.push(eq(attendances.employeeId, employeeId));
+    if (filters.date) {
+      conditions.push(eq(attendances.date, filters.date));
+    } else {
+      if (filters.dateFrom) conditions.push(gte(attendances.date, filters.dateFrom));
+      if (filters.dateTo) conditions.push(lte(attendances.date, filters.dateTo));
+    }
+    if (filters.employeeId) conditions.push(eq(attendances.employeeId, filters.employeeId));
+    if (filters.status) conditions.push(eq(attendances.verificationStatus, filters.status));
+    if (filters.search) {
+      const searchPattern = `%${filters.search}%`;
+      conditions.push(or(
+        ilike(employees.name, searchPattern),
+        ilike(employees.employeeCode, searchPattern),
+        ilike(employees.department, searchPattern),
+        ilike(employees.rfidUid, searchPattern),
+        ilike(attendances.deviceId, searchPattern),
+        ilike(attendances.verificationStatus, searchPattern),
+      ));
+    }
 
     if (conditions.length > 0) {
       // @ts-ignore
@@ -273,15 +298,50 @@ export class MemoryStorage implements IStorage {
     return newDevice;
   }
 
-  async getAttendances(date?: string, employeeId?: number): Promise<AttendanceWithEmployee[]> {
+  async getAttendances(filters: AttendanceFilters = {}): Promise<AttendanceWithEmployee[]> {
     return Array.from(this.attendanceStore.values())
-      .filter((attendance) => !date || attendance.date === date)
-      .filter((attendance) => !employeeId || attendance.employeeId === employeeId)
+      .filter((attendance) => {
+        if (filters.date) {
+          return attendance.date === filters.date;
+        }
+
+        if (filters.dateFrom && attendance.date < filters.dateFrom) {
+          return false;
+        }
+
+        if (filters.dateTo && attendance.date > filters.dateTo) {
+          return false;
+        }
+
+        return true;
+      })
+      .filter((attendance) => !filters.employeeId || attendance.employeeId === filters.employeeId)
+      .filter((attendance) => !filters.status || attendance.verificationStatus === filters.status)
       .sort((a, b) => b.id - a.id)
       .map((attendance) => ({
         ...attendance,
         employee: this.employeeStore.get(attendance.employeeId),
-      }));
+      }))
+      .filter((attendance) => {
+        if (!filters.search) {
+          return true;
+        }
+
+        const searchValue = filters.search.toLowerCase();
+        const haystack = [
+          attendance.employee?.name,
+          attendance.employee?.employeeCode,
+          attendance.employee?.department,
+          attendance.employee?.rfidUid,
+          attendance.deviceId,
+          attendance.verificationStatus,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+
+        return haystack.includes(searchValue);
+      });
   }
 
   async getOpenAttendance(employeeId: number, date: string): Promise<Attendance | undefined> {
