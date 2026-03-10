@@ -120,6 +120,7 @@ export class DatabaseStorage implements IStorage {
         and(
           eq(attendances.employeeId, employeeId),
           eq(attendances.date, date),
+          eq(attendances.verificationStatus, "ENTRY"),
           sql`${attendances.exitTime} IS NULL`
         )
       )
@@ -288,6 +289,7 @@ export class MemoryStorage implements IStorage {
       .filter((attendance) => {
         return attendance.employeeId === employeeId
           && attendance.date === date
+          && attendance.verificationStatus === "ENTRY"
           && attendance.exitTime === null;
       })
       .sort((a, b) => b.id - a.id)[0];

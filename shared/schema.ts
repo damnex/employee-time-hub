@@ -30,7 +30,7 @@ export const attendances = pgTable("attendances", {
   entryTime: timestamp("entry_time"),
   exitTime: timestamp("exit_time"),
   workingHours: doublePrecision("working_hours"),
-  verificationStatus: text("verification_status").notNull(), // 'ENTRY', 'EXIT', 'FAILED_FACE', 'UNKNOWN_RFID'
+  verificationStatus: text("verification_status").notNull(), // 'ENTRY', 'EXIT', 'FAILED_FACE', 'FAILED_DIRECTION', 'UNKNOWN_RFID'
   deviceId: text("device_id").notNull(),
 });
 

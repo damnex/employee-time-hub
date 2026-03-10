@@ -47,12 +47,12 @@ import {
 } from "@/components/ui/form";
 import { insertEmployeeSchema } from "@shared/schema";
 import {
-  averageFaceSamples,
-  captureFaceSample,
+  captureFaceTemplate,
 } from "@/lib/biometrics";
 import { useDeviceWS } from "@/hooks/use-device-ws";
 
-const ENROLLMENT_SAMPLE_COUNT = 3;
+const ENROLLMENT_SAMPLE_COUNT = 25;
+const ENROLLMENT_SAMPLE_DELAY_MS = 90;
 
 const defaultFormValues = {
   employeeCode: "",
@@ -272,35 +272,22 @@ export default function Employees() {
     form.clearErrors("faceDescriptor");
 
     try {
-      const descriptors: number[][] = [];
-      const qualitySamples: number[] = [];
+      const template = await captureFaceTemplate(videoRef.current, canvasRef.current, {
+        sampleCount: ENROLLMENT_SAMPLE_COUNT,
+        sampleDelayMs: ENROLLMENT_SAMPLE_DELAY_MS,
+        minQuality: 0.24,
+        maxAttempts: ENROLLMENT_SAMPLE_COUNT * 3,
+        onProgress: (acceptedSamples) => {
+          setCapturedSamples(acceptedSamples);
+        },
+      });
 
-      for (let sampleIndex = 0; sampleIndex < ENROLLMENT_SAMPLE_COUNT; sampleIndex++) {
-        const sample = captureFaceSample(videoRef.current, canvasRef.current);
-        if (!sample) {
-          throw new Error("Live frame unavailable. Keep the camera open and try again.");
-        }
-
-        descriptors.push(sample.descriptor);
-        qualitySamples.push(sample.quality);
-        setCapturedSamples(sampleIndex + 1);
-
-        if (sampleIndex < ENROLLMENT_SAMPLE_COUNT - 1) {
-          await new Promise((resolve) => window.setTimeout(resolve, 280));
-        }
-      }
-
-      const averagedDescriptor = averageFaceSamples(descriptors);
-      const averageQuality =
-        qualitySamples.reduce((sum, quality) => sum + quality, 0)
-        / qualitySamples.length;
-
-      form.setValue("faceDescriptor", averagedDescriptor, {
+      form.setValue("faceDescriptor", template.descriptor, {
         shouldDirty: true,
         shouldTouch: true,
         shouldValidate: true,
       });
-      setCaptureQuality(Number(averageQuality.toFixed(3)));
+      setCaptureQuality(template.averageQuality);
     } catch (error) {
       form.setError("faceDescriptor", {
         type: "manual",
@@ -554,7 +541,7 @@ export default function Employees() {
                         <div>
                           <p className="text-sm font-semibold">Biometric Profile</p>
                           <p className="text-xs text-muted-foreground">
-                            Three live samples are averaged into one enrollment template.
+                            Twenty-five clear live samples are merged into one enrollment template.
                           </p>
                         </div>
                         {faceProfileReady ? (
@@ -695,7 +682,7 @@ export default function Employees() {
                             <AlertCircle className="mt-0.5 size-4 shrink-0" />
                             <p>
                               Center the face in frame, keep still for one second, then
-                              capture all three samples.
+                              capture all 25 samples.
                             </p>
                           </div>
                         )}

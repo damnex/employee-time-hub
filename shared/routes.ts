@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { insertEmployeeSchema, employees, devices, attendances } from './schema';
 
+const movementDirectionSchema = z.enum(["ENTRY", "EXIT", "UNKNOWN"]);
+
 export const errorSchemas = {
   validation: z.object({ message: z.string(), field: z.string().optional() }),
   notFound: z.object({ message: z.string() }),
@@ -55,7 +57,9 @@ export const api = {
       input: z.object({
         rfidUid: z.string(),
         deviceId: z.string(),
-        faceDescriptor: z.array(z.number()).optional()
+        faceDescriptor: z.array(z.number()).optional(),
+        movementDirection: movementDirectionSchema.optional(),
+        movementConfidence: z.number().min(0).max(1).optional(),
       }),
       responses: {
         200: z.object({
@@ -63,7 +67,10 @@ export const api = {
           message: z.string(),
           employee: z.custom<typeof employees.$inferSelect>().optional(),
           attendance: z.custom<typeof attendances.$inferSelect>().optional(),
-          matchConfidence: z.number().optional()
+          matchConfidence: z.number().optional(),
+          action: z.enum(["ENTRY", "EXIT"]).optional(),
+          movementDirection: movementDirectionSchema.optional(),
+          movementConfidence: z.number().optional(),
         }),
         400: errorSchemas.validation,
         404: errorSchemas.notFound

@@ -7,12 +7,21 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Camera, Scan, KeyRound, AlertCircle, CheckCircle2, Wifi, WifiOff } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { averageFaceSamples, captureFaceSample } from "@/lib/biometrics";
+import { captureFaceTemplate } from "@/lib/biometrics";
+import {
+  appendMovementSample,
+  inferMovementDirection,
+  type DirectionInferenceResult,
+  type MovementSample,
+} from "@/lib/movement";
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
 const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
-const GATE_FACE_SAMPLE_COUNT = 3;
-const GATE_FACE_SAMPLE_DELAY_MS = 140;
+const GATE_FACE_SAMPLE_COUNT = 25;
+const GATE_FACE_SAMPLE_DELAY_MS = 70;
+const GATE_DIRECTION_SAMPLE_WINDOW = 25;
+const GATE_DIRECTION_MAX_SAMPLE_AGE_MS = 1800;
+const GATE_DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
 
 type FaceAlignmentState =
   | "unsupported"
@@ -43,12 +52,20 @@ export default function GateSimulator() {
   const [rfidUid, setRfidUid] = useState("");
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const motionSamplesRef = useRef<MovementSample[]>([]);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryToken, setCameraRetryToken] = useState(0);
   const [isSamplingFace, setIsSamplingFace] = useState(false);
+  const [capturedFaceSamples, setCapturedFaceSamples] = useState(0);
   const [faceAlignmentState, setFaceAlignmentState] = useState<FaceAlignmentState>("searching");
   const [faceBounds, setFaceBounds] = useState<DetectedFaceLike["boundingBox"] | null>(null);
+  const [directionState, setDirectionState] = useState<DirectionInferenceResult>({
+    direction: "UNKNOWN",
+    confidence: 0,
+    axis: "none",
+    sampleCount: 0,
+  });
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [readerSourceDeviceId, setReaderSourceDeviceId] = useState<string | null>(null);
   const [liveTapUid, setLiveTapUid] = useState<string | null>(null);
@@ -61,6 +78,10 @@ export default function GateSimulator() {
 
   const scanMutation = useScanRFID();
   const { isConnected, lastScanResult, clearResult } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
+  const supportsDirectionTracking = typeof window !== "undefined" && Boolean(window.FaceDetector);
+  const directionReady =
+    directionState.direction !== "UNKNOWN"
+    && directionState.confidence >= GATE_DIRECTION_CONFIDENCE_THRESHOLD;
   const faceFrameTone = !cameraActive
     ? "border-slate-300 shadow-none"
     : lastResult?.success
@@ -80,22 +101,54 @@ export default function GateSimulator() {
         ? "RETRY"
         : isSamplingFace || scanMutation.isPending
           ? "SCANNING"
-          : faceAlignmentState === "aligned"
-            ? "ALIGNMENT OK"
-            : "ALIGN FACE";
-  const faceGuideMessage = !cameraActive
-    ? cameraError ?? "Waiting for browser camera access..."
-    : faceAlignmentState === "unsupported"
-      ? "Face detector is unavailable in this browser. Matching can still run, but alignment guidance is limited."
-      : faceAlignmentState === "multiple"
-        ? "Keep only one face inside the frame."
-        : faceAlignmentState === "off-center"
-          ? "Center your face inside the green guide."
-          : faceAlignmentState === "no-face"
-            ? "Face not detected. Step into the camera frame."
+          : directionReady
+            ? directionState.direction === "ENTRY"
+              ? "ENTRY PATH"
+              : "EXIT PATH"
             : faceAlignmentState === "aligned"
-              ? "Face detected and aligned."
-              : "Searching for face alignment...";
+              ? "TRACK MOTION"
+              : "ALIGN FACE";
+  const faceGuideMessage = (() => {
+    if (!cameraActive) {
+      return cameraError ?? "Waiting for browser camera access...";
+    }
+
+    if (faceAlignmentState === "unsupported") {
+      return "Face detector is unavailable in this browser. Direction-aware entry and exit will fall back to the legacy toggle.";
+    }
+
+    if (faceAlignmentState === "multiple") {
+      return "Keep only one face inside the frame.";
+    }
+
+    if (faceAlignmentState === "off-center") {
+      return "Center your face inside the green guide.";
+    }
+
+    if (faceAlignmentState === "no-face") {
+      return "Face not detected. Step into the camera frame.";
+    }
+
+    if (directionReady) {
+      return `Movement classified as ${directionState.direction.toLowerCase()} with ${Math.round(directionState.confidence * 100)}% confidence.`;
+    }
+
+    if (faceAlignmentState === "aligned") {
+      return "Walk through the frame before scanning so the camera can classify entry or exit.";
+    }
+
+    return "Searching for face alignment...";
+  })();
+
+  const resetMotionEvidence = () => {
+    motionSamplesRef.current = [];
+    setDirectionState({
+      direction: "UNKNOWN",
+      confidence: 0,
+      axis: "none",
+      sampleCount: 0,
+    });
+  };
 
   // Initialize real camera
   useEffect(() => {
@@ -162,12 +215,14 @@ export default function GateSimulator() {
     if (!cameraActive || !videoRef.current) {
       setFaceAlignmentState((current) => (current === "unsupported" ? current : "searching"));
       setFaceBounds(null);
+      resetMotionEvidence();
       return;
     }
 
     if (!window.FaceDetector) {
       setFaceAlignmentState("unsupported");
       setFaceBounds(null);
+      resetMotionEvidence();
       return;
     }
 
@@ -191,12 +246,14 @@ export default function GateSimulator() {
         if (faces.length === 0) {
           setFaceBounds(null);
           setFaceAlignmentState("no-face");
+          resetMotionEvidence();
           return;
         }
 
         if (faces.length > 1) {
           setFaceBounds(null);
           setFaceAlignmentState("multiple");
+          resetMotionEvidence();
           return;
         }
 
@@ -222,11 +279,30 @@ export default function GateSimulator() {
 
         setFaceBounds(bounds);
         setFaceAlignmentState(centeredEnough && sizeEnough ? "aligned" : "off-center");
+
+        const nextSamples = appendMovementSample(
+          motionSamplesRef.current,
+          {
+            timestamp: Date.now(),
+            centerX: normalizedCenterX,
+            centerY: normalizedCenterY,
+            area: normalizedWidth * normalizedHeight,
+          },
+          GATE_DIRECTION_SAMPLE_WINDOW,
+        );
+        motionSamplesRef.current = nextSamples;
+        setDirectionState(
+          inferMovementDirection(nextSamples, {
+            maxSamples: GATE_DIRECTION_SAMPLE_WINDOW,
+            maxSampleAgeMs: GATE_DIRECTION_MAX_SAMPLE_AGE_MS,
+          }),
+        );
       } catch (error) {
         console.error("Face detection failed:", error);
         if (!cancelled) {
           setFaceAlignmentState("unsupported");
           setFaceBounds(null);
+          resetMotionEvidence();
         }
       }
     };
@@ -242,41 +318,22 @@ export default function GateSimulator() {
     };
   }, [cameraActive]);
 
-  const extractFaceDescriptor = (): number[] | null => {
-    if (!cameraActive || !videoRef.current || !canvasRef.current) {
-      return null;
-    }
-
-    try {
-      const sample = captureFaceSample(videoRef.current, canvasRef.current);
-      return sample?.descriptor ?? null;
-    } catch (error) {
-      console.error("Error extracting face descriptor:", error);
-      return null;
-    }
-  };
-
   const captureLiveFaceDescriptor = async () => {
     if (!cameraActive || !videoRef.current || !canvasRef.current) {
       return null;
     }
 
-    const descriptors: number[][] = [];
+    const template = await captureFaceTemplate(videoRef.current, canvasRef.current, {
+      sampleCount: GATE_FACE_SAMPLE_COUNT,
+      sampleDelayMs: GATE_FACE_SAMPLE_DELAY_MS,
+      minQuality: 0.2,
+      maxAttempts: GATE_FACE_SAMPLE_COUNT * 2,
+      onProgress: (acceptedSamples) => {
+        setCapturedFaceSamples(acceptedSamples);
+      },
+    });
 
-    for (let sampleIndex = 0; sampleIndex < GATE_FACE_SAMPLE_COUNT; sampleIndex++) {
-      const sample = captureFaceSample(videoRef.current, canvasRef.current);
-      if (!sample) {
-        return null;
-      }
-
-      descriptors.push(sample.descriptor);
-
-      if (sampleIndex < GATE_FACE_SAMPLE_COUNT - 1) {
-        await new Promise((resolve) => setTimeout(resolve, GATE_FACE_SAMPLE_DELAY_MS));
-      }
-    }
-
-    return averageFaceSamples(descriptors);
+    return template.descriptor;
   };
 
   const authenticateScan = async (
@@ -288,12 +345,34 @@ export default function GateSimulator() {
     if (!normalizedUid || scanMutation.isPending || isSamplingFace) return;
 
     setIsSamplingFace(true);
+    setCapturedFaceSamples(0);
 
     try {
       if (faceAlignmentState !== "aligned" && faceAlignmentState !== "unsupported") {
         setLastResult({
           success: false,
           message: "Center a single face inside the guide before scanning.",
+        });
+        return;
+      }
+
+      const latestDirection = supportsDirectionTracking
+        ? inferMovementDirection(motionSamplesRef.current, {
+            maxSamples: GATE_DIRECTION_SAMPLE_WINDOW,
+            maxSampleAgeMs: GATE_DIRECTION_MAX_SAMPLE_AGE_MS,
+          })
+        : undefined;
+
+      if (
+        supportsDirectionTracking
+        && (
+          latestDirection.direction === "UNKNOWN"
+          || latestDirection.confidence < GATE_DIRECTION_CONFIDENCE_THRESHOLD
+        )
+      ) {
+        setLastResult({
+          success: false,
+          message: "Movement direction is unclear. Walk fully through the frame before scanning again.",
         });
         return;
       }
@@ -316,7 +395,9 @@ export default function GateSimulator() {
       const data = await scanMutation.mutateAsync({
         rfidUid: normalizedUid,
         deviceId: source === "reader" ? (sourceDeviceId ?? GATE_DEVICE_ID) : GATE_DEVICE_ID,
-        faceDescriptor: descriptor
+        faceDescriptor: descriptor,
+        movementDirection: latestDirection?.direction,
+        movementConfidence: latestDirection?.confidence,
       });
 
       setLastResult({
@@ -336,6 +417,8 @@ export default function GateSimulator() {
       });
     } finally {
       setIsSamplingFace(false);
+      setCapturedFaceSamples(0);
+      resetMotionEvidence();
     }
   };
 
@@ -467,7 +550,13 @@ export default function GateSimulator() {
               </div>
               {(scanMutation.isPending || isSamplingFace) && (
                 <div className="absolute inset-0 flex items-center justify-center bg-primary/10 backdrop-blur-[2px]">
-                  <div className="h-1 w-16 animate-pulse rounded-full bg-primary/80 shadow-[0_0_15px_rgba(var(--primary),0.5)]" />
+                  {isSamplingFace ? (
+                    <div className="rounded-full bg-black/70 px-4 py-2 text-sm font-medium text-white">
+                      Capturing sample {Math.min(capturedFaceSamples + 1, GATE_FACE_SAMPLE_COUNT)} / {GATE_FACE_SAMPLE_COUNT}
+                    </div>
+                  ) : (
+                    <div className="h-1 w-16 animate-pulse rounded-full bg-primary/80 shadow-[0_0_15px_rgba(var(--primary),0.5)]" />
+                  )}
                 </div>
               )}
             </div>
@@ -509,6 +598,10 @@ export default function GateSimulator() {
                   <span className="font-mono text-slate-900">{GATE_FACE_SAMPLE_COUNT}</span>
                 </div>
                 <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Direction samples</span>
+                  <span className="font-mono text-slate-900">{directionState.sampleCount}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
                   <span className="text-slate-500">Face alignment</span>
                   <span className={faceAlignmentState === "aligned" ? "font-medium text-emerald-600" : "text-rose-500"}>
                     {faceAlignmentState === "aligned"
@@ -516,6 +609,36 @@ export default function GateSimulator() {
                       : faceAlignmentState === "unsupported"
                         ? "Detector off"
                         : "Adjust"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Motion direction</span>
+                  <span
+                    className={
+                      faceAlignmentState === "unsupported"
+                        ? "text-slate-500"
+                        : directionReady
+                          ? directionState.direction === "ENTRY"
+                            ? "font-medium text-emerald-600"
+                            : "font-medium text-blue-600"
+                          : "text-amber-600"
+                    }
+                  >
+                    {faceAlignmentState === "unsupported"
+                      ? "Fallback"
+                      : directionReady
+                        ? directionState.direction
+                        : directionState.sampleCount >= 8
+                          ? "Unclear"
+                          : "Learning"}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">Motion confidence</span>
+                  <span className="font-mono text-slate-900">
+                    {faceAlignmentState === "unsupported"
+                      ? "--"
+                      : `${Math.round(directionState.confidence * 100)}%`}
                   </span>
                 </div>
                 {readerSourceDeviceId && (
@@ -528,6 +651,9 @@ export default function GateSimulator() {
               {readerMessage && (
                 <p className="mt-3 text-sm text-slate-600">{readerMessage}</p>
               )}
+              <p className="mt-3 text-xs text-slate-500">
+                Entry is inferred from left-to-right or approaching-camera motion. Exit uses the reverse path.
+              </p>
             </div>
 
             <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">

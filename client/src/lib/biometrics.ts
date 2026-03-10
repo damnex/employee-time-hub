@@ -1,9 +1,26 @@
 const FACE_GRID_SIZE = 8;
 const FACE_CAPTURE_SIZE = 128;
+const DEFAULT_SAMPLE_DELAY_MS = 80;
+const DEFAULT_MIN_SAMPLE_QUALITY = 0.2;
 
 export interface FaceCaptureSample {
   descriptor: number[];
   quality: number;
+}
+
+export interface FaceTemplateCaptureOptions {
+  sampleCount: number;
+  sampleDelayMs?: number;
+  minQuality?: number;
+  maxAttempts?: number;
+  onProgress?: (acceptedSamples: number, attemptCount: number) => void;
+}
+
+export interface FaceTemplateCaptureResult {
+  descriptor: number[];
+  averageQuality: number;
+  acceptedSamples: number;
+  attempts: number;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -160,4 +177,92 @@ export function averageFaceSamples(descriptors: number[][]) {
   });
 
   return normalizeDescriptor(merged);
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function mergeFaceCaptureSamples(samples: FaceCaptureSample[]) {
+  if (!samples.length) {
+    return {
+      descriptor: [],
+      averageQuality: 0,
+    };
+  }
+
+  const descriptorLength = samples[0]?.descriptor.length ?? 0;
+  if (!descriptorLength) {
+    return {
+      descriptor: [],
+      averageQuality: 0,
+    };
+  }
+
+  const merged = Array.from({ length: descriptorLength }, (_, index) => {
+    let weightedSum = 0;
+    let totalWeight = 0;
+
+    samples.forEach((sample) => {
+      const weight = Math.max(0.12, sample.quality);
+      weightedSum += sample.descriptor[index] * weight;
+      totalWeight += weight;
+    });
+
+    return totalWeight ? weightedSum / totalWeight : 0;
+  });
+
+  const averageQuality =
+    samples.reduce((sum, sample) => sum + sample.quality, 0) / samples.length;
+
+  return {
+    descriptor: normalizeDescriptor(merged),
+    averageQuality: Number(averageQuality.toFixed(3)),
+  };
+}
+
+export async function captureFaceTemplate(
+  video: HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+  options: FaceTemplateCaptureOptions,
+): Promise<FaceTemplateCaptureResult> {
+  const {
+    sampleCount,
+    sampleDelayMs = DEFAULT_SAMPLE_DELAY_MS,
+    minQuality = DEFAULT_MIN_SAMPLE_QUALITY,
+    maxAttempts = sampleCount * 3,
+    onProgress,
+  } = options;
+
+  const acceptedSamples: FaceCaptureSample[] = [];
+  let attempts = 0;
+
+  while (acceptedSamples.length < sampleCount && attempts < maxAttempts) {
+    const sample = captureFaceSample(video, canvas);
+    attempts += 1;
+
+    if (sample && sample.quality >= minQuality) {
+      acceptedSamples.push(sample);
+      onProgress?.(acceptedSamples.length, attempts);
+    }
+
+    if (acceptedSamples.length < sampleCount) {
+      await delay(sampleDelayMs);
+    }
+  }
+
+  if (acceptedSamples.length < sampleCount) {
+    throw new Error(
+      `Only ${acceptedSamples.length} of ${sampleCount} clear samples were captured. Improve lighting, keep still, and retry.`,
+    );
+  }
+
+  const { descriptor, averageQuality } = mergeFaceCaptureSamples(acceptedSamples);
+
+  return {
+    descriptor,
+    averageQuality,
+    acceptedSamples: acceptedSamples.length,
+    attempts,
+  };
 }
