@@ -45,18 +45,35 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { faceProfileSchema, insertEmployeeSchema } from "@shared/schema";
+import { faceProfileSchema, insertEmployeeSchema, type FacePoseCoverage } from "@shared/schema";
 import {
-  allowInsecureFaceFallback,
   captureFaceTemplate,
+  describeFacePose,
+  getDefaultEnrollmentPoseTargets,
   getBiometricCameraConstraints,
   getBiometricRuntimeInfo,
-  isFaceDetectorAvailable,
+  startFaceTracking,
+  type FaceTrackingSnapshot,
 } from "@/lib/biometrics";
 import { useDeviceWS } from "@/hooks/use-device-ws";
 
-const ENROLLMENT_SAMPLE_COUNT = 25;
-const ENROLLMENT_SAMPLE_DELAY_MS = 90;
+const ENROLLMENT_POSE_TARGETS = getDefaultEnrollmentPoseTargets();
+const ENROLLMENT_SAMPLE_COUNT =
+  ENROLLMENT_POSE_TARGETS.front
+  + ENROLLMENT_POSE_TARGETS.left
+  + ENROLLMENT_POSE_TARGETS.right;
+const ENROLLMENT_SAMPLE_DELAY_MS = 110;
+
+function createEmptyPoseCounts(): FacePoseCoverage {
+  return {
+    front: 0,
+    left: 0,
+    right: 0,
+    up: 0,
+    down: 0,
+    unknown: 0,
+  };
+}
 
 const defaultFormValues = {
   employeeCode: "",
@@ -99,6 +116,9 @@ export default function Employees() {
   const [isCapturingFace, setIsCapturingFace] = useState(false);
   const [capturedSamples, setCapturedSamples] = useState(0);
   const [captureQuality, setCaptureQuality] = useState<number | null>(null);
+  const [capturePoseCounts, setCapturePoseCounts] = useState<FacePoseCoverage>(createEmptyPoseCounts);
+  const [latestTrackedPose, setLatestTrackedPose] = useState<string>("Front");
+  const [trackingSnapshot, setTrackingSnapshot] = useState<FaceTrackingSnapshot | null>(null);
   const [rfidReaderMessage, setRfidReaderMessage] = useState<string | null>(null);
   const [rfidSourceDeviceId, setRfidSourceDeviceId] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -111,8 +131,7 @@ export default function Employees() {
 
   const faceDescriptor = form.watch("faceDescriptor");
   const biometricRuntime = getBiometricRuntimeInfo();
-  const faceDetectorAvailable = biometricRuntime.detectorAvailable && isFaceDetectorAvailable();
-  const fallbackCaptureAllowed = biometricRuntime.fallbackAllowed && allowInsecureFaceFallback();
+  const modelCaptureAvailable = biometricRuntime.detectorAvailable;
   const watchedRfidUid = form.watch("rfidUid");
   const normalizedRfidUid = watchedRfidUid.trim().toUpperCase();
   const mappedBadgeOwner = employees?.find((employee) => {
@@ -121,11 +140,15 @@ export default function Employees() {
   const rfidReady = Boolean(normalizedRfidUid) && !mappedBadgeOwner;
   const faceProfileReady = Boolean(faceDescriptor?.primaryDescriptor?.length);
   const faceError = form.formState.errors.faceDescriptor?.message;
-  const compatibilityModeMessage = biometricRuntime.compatibilityMode
+  const poseCoverageReady =
+    capturePoseCounts.front >= ENROLLMENT_POSE_TARGETS.front
+    && capturePoseCounts.left >= ENROLLMENT_POSE_TARGETS.left
+    && capturePoseCounts.right >= ENROLLMENT_POSE_TARGETS.right;
+  const compatibilityModeMessage = biometricRuntime.detectorAvailable
     ? biometricRuntime.isIOS || biometricRuntime.isSafari
-      ? "iPhone/Safari compatibility mode is active. This uses the regular front camera, not Apple Face ID hardware."
-      : "Browser compatibility mode is active. This uses the standard camera only, so matching is less strict."
-    : null;
+      ? "Model-backed face capture is active in the browser camera. This is not Apple Face ID hardware, but it now uses a real ML face engine."
+      : "Model-backed face capture is active. The camera auto-tracks the face and records multi-angle embeddings."
+    : "This browser cannot run the ML face capture reliably.";
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -187,6 +210,19 @@ export default function Employees() {
       }
     };
   }, [isDialogOpen, cameraRetryToken]);
+
+  useEffect(() => {
+    if (!isDialogOpen || !cameraActive || !videoRef.current || isCapturingFace) {
+      return;
+    }
+
+    return startFaceTracking(videoRef.current, (snapshot) => {
+      setTrackingSnapshot(snapshot);
+      setLatestTrackedPose(describeFacePose(snapshot.pose));
+    }, {
+      mode: "tracking",
+    });
+  }, [cameraActive, isCapturingFace, isDialogOpen]);
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -251,6 +287,9 @@ export default function Employees() {
     setIsCapturingFace(false);
     setCapturedSamples(0);
     setCaptureQuality(null);
+     setCapturePoseCounts(createEmptyPoseCounts());
+     setLatestTrackedPose("Front");
+     setTrackingSnapshot(null);
     setCameraError(null);
     setRfidReaderMessage(null);
     setRfidSourceDeviceId(null);
@@ -266,12 +305,10 @@ export default function Employees() {
   };
 
   const handleCaptureFace = async () => {
-    if (!faceDetectorAvailable && !fallbackCaptureAllowed) {
+    if (!modelCaptureAvailable) {
       form.setError("faceDescriptor", {
         type: "manual",
-        message: biometricRuntime.isIOS || biometricRuntime.isSafari
-          ? "Secure detector-backed enrollment is unavailable here. Turn on compatibility mode or use Chrome or Edge."
-          : "Use Chrome or Edge for secure biometric enrollment. Fallback capture is disabled.",
+        message: "This browser cannot run the ML face capture. Use a supported desktop browser or recent iPhone/Safari browser with camera access.",
       });
       return;
     }
@@ -287,17 +324,22 @@ export default function Employees() {
     setIsCapturingFace(true);
     setCapturedSamples(0);
     setCaptureQuality(null);
+    setCapturePoseCounts(createEmptyPoseCounts());
     form.clearErrors("faceDescriptor");
 
     try {
       const template = await captureFaceTemplate(videoRef.current, canvasRef.current, {
         sampleCount: ENROLLMENT_SAMPLE_COUNT,
         sampleDelayMs: ENROLLMENT_SAMPLE_DELAY_MS,
-        minQuality: 0.24,
-        maxAttempts: ENROLLMENT_SAMPLE_COUNT * 3,
-        requireDetector: !fallbackCaptureAllowed,
-        onProgress: (acceptedSamples) => {
+        minQuality: 0.5,
+        maxAttempts: ENROLLMENT_SAMPLE_COUNT * 6,
+        poseTargets: ENROLLMENT_POSE_TARGETS,
+        minLiveConfidence: 0.45,
+        minRealConfidence: 0.35,
+        onProgress: (acceptedSamples, _attemptCount, poseCounts, latestPose) => {
           setCapturedSamples(acceptedSamples);
+          setCapturePoseCounts(poseCounts);
+          setLatestTrackedPose(describeFacePose(latestPose));
         },
       });
 
@@ -307,6 +349,7 @@ export default function Employees() {
         shouldValidate: true,
       });
       setCaptureQuality(template.averageQuality);
+      setCapturePoseCounts(template.poseCounts);
     } catch (error) {
       form.setError("faceDescriptor", {
         type: "manual",
@@ -323,6 +366,7 @@ export default function Employees() {
   const handleClearEnrollment = () => {
     setCapturedSamples(0);
     setCaptureQuality(null);
+    setCapturePoseCounts(createEmptyPoseCounts());
     form.setValue("faceDescriptor", null, {
       shouldDirty: true,
       shouldTouch: true,
@@ -544,6 +588,12 @@ export default function Employees() {
                             </span>
                           </div>
                           <div className="flex items-center justify-between">
+                            <span>Pose coverage</span>
+                            <span className={poseCoverageReady ? "text-emerald-600" : ""}>
+                              {poseCoverageReady ? "Front + sides" : "Need front/left/right"}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
                             <span>Capture quality</span>
                             <span>
                               {captureQuality !== null
@@ -560,7 +610,7 @@ export default function Employees() {
                         <div>
                           <p className="text-sm font-semibold">Biometric Profile</p>
                           <p className="text-xs text-muted-foreground">
-                            Twenty-five face crops are merged into a biometric profile. Detector-backed capture is preferred; compatibility mode works on iPhone/Safari but uses the regular selfie camera only.
+                            The ML engine auto-tracks the face and captures front, left, and right embeddings during enrollment. Ask the employee to look straight, then turn left and right naturally.
                           </p>
                         </div>
                         {faceProfileReady ? (
@@ -584,10 +634,28 @@ export default function Employees() {
 
                         {cameraActive && (
                           <>
-                            <div className="absolute inset-5 rounded-[1.25rem] border border-primary/40" />
+                            <div className="absolute inset-5 rounded-[1.25rem] border border-primary/20" />
                             <div className="absolute left-4 top-4 rounded-full bg-black/55 px-3 py-1 text-[11px] font-medium text-white">
-                              Live enrollment camera
+                              ML enrollment camera
                             </div>
+                            <div className="absolute right-4 top-4 rounded-full bg-black/55 px-3 py-1 text-[11px] font-medium text-white">
+                              Pose: {latestTrackedPose}
+                            </div>
+                            {trackingSnapshot?.bounds && (
+                              <div
+                                className={`absolute rounded-[1.1rem] border-2 transition-all duration-200 ${
+                                  trackingSnapshot.status === "ready"
+                                    ? "border-emerald-300 shadow-[0_0_0_1px_rgba(110,231,183,0.6),0_0_24px_rgba(16,185,129,0.22)]"
+                                    : "border-amber-300 shadow-[0_0_0_1px_rgba(252,211,77,0.6),0_0_20px_rgba(252,211,77,0.18)]"
+                                }`}
+                                style={{
+                                  left: `${(trackingSnapshot.bounds.x / (videoRef.current?.videoWidth || 1)) * 100}%`,
+                                  top: `${(trackingSnapshot.bounds.y / (videoRef.current?.videoHeight || 1)) * 100}%`,
+                                  width: `${(trackingSnapshot.bounds.width / (videoRef.current?.videoWidth || 1)) * 100}%`,
+                                  height: `${(trackingSnapshot.bounds.height / (videoRef.current?.videoHeight || 1)) * 100}%`,
+                                }}
+                              />
+                            )}
                           </>
                         )}
 
@@ -595,25 +663,24 @@ export default function Employees() {
                           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
                             <Camera className="size-10 text-white/40" />
                             <p className="max-w-xs text-sm text-white/70">
-                              {cameraError ?? (!faceDetectorAvailable && !fallbackCaptureAllowed
-                                ? biometricRuntime.isIOS || biometricRuntime.isSafari
-                                  ? "Turn on compatibility mode for iPhone/Safari, or use Chrome or Edge for detector-backed capture."
-                                  : "Use Chrome or Edge for secure biometric enrollment."
-                                : compatibilityModeMessage ?? "Starting live camera feed...")}
+                              {cameraError ?? compatibilityModeMessage ?? "Starting live camera feed..."}
                             </p>
                           </div>
                         )}
 
                         {isCapturingFace && (
                           <div className="absolute inset-0 bg-primary/15 backdrop-blur-[2px] flex items-center justify-center">
-                            <div className="rounded-full bg-black/70 px-4 py-2 text-sm font-medium text-white">
-                              Capturing sample {capturedSamples + 1} / {ENROLLMENT_SAMPLE_COUNT}
+                            <div className="space-y-2 rounded-2xl bg-black/70 px-4 py-3 text-center text-sm font-medium text-white">
+                              <div>Capturing sample {Math.min(capturedSamples + 1, ENROLLMENT_SAMPLE_COUNT)} / {ENROLLMENT_SAMPLE_COUNT}</div>
+                              <div className="text-xs text-white/80">
+                                Required poses: Front {capturePoseCounts.front}/{ENROLLMENT_POSE_TARGETS.front}, Left {capturePoseCounts.left}/{ENROLLMENT_POSE_TARGETS.left}, Right {capturePoseCounts.right}/{ENROLLMENT_POSE_TARGETS.right}
+                              </div>
                             </div>
                           </div>
                         )}
                       </div>
 
-                      <div className="grid gap-3 sm:grid-cols-2">
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                         <div className="rounded-xl bg-muted/30 px-3 py-2">
                           <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
                             Samples
@@ -632,6 +699,37 @@ export default function Employees() {
                               : "--"}
                           </p>
                         </div>
+                        <div className="rounded-xl bg-muted/30 px-3 py-2">
+                          <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
+                            Front
+                          </p>
+                          <p className="text-lg font-semibold text-foreground">
+                            {capturePoseCounts.front} / {ENROLLMENT_POSE_TARGETS.front}
+                          </p>
+                        </div>
+                        <div className="rounded-xl bg-muted/30 px-3 py-2">
+                          <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
+                            Side Poses
+                          </p>
+                          <div className="mt-2 grid grid-cols-2 gap-2">
+                            <div className="rounded-lg bg-background/80 px-2 py-1.5">
+                              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+                                Left
+                              </p>
+                              <p className="text-base font-semibold text-foreground">
+                                {capturePoseCounts.left} / {ENROLLMENT_POSE_TARGETS.left}
+                              </p>
+                            </div>
+                            <div className="rounded-lg bg-background/80 px-2 py-1.5 text-right">
+                              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+                                Right
+                              </p>
+                              <p className="text-base font-semibold text-foreground">
+                                {capturePoseCounts.right} / {ENROLLMENT_POSE_TARGETS.right}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
                       </div>
 
                       <div className="h-2 overflow-hidden rounded-full bg-muted">
@@ -648,7 +746,7 @@ export default function Employees() {
                           type="button"
                           className="flex-1"
                           onClick={handleCaptureFace}
-                          disabled={!cameraActive || (!faceDetectorAvailable && !fallbackCaptureAllowed) || isCapturingFace}
+                          disabled={!cameraActive || !modelCaptureAvailable || isCapturingFace}
                         >
                           {isCapturingFace ? (
                             <>
@@ -703,17 +801,66 @@ export default function Employees() {
                         ) : (
                           <div className="space-y-2">
                             {compatibilityModeMessage && (
-                              <p className="text-amber-700">{compatibilityModeMessage}</p>
+                              <p className="text-muted-foreground">{compatibilityModeMessage}</p>
                             )}
                             <div className="flex items-start gap-2 text-muted-foreground">
                               <AlertCircle className="mt-0.5 size-4 shrink-0" />
                               <p>
-                                {faceDetectorAvailable
-                                  ? "Center the face in frame, keep still for one second, then capture all 25 samples."
-                                  : fallbackCaptureAllowed
-                                    ? "Compatibility fallback capture is enabled in this environment. Keep the full face centered, well lit, and close to the camera."
-                                    : "Open this page in Chrome or Edge before enrolling. Insecure fallback capture is blocked."}
+                                {trackingSnapshot?.guidance
+                                  ?? "Keep the tracked face box visible. The system will collect front, left, and right face embeddings for the new ML profile."}
                               </p>
+                            </div>
+                            <div className="space-y-2">
+                              <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground">
+                                Pose Checklist
+                              </p>
+                              <div className={`rounded-xl border px-3 py-2.5 ${capturePoseCounts.front >= ENROLLMENT_POSE_TARGETS.front ? "border-emerald-300 bg-emerald-50/70 text-emerald-700" : "border-border/70 bg-background/75 text-foreground"}`}>
+                                <div className="flex items-center justify-between gap-3">
+                                  <div>
+                                    <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                                      Front Capture
+                                    </p>
+                                    <p className="text-sm font-medium">
+                                      Straight face toward camera
+                                    </p>
+                                  </div>
+                                  <p className="text-lg font-semibold">
+                                    {capturePoseCounts.front} / {ENROLLMENT_POSE_TARGETS.front}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <div className={`rounded-xl border px-3 py-3 ${capturePoseCounts.left >= ENROLLMENT_POSE_TARGETS.left ? "border-emerald-300 bg-emerald-50/70 text-emerald-700" : "border-border/70 bg-background/75 text-foreground"}`}>
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                      <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                                        Left Side
+                                      </p>
+                                      <p className="mt-1 text-sm font-medium">
+                                        Turn slightly left
+                                      </p>
+                                    </div>
+                                    <p className="text-xl font-semibold">
+                                      {capturePoseCounts.left} / {ENROLLMENT_POSE_TARGETS.left}
+                                    </p>
+                                  </div>
+                                </div>
+                                <div className={`rounded-xl border px-3 py-3 ${capturePoseCounts.right >= ENROLLMENT_POSE_TARGETS.right ? "border-emerald-300 bg-emerald-50/70 text-emerald-700" : "border-border/70 bg-background/75 text-foreground"}`}>
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                      <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
+                                        Right Side
+                                      </p>
+                                      <p className="mt-1 text-sm font-medium">
+                                        Turn slightly right
+                                      </p>
+                                    </div>
+                                    <p className="text-xl font-semibold">
+                                      {capturePoseCounts.right} / {ENROLLMENT_POSE_TARGETS.right}
+                                    </p>
+                                  </div>
+                                </div>
+                              </div>
                             </div>
                           </div>
                         )}
@@ -822,9 +969,15 @@ export default function Employees() {
                     </TableCell>
                     <TableCell>
                       {emp.faceDescriptor ? (
-                        <Badge className="bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-none">
-                          Enrolled
-                        </Badge>
+                        typeof emp.faceDescriptor === "object" && emp.faceDescriptor && "version" in emp.faceDescriptor && emp.faceDescriptor.version === 3 ? (
+                          <Badge className="bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-none">
+                            ML Enrolled
+                          </Badge>
+                        ) : (
+                          <Badge variant="outline" className="border-amber-300 bg-amber-50 text-amber-700">
+                            Legacy
+                          </Badge>
+                        )
                       ) : (
                         <span className="text-xs text-muted-foreground">Pending</span>
                       )}

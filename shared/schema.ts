@@ -5,18 +5,80 @@ import { z } from "zod";
 
 export const faceCaptureModeSchema = z.enum(["detected", "fallback"]);
 export const scanTechnologySchema = z.enum(["HF_RFID", "UHF_RFID"]);
-export const movementAxisSchema = z.enum(["horizontal", "depth", "none"]);
+export const movementAxisSchema = z.enum(["horizontal", "depth", "pose", "none"]);
 export const gateDecisionSchema = z.enum(["ENTRY", "EXIT", "REJECTED", "UNKNOWN"]);
+export const facePoseSchema = z.enum(["front", "left", "right", "up", "down", "unknown"]);
 
-export const faceProfileSchema = z.object({
+const descriptorSchema = z.array(z.number()).min(1);
+
+const faceProfileV2Schema = z.object({
   version: z.literal(2),
   captureMode: faceCaptureModeSchema.optional(),
-  primaryDescriptor: z.array(z.number()).min(1),
-  anchorDescriptors: z.array(z.array(z.number()).min(1)).min(1),
+  primaryDescriptor: descriptorSchema,
+  anchorDescriptors: z.array(descriptorSchema).min(1),
   averageQuality: z.number().min(0).max(1),
   sampleCount: z.number().int().min(1),
   consistency: z.number().min(0).max(1),
 });
+
+export const facePoseCoverageSchema = z.object({
+  front: z.number().int().min(0),
+  left: z.number().int().min(0),
+  right: z.number().int().min(0),
+  up: z.number().int().min(0),
+  down: z.number().int().min(0),
+  unknown: z.number().int().min(0),
+});
+
+export const facePoseEmbeddingSchema = z.object({
+  pose: facePoseSchema,
+  descriptor: descriptorSchema,
+  sampleCount: z.number().int().min(1),
+  averageQuality: z.number().min(0).max(1),
+  yaw: z.number(),
+  pitch: z.number(),
+  roll: z.number(),
+  averageLive: z.number().min(0).max(1).optional(),
+  averageReal: z.number().min(0).max(1).optional(),
+});
+
+export const faceProfileV3Schema = z.object({
+  version: z.literal(3),
+  captureMode: faceCaptureModeSchema.optional(),
+  engine: z.object({
+    provider: z.literal("human"),
+    libraryVersion: z.string(),
+    descriptionModel: z.string(),
+    detectorModel: z.string(),
+    meshModel: z.string(),
+    irisModel: z.string().optional(),
+    livenessModel: z.string().optional(),
+    antispoofModel: z.string().optional(),
+  }),
+  primaryDescriptor: descriptorSchema,
+  anchorDescriptors: z.array(descriptorSchema).min(1),
+  averageQuality: z.number().min(0).max(1),
+  sampleCount: z.number().int().min(1),
+  consistency: z.number().min(0).max(1),
+  poseEmbeddings: z.array(facePoseEmbeddingSchema).min(1),
+  poseCoverage: facePoseCoverageSchema,
+  requiredPoses: z.array(facePoseSchema).min(1),
+  averageLive: z.number().min(0).max(1).optional(),
+  averageReal: z.number().min(0).max(1).optional(),
+  orientationSpread: z.object({
+    minYaw: z.number(),
+    maxYaw: z.number(),
+    minPitch: z.number(),
+    maxPitch: z.number(),
+    minRoll: z.number(),
+    maxRoll: z.number(),
+  }),
+});
+
+export const faceProfileSchema = z.union([
+  faceProfileV2Schema,
+  faceProfileV3Schema,
+]);
 
 export const employees = pgTable("employees", {
   id: serial("id").primaryKey(),
@@ -102,7 +164,11 @@ export type InsertAttendance = z.infer<typeof insertAttendanceSchema>;
 export type GateEvent = typeof gateEvents.$inferSelect;
 export type InsertGateEvent = z.infer<typeof insertGateEventSchema>;
 export type FaceProfile = z.infer<typeof faceProfileSchema>;
+export type FaceProfileV2 = z.infer<typeof faceProfileV2Schema>;
+export type FaceProfileV3 = z.infer<typeof faceProfileV3Schema>;
 export type FaceCaptureMode = z.infer<typeof faceCaptureModeSchema>;
+export type FacePose = z.infer<typeof facePoseSchema>;
+export type FacePoseCoverage = z.infer<typeof facePoseCoverageSchema>;
 export type ScanTechnology = z.infer<typeof scanTechnologySchema>;
 export type MovementAxis = z.infer<typeof movementAxisSchema>;
 export type GateDecision = z.infer<typeof gateDecisionSchema>;

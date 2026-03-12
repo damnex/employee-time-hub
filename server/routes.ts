@@ -9,6 +9,7 @@ import {
   type Attendance,
   type Employee,
   type FaceCaptureMode,
+  type FacePose,
   type MovementAxis,
   type GateDecision,
   type ScanTechnology,
@@ -35,6 +36,12 @@ interface ProcessScanInput {
   faceConsistency?: number;
   faceQuality?: number;
   faceCaptureMode?: FaceCaptureMode;
+  facePose?: FacePose;
+  faceYaw?: number;
+  facePitch?: number;
+  faceRoll?: number;
+  faceLiveConfidence?: number;
+  faceRealConfidence?: number;
   scanTechnology?: ScanTechnology;
   movementDirection?: MovementDirection;
   movementAxis?: MovementAxis;
@@ -61,6 +68,19 @@ interface NormalizedFaceProfile {
   captureMode: FaceCaptureMode | "legacy" | "unknown";
   secureCapture: boolean;
   legacy: boolean;
+  engine: "legacy" | "heuristic" | "human";
+  poseEmbeddings?: Array<{
+    pose: FacePose;
+    descriptor: number[];
+    averageQuality: number;
+    sampleCount: number;
+  }>;
+  pose?: FacePose;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  liveConfidence: number | null;
+  realConfidence: number | null;
 }
 
 interface FaceMatchDetails {
@@ -69,41 +89,57 @@ interface FaceMatchDetails {
   peakAnchorConfidence: number;
   strongAnchorRatio: number;
   liveConsistency: number;
+  poseConfidence?: number;
+  liveLiveness?: number;
+  liveRealness?: number;
 }
 
-function normalizeDescriptor(descriptor: number[]) {
-  if (!descriptor.length) {
-    return [];
-  }
-
-  const mean =
-    descriptor.reduce((sum, value) => sum + value, 0) / descriptor.length;
-  const centered = descriptor.map((value) => value - mean);
-  const magnitude = Math.sqrt(
-    centered.reduce((sum, value) => sum + value * value, 0),
-  );
-
-  if (!magnitude) {
-    return centered.map(() => 0);
-  }
-
-  return centered.map((value) => value / magnitude);
+function roundMetric(value: number, digits = 4) {
+  return Number(value.toFixed(digits));
 }
 
-function calculateMatchConfidence(v1: number[], v2: number[]): number {
+function calculateLegacyMatchConfidence(v1: number[], v2: number[]): number {
   if (!v1 || !v2 || v1.length !== v2.length || !v1.length) {
     return 0;
   }
 
-  const normalizedV1 = normalizeDescriptor(v1);
-  const normalizedV2 = normalizeDescriptor(v2);
-
-  let dotProduct = 0;
-  for (let i = 0; i < normalizedV1.length; i++) {
-    dotProduct += normalizedV1[i] * normalizedV2[i];
+  const meanV1 = v1.reduce((sum, value) => sum + value, 0) / v1.length;
+  const meanV2 = v2.reduce((sum, value) => sum + value, 0) / v2.length;
+  const centeredV1 = v1.map((value) => value - meanV1);
+  const centeredV2 = v2.map((value) => value - meanV2);
+  const magnitudeV1 = Math.sqrt(centeredV1.reduce((sum, value) => sum + value * value, 0));
+  const magnitudeV2 = Math.sqrt(centeredV2.reduce((sum, value) => sum + value * value, 0));
+  if (!magnitudeV1 || !magnitudeV2) {
+    return 0;
   }
 
-  return Number((((dotProduct + 1) / 2)).toFixed(4));
+  let dotProduct = 0;
+  for (let i = 0; i < centeredV1.length; i++) {
+    dotProduct += (centeredV1[i] / magnitudeV1) * (centeredV2[i] / magnitudeV2);
+  }
+
+  return roundMetric((dotProduct + 1) / 2);
+}
+
+function calculateHumanMatchConfidence(v1: number[], v2: number[]) {
+  if (!v1 || !v2 || v1.length !== v2.length || !v1.length) {
+    return 0;
+  }
+
+  let sum = 0;
+  for (let i = 0; i < v1.length; i++) {
+    const diff = v1[i] - v2[i];
+    sum += diff * diff;
+  }
+
+  const distance = 25 * sum;
+  if (distance === 0) {
+    return 1;
+  }
+
+  const root = Math.sqrt(distance);
+  const normalized = (1 - root / 100 - 0.2) / 0.6;
+  return roundMetric(Math.max(Math.min(normalized, 1), 0));
 }
 
 function average(values: number[]) {
@@ -128,6 +164,12 @@ function normalizeStoredFaceProfile(faceDescriptor: unknown): NormalizedFaceProf
       captureMode: "legacy",
       secureCapture: false,
       legacy: true,
+      engine: "legacy",
+      yaw: 0,
+      pitch: 0,
+      roll: 0,
+      liveConfidence: null,
+      realConfidence: null,
     };
   }
 
@@ -143,7 +185,22 @@ function normalizeStoredFaceProfile(faceDescriptor: unknown): NormalizedFaceProf
     averageQuality: parsedProfile.data.averageQuality,
     captureMode: parsedProfile.data.captureMode ?? "unknown",
     secureCapture: parsedProfile.data.captureMode === "detected",
-    legacy: false,
+    legacy: parsedProfile.data.version !== 3,
+    engine: parsedProfile.data.version === 3 ? "human" : "heuristic",
+    poseEmbeddings: parsedProfile.data.version === 3
+      ? parsedProfile.data.poseEmbeddings.map((embedding) => ({
+          pose: embedding.pose,
+          descriptor: embedding.descriptor,
+          averageQuality: embedding.averageQuality,
+          sampleCount: embedding.sampleCount,
+        }))
+      : undefined,
+    pose: "unknown",
+    yaw: 0,
+    pitch: 0,
+    roll: 0,
+    liveConfidence: parsedProfile.data.version === 3 ? (parsedProfile.data.averageLive ?? null) : null,
+    realConfidence: parsedProfile.data.version === 3 ? (parsedProfile.data.averageReal ?? null) : null,
   };
 }
 
@@ -164,6 +221,26 @@ function normalizeLiveFaceProfile(input: ProcessScanInput): NormalizedFaceProfil
     captureMode: input.faceCaptureMode ?? "fallback",
     secureCapture: input.faceCaptureMode === "detected",
     legacy: false,
+    engine:
+      input.facePose
+      || input.faceLiveConfidence !== undefined
+      || input.faceRealConfidence !== undefined
+        ? "human"
+        : "heuristic",
+    poseEmbeddings: input.facePose
+      ? [{
+          pose: input.facePose,
+          descriptor: input.faceDescriptor,
+          averageQuality: input.faceQuality ?? input.faceConsistency ?? 0.35,
+          sampleCount: 1,
+        }]
+      : undefined,
+    pose: input.facePose ?? "unknown",
+    yaw: input.faceYaw ?? 0,
+    pitch: input.facePitch ?? 0,
+    roll: input.faceRoll ?? 0,
+    liveConfidence: input.faceLiveConfidence ?? null,
+    realConfidence: input.faceRealConfidence ?? null,
   };
 }
 
@@ -171,36 +248,68 @@ function calculateProfileMatchMetrics(
   liveProfile: NormalizedFaceProfile,
   storedProfile: NormalizedFaceProfile,
 ) {
+  const useHumanEmbeddingMatch =
+    liveProfile.engine === "human" && storedProfile.engine === "human";
+  const similarity = useHumanEmbeddingMatch
+    ? calculateHumanMatchConfidence
+    : calculateLegacyMatchConfidence;
+  const strongAnchorThreshold = useHumanEmbeddingMatch
+    ? HUMAN_FACE_ANCHOR_AVG_THRESHOLD
+    : FACE_ANCHOR_AVG_THRESHOLD;
   const primaryConfidence = Math.max(
-    calculateMatchConfidence(liveProfile.primaryDescriptor, storedProfile.primaryDescriptor),
+    similarity(liveProfile.primaryDescriptor, storedProfile.primaryDescriptor),
     ...storedProfile.anchorDescriptors.map((anchor) => {
-      return calculateMatchConfidence(liveProfile.primaryDescriptor, anchor);
+      return similarity(liveProfile.primaryDescriptor, anchor);
     }),
   );
   const anchorScores = liveProfile.anchorDescriptors.map((liveAnchor) => {
     return Math.max(
-      calculateMatchConfidence(liveAnchor, storedProfile.primaryDescriptor),
+      similarity(liveAnchor, storedProfile.primaryDescriptor),
       ...storedProfile.anchorDescriptors.map((storedAnchor) => {
-        return calculateMatchConfidence(liveAnchor, storedAnchor);
+        return similarity(liveAnchor, storedAnchor);
       }),
     );
   });
   const anchorAverage = average(anchorScores);
   const peakAnchorConfidence = Math.max(...anchorScores, 0);
   const strongAnchorRatio =
-    anchorScores.filter((score) => score >= FACE_ANCHOR_AVG_THRESHOLD).length
+    anchorScores.filter((score) => score >= strongAnchorThreshold).length
     / Math.max(1, anchorScores.length);
-  const finalConfidence = Number((
-    primaryConfidence * 0.45
-    + anchorAverage * 0.45
-    + strongAnchorRatio * 0.1
-  ).toFixed(4));
+  const poseScores = storedProfile.poseEmbeddings?.map((poseEmbedding) => {
+    return {
+      pose: poseEmbedding.pose,
+      similarity: similarity(liveProfile.primaryDescriptor, poseEmbedding.descriptor),
+    };
+  }) ?? [];
+  const poseConfidence = poseScores.length
+    ? Math.max(
+        ...poseScores.map((poseScore) => poseScore.similarity),
+        liveProfile.pose && liveProfile.pose !== "unknown"
+          ? poseScores.find((poseScore) => poseScore.pose === liveProfile.pose)?.similarity ?? 0
+          : 0,
+      )
+    : primaryConfidence;
+  const finalConfidence = roundMetric(
+    useHumanEmbeddingMatch
+      ? (
+          primaryConfidence * 0.38
+          + anchorAverage * 0.27
+          + poseConfidence * 0.25
+          + strongAnchorRatio * 0.1
+        )
+      : (
+          primaryConfidence * 0.45
+          + anchorAverage * 0.45
+          + strongAnchorRatio * 0.1
+        ),
+  );
 
   return {
-    primaryConfidence,
-    anchorAverage: Number(anchorAverage.toFixed(4)),
-    peakAnchorConfidence: Number(peakAnchorConfidence.toFixed(4)),
-    strongAnchorRatio: Number(strongAnchorRatio.toFixed(4)),
+    primaryConfidence: roundMetric(primaryConfidence),
+    anchorAverage: roundMetric(anchorAverage),
+    peakAnchorConfidence: roundMetric(peakAnchorConfidence),
+    strongAnchorRatio: roundMetric(strongAnchorRatio),
+    poseConfidence: roundMetric(poseConfidence),
     finalConfidence,
   };
 }
@@ -219,6 +328,16 @@ const LEGACY_FACE_MATCH_THRESHOLD = 0.9;
 const MIN_STORED_FACE_QUALITY = 0.18;
 const MIN_LIVE_FACE_QUALITY = 0.16;
 const MIN_INSECURE_LIVE_FACE_QUALITY = 0.2;
+const HUMAN_FACE_MATCH_THRESHOLD = 0.57;
+const HUMAN_FACE_PRIMARY_THRESHOLD = 0.58;
+const HUMAN_FACE_ANCHOR_AVG_THRESHOLD = 0.54;
+const HUMAN_FACE_ANCHOR_RATIO_THRESHOLD = 0.55;
+const HUMAN_FACE_POSE_THRESHOLD = 0.55;
+const HUMAN_FACE_SCAN_CONSISTENCY_THRESHOLD = 0.6;
+const MIN_HUMAN_STORED_FACE_QUALITY = 0.48;
+const MIN_HUMAN_LIVE_FACE_QUALITY = 0.42;
+const MIN_HUMAN_LIVE_LIVENESS = 0.45;
+const MIN_HUMAN_LIVE_REALNESS = 0.35;
 const DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
 
 function normalizeScanTechnology(scanTechnology?: ScanTechnology): ScanTechnology {
@@ -327,7 +446,7 @@ async function resolveAttendanceDecision(
 
       return {
         success: false,
-        message: "Movement direction was unclear. Walk fully through the frame and scan again.",
+        message: "Direction was unclear. Show a clear left or right side-face while scanning again.",
         employee,
         attendance,
         matchConfidence,
@@ -348,7 +467,7 @@ async function resolveAttendanceDecision(
 
         return {
           success: false,
-          message: "An entry is already open. Exit direction is required before another entry.",
+          message: "An entry is already open. Show the exit-side face before marking another scan.",
           employee,
           attendance,
           matchConfidence,
@@ -382,7 +501,7 @@ async function resolveAttendanceDecision(
 
       return {
         success: false,
-        message: "No active entry was found. Capture an entry direction before exiting.",
+        message: "No active entry was found. Mark an entry first while the correct entry-side face is visible.",
         employee,
         attendance,
         matchConfidence,
@@ -585,7 +704,127 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     });
   }
 
-  if (!storedFaceProfile.legacy && storedFaceProfile.averageQuality < MIN_STORED_FACE_QUALITY) {
+  if (storedFaceProfile.engine !== liveFaceProfile.engine) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return logAndReturn({
+      success: false,
+      message: storedFaceProfile.engine === "human"
+        ? "The gate is still using the older biometric engine. Refresh the terminal and retry the scan."
+        : "This employee is enrolled with the previous biometric engine. Re-enroll the employee with the new ML face capture.",
+      employee,
+      attendance,
+      matchConfidence,
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
+  }
+
+  if (storedFaceProfile.engine === "human") {
+    if (storedFaceProfile.averageQuality < MIN_HUMAN_STORED_FACE_QUALITY) {
+      const attendance = await createFailureAttendance(
+        employee.id,
+        todayDate,
+        now,
+        input.deviceId,
+        "FAILED_FACE",
+      );
+
+      return logAndReturn({
+        success: false,
+        message: "Stored ML face profile quality is too low. Re-enroll this employee with front, left, and right capture.",
+        employee,
+        attendance,
+        matchConfidence,
+      }, {
+        verificationStatus: "FAILED_FACE",
+        decision: "REJECTED",
+        liveFaceProfile,
+      });
+    }
+
+    if (liveFaceProfile.averageQuality < MIN_HUMAN_LIVE_FACE_QUALITY) {
+      const attendance = await createFailureAttendance(
+        employee.id,
+        todayDate,
+        now,
+        input.deviceId,
+        "FAILED_FACE",
+      );
+
+      return logAndReturn({
+        success: false,
+        message: "Live ML face quality is too low. Move closer, reduce backlight, and keep the tracked face box stable before retrying.",
+        employee,
+        attendance,
+        matchConfidence,
+        movementDirection: input.movementDirection,
+        movementConfidence: input.movementConfidence,
+      }, {
+        verificationStatus: "FAILED_FACE",
+        decision: "REJECTED",
+        liveFaceProfile,
+      });
+    }
+
+    if ((liveFaceProfile.liveConfidence ?? 0) < MIN_HUMAN_LIVE_LIVENESS) {
+      const attendance = await createFailureAttendance(
+        employee.id,
+        todayDate,
+        now,
+        input.deviceId,
+        "FAILED_FACE",
+      );
+
+      return logAndReturn({
+        success: false,
+        message: "Liveness verification failed. Ask the person to blink or move naturally and retry in better lighting.",
+        employee,
+        attendance,
+        matchConfidence,
+      }, {
+        verificationStatus: "FAILED_FACE",
+        decision: "REJECTED",
+        liveFaceProfile,
+      });
+    }
+
+    if ((liveFaceProfile.realConfidence ?? 0) < MIN_HUMAN_LIVE_REALNESS) {
+      const attendance = await createFailureAttendance(
+        employee.id,
+        todayDate,
+        now,
+        input.deviceId,
+        "FAILED_FACE",
+      );
+
+      return logAndReturn({
+        success: false,
+        message: "Anti-spoof verification failed. Remove glare, masks, or screen reflections and retry with a real face in view.",
+        employee,
+        attendance,
+        matchConfidence,
+      }, {
+        verificationStatus: "FAILED_FACE",
+        decision: "REJECTED",
+        liveFaceProfile,
+      });
+    }
+  }
+
+  if (
+    storedFaceProfile.engine !== "human"
+    && !storedFaceProfile.legacy
+    && storedFaceProfile.averageQuality < MIN_STORED_FACE_QUALITY
+  ) {
     const attendance = await createFailureAttendance(
       employee.id,
       todayDate,
@@ -611,7 +850,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     ? MIN_LIVE_FACE_QUALITY
     : MIN_INSECURE_LIVE_FACE_QUALITY;
 
-  if (liveFaceProfile.averageQuality < requiredLiveQuality) {
+  if (liveFaceProfile.engine !== "human" && liveFaceProfile.averageQuality < requiredLiveQuality) {
     const attendance = await createFailureAttendance(
       employee.id,
       todayDate,
@@ -636,7 +875,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   }
 
   if (storedFaceProfile.legacy) {
-    matchConfidence = calculateMatchConfidence(
+    matchConfidence = calculateLegacyMatchConfidence(
       liveFaceProfile.primaryDescriptor,
       storedFaceProfile.primaryDescriptor,
     );
@@ -646,7 +885,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       anchorAverage: matchConfidence,
       peakAnchorConfidence: matchConfidence,
       strongAnchorRatio: matchConfidence >= LEGACY_FACE_MATCH_THRESHOLD ? 1 : 0,
-      liveConsistency: Number(liveFaceProfile.consistency.toFixed(4)),
+      liveConsistency: roundMetric(liveFaceProfile.consistency),
     };
   } else {
     const metrics = calculateProfileMatchMetrics(liveFaceProfile, storedFaceProfile);
@@ -656,25 +895,38 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       anchorAverage: metrics.anchorAverage,
       peakAnchorConfidence: metrics.peakAnchorConfidence,
       strongAnchorRatio: metrics.strongAnchorRatio,
-      liveConsistency: Number(liveFaceProfile.consistency.toFixed(4)),
+      liveConsistency: roundMetric(liveFaceProfile.consistency),
+      poseConfidence: metrics.poseConfidence,
+      liveLiveness: liveFaceProfile.liveConfidence ?? undefined,
+      liveRealness: liveFaceProfile.realConfidence ?? undefined,
     };
 
-    const securePair = storedFaceProfile.secureCapture && liveFaceProfile.secureCapture;
-    faceMatched = securePair
-      ? (
-          metrics.finalConfidence >= FACE_MATCH_THRESHOLD
-          && metrics.primaryConfidence >= FACE_PRIMARY_THRESHOLD
-          && metrics.anchorAverage >= FACE_ANCHOR_AVG_THRESHOLD
-          && metrics.strongAnchorRatio >= FACE_ANCHOR_RATIO_THRESHOLD
-          && liveFaceProfile.consistency >= FACE_SCAN_CONSISTENCY_THRESHOLD
-        )
-      : (
-          metrics.finalConfidence >= INSECURE_FACE_MATCH_THRESHOLD
-          && metrics.primaryConfidence >= INSECURE_FACE_PRIMARY_THRESHOLD
-          && metrics.anchorAverage >= INSECURE_FACE_ANCHOR_AVG_THRESHOLD
-          && metrics.strongAnchorRatio >= INSECURE_FACE_ANCHOR_RATIO_THRESHOLD
-          && liveFaceProfile.consistency >= INSECURE_FACE_SCAN_CONSISTENCY_THRESHOLD
-        );
+    if (storedFaceProfile.engine === "human" && liveFaceProfile.engine === "human") {
+      faceMatched =
+        metrics.finalConfidence >= HUMAN_FACE_MATCH_THRESHOLD
+        && metrics.primaryConfidence >= HUMAN_FACE_PRIMARY_THRESHOLD
+        && metrics.anchorAverage >= HUMAN_FACE_ANCHOR_AVG_THRESHOLD
+        && metrics.strongAnchorRatio >= HUMAN_FACE_ANCHOR_RATIO_THRESHOLD
+        && metrics.poseConfidence >= HUMAN_FACE_POSE_THRESHOLD
+        && liveFaceProfile.consistency >= HUMAN_FACE_SCAN_CONSISTENCY_THRESHOLD;
+    } else {
+      const securePair = storedFaceProfile.secureCapture && liveFaceProfile.secureCapture;
+      faceMatched = securePair
+        ? (
+            metrics.finalConfidence >= FACE_MATCH_THRESHOLD
+            && metrics.primaryConfidence >= FACE_PRIMARY_THRESHOLD
+            && metrics.anchorAverage >= FACE_ANCHOR_AVG_THRESHOLD
+            && metrics.strongAnchorRatio >= FACE_ANCHOR_RATIO_THRESHOLD
+            && liveFaceProfile.consistency >= FACE_SCAN_CONSISTENCY_THRESHOLD
+          )
+        : (
+            metrics.finalConfidence >= INSECURE_FACE_MATCH_THRESHOLD
+            && metrics.primaryConfidence >= INSECURE_FACE_PRIMARY_THRESHOLD
+            && metrics.anchorAverage >= INSECURE_FACE_ANCHOR_AVG_THRESHOLD
+            && metrics.strongAnchorRatio >= INSECURE_FACE_ANCHOR_RATIO_THRESHOLD
+            && liveFaceProfile.consistency >= INSECURE_FACE_SCAN_CONSISTENCY_THRESHOLD
+          );
+    }
   }
 
   if (!faceMatched) {
@@ -687,8 +939,11 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
         + `peak=${matchDetails.peakAnchorConfidence.toFixed(4)} `
         + `ratio=${matchDetails.strongAnchorRatio.toFixed(4)} `
         + `consistency=${matchDetails.liveConsistency.toFixed(4)} `
+        + `pose=${matchDetails.poseConfidence?.toFixed(4) ?? "--"} `
         + `liveQuality=${liveFaceProfile.averageQuality.toFixed(4)} `
-        + `storedQuality=${storedFaceProfile.averageQuality.toFixed(4)}`,
+        + `storedQuality=${storedFaceProfile.averageQuality.toFixed(4)} `
+        + `liveness=${liveFaceProfile.liveConfidence?.toFixed(4) ?? "--"} `
+        + `real=${liveFaceProfile.realConfidence?.toFixed(4) ?? "--"}`,
       );
     }
 
@@ -902,6 +1157,35 @@ export async function registerRoutes(
             faceQuality:
               typeof message.faceQuality === "number"
                 ? message.faceQuality
+                : undefined,
+            facePose:
+              message.facePose === "front"
+              || message.facePose === "left"
+              || message.facePose === "right"
+              || message.facePose === "up"
+              || message.facePose === "down"
+              || message.facePose === "unknown"
+                ? message.facePose
+                : undefined,
+            faceYaw:
+              typeof message.faceYaw === "number"
+                ? message.faceYaw
+                : undefined,
+            facePitch:
+              typeof message.facePitch === "number"
+                ? message.facePitch
+                : undefined,
+            faceRoll:
+              typeof message.faceRoll === "number"
+                ? message.faceRoll
+                : undefined,
+            faceLiveConfidence:
+              typeof message.faceLiveConfidence === "number"
+                ? message.faceLiveConfidence
+                : undefined,
+            faceRealConfidence:
+              typeof message.faceRealConfidence === "number"
+                ? message.faceRealConfidence
                 : undefined,
             scanTechnology:
               message.scanTechnology === "HF_RFID" || message.scanTechnology === "UHF_RFID"

@@ -1,40 +1,69 @@
-import type { FaceCaptureMode, FaceProfile } from "@shared/schema";
+import type { Config, FaceResult } from "@vladmandic/human";
+import type {
+  FaceCaptureMode,
+  FacePose,
+  FacePoseCoverage,
+  FaceProfile,
+  FaceProfileV3,
+} from "@shared/schema";
 
-const FACE_GRID_SIZE = 12;
-const FACE_CAPTURE_SIZE = 128;
-const DEFAULT_SAMPLE_DELAY_MS = 80;
-const DEFAULT_MIN_SAMPLE_QUALITY = 0.2;
-const DEFAULT_ANCHOR_COUNT = 5;
-const DEFAULT_FALLBACK_CROP_SCALE = 0.82;
-const DEFAULT_FALLBACK_FACE_CENTER_Y = 0.44;
-const FACE_MASK_CENTER_Y = 0.47;
-const FACE_MASK_RADIUS_X = 0.39;
-const FACE_MASK_RADIUS_Y = 0.5;
+type HumanModule = typeof import("@vladmandic/human");
+type HumanInstance = InstanceType<HumanModule["default"]>;
 
-interface FaceDetectorLike {
-  detect: (source: CanvasImageSource) => Promise<Array<{
-    boundingBox: FaceCropBounds;
-  }>>;
-}
+const HUMAN_MODEL_BASE_PATH = "/ml-models/";
+const TRACKING_INTERVAL_MS = 220;
+const DEFAULT_SAMPLE_DELAY_MS = 110;
+const DEFAULT_MIN_SAMPLE_QUALITY = 0.5;
+const DEFAULT_MIN_LIVE_CONFIDENCE = 0.45;
+const DEFAULT_MIN_REAL_CONFIDENCE = 0.35;
+const DEFAULT_MAX_ATTEMPTS_MULTIPLIER = 5;
 
-interface FaceCropBounds {
+const RAD_TO_DEG = 180 / Math.PI;
+
+const DEFAULT_POSE_TARGETS: FacePoseCoverage = {
+  front: 14,
+  left: 11,
+  right: 11,
+  up: 0,
+  down: 0,
+  unknown: 0,
+};
+
+export interface FaceCropBounds {
   x: number;
   y: number;
   width: number;
   height: number;
 }
 
-declare global {
-  interface Window {
-    FaceDetector?: new (options?: { fastMode?: boolean; maxDetectedFaces?: number }) => FaceDetectorLike;
-  }
-}
-
-let cachedFaceDetector: FaceDetectorLike | false | null = null;
-
 export interface FaceCaptureSample {
   descriptor: number[];
   quality: number;
+  pose: FacePose;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  liveConfidence: number;
+  realConfidence: number;
+  distance: number | null;
+}
+
+export interface FaceTrackingSnapshot {
+  status: "loading" | "ready" | "no-face" | "multiple" | "off-center" | "low-quality" | "unsupported";
+  faceCount: number;
+  bounds: FaceCropBounds | null;
+  quality: number;
+  pose: FacePose;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  liveConfidence: number;
+  realConfidence: number;
+  distance: number | null;
+  boxScore: number;
+  faceScore: number;
+  descriptor: number[] | null;
+  guidance: string;
 }
 
 export interface FaceTemplateCaptureOptions {
@@ -43,7 +72,15 @@ export interface FaceTemplateCaptureOptions {
   minQuality?: number;
   maxAttempts?: number;
   requireDetector?: boolean;
-  onProgress?: (acceptedSamples: number, attemptCount: number) => void;
+  poseTargets?: Partial<FacePoseCoverage>;
+  minLiveConfidence?: number;
+  minRealConfidence?: number;
+  onProgress?: (
+    acceptedSamples: number,
+    attemptCount: number,
+    poseCounts: FacePoseCoverage,
+    latestPose: FacePose,
+  ) => void;
 }
 
 export interface FaceTemplateCaptureResult {
@@ -55,6 +92,7 @@ export interface FaceTemplateCaptureResult {
   consistency: number;
   captureMode: FaceCaptureMode;
   profile: FaceProfile;
+  poseCounts: FacePoseCoverage;
 }
 
 export interface BiometricRuntimeInfo {
@@ -65,22 +103,278 @@ export interface BiometricRuntimeInfo {
   compatibilityMode: boolean;
 }
 
-function clamp(value: number, min: number, max: number) {
-  return Math.min(Math.max(value, min), max);
+interface AggregatedPoseEmbedding {
+  pose: FacePose;
+  descriptor: number[];
+  sampleCount: number;
+  averageQuality: number;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  averageLive: number;
+  averageReal: number;
 }
 
-function normalizeDescriptor(values: number[]) {
-  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
-  const centered = values.map((value) => value - mean);
-  const magnitude = Math.sqrt(
-    centered.reduce((sum, value) => sum + value * value, 0),
-  );
+let humanPromise: Promise<HumanInstance> | null = null;
 
-  if (!magnitude) {
-    return centered.map(() => 0);
-  }
+const HUMAN_CONFIG: Partial<Config> = {
+  backend: "webgl",
+  modelBasePath: HUMAN_MODEL_BASE_PATH,
+  warmup: "face",
+  async: true,
+  cacheModels: true,
+  validateModels: false,
+  debug: false,
+  skipAllowed: false,
+  cacheSensitivity: 0.7,
+  filter: {
+    enabled: true,
+    autoBrightness: true,
+    contrast: 0.02,
+    sharpness: 0.2,
+    return: true,
+  },
+  gesture: {
+    enabled: false,
+  },
+  face: {
+    enabled: true,
+    detector: {
+      enabled: true,
+      modelPath: "blazeface.json",
+      rotation: true,
+      maxDetected: 1,
+      minConfidence: 0.35,
+      minSize: 80,
+      iouThreshold: 0.2,
+      scale: 1.55,
+      mask: false,
+      return: false,
+      skipFrames: 1,
+      skipTime: 60,
+      square: false,
+    },
+    mesh: {
+      enabled: true,
+      modelPath: "facemesh.json",
+      skipFrames: 1,
+      skipTime: 80,
+      keepInvalid: false,
+    },
+    iris: {
+      enabled: true,
+      modelPath: "iris.json",
+      skipFrames: 1,
+      skipTime: 120,
+      scale: 2.2,
+    },
+    description: {
+      enabled: true,
+      modelPath: "faceres.json",
+      skipFrames: 1,
+      skipTime: 60,
+      minConfidence: 0.2,
+    },
+    antispoof: {
+      enabled: true,
+      modelPath: "antispoof.json",
+      skipFrames: 1,
+      skipTime: 80,
+    },
+    liveness: {
+      enabled: true,
+      modelPath: "liveness.json",
+      skipFrames: 1,
+      skipTime: 80,
+    },
+    emotion: {
+      enabled: false,
+      modelPath: "emotion.json",
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    attention: {
+      enabled: false,
+      modelPath: "facemesh-attention.json",
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    gear: {
+      enabled: false,
+      modelPath: "",
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+  },
+  body: {
+    enabled: false,
+    maxDetected: 1,
+    minConfidence: 0.2,
+    skipFrames: 99,
+    skipTime: 1500,
+    modelPath: "movenet-lightning.json",
+  },
+  hand: {
+    enabled: false,
+    maxDetected: 2,
+    minConfidence: 0.2,
+    skipFrames: 99,
+    skipTime: 1500,
+    detector: {
+      modelPath: "handtrack.json",
+    },
+    skeleton: {
+      modelPath: "handlandmark-lite.json",
+    },
+  },
+  object: {
+    enabled: false,
+    maxDetected: 1,
+    minConfidence: 0.2,
+    skipFrames: 99,
+    skipTime: 1500,
+    modelPath: "centernet.json",
+  },
+  segmentation: {
+    enabled: false,
+    modelPath: "",
+  },
+};
 
-  return centered.map((value) => Number((value / magnitude).toFixed(6)));
+const TRACKING_CONFIG: Partial<Config> = {
+  face: {
+    enabled: true,
+    detector: {
+      enabled: true,
+      rotation: true,
+      maxDetected: 1,
+      minConfidence: 0.35,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    mesh: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+      keepInvalid: false,
+    },
+    iris: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+      scale: 2.2,
+    },
+    description: {
+      enabled: false,
+      minConfidence: 0.2,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    antispoof: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    liveness: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    emotion: {
+      enabled: false,
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    attention: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    gear: {
+      enabled: false,
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+  },
+  gesture: {
+    enabled: false,
+  },
+};
+
+const CAPTURE_CONFIG: Partial<Config> = {
+  face: {
+    enabled: true,
+    detector: {
+      enabled: true,
+      rotation: true,
+      maxDetected: 1,
+      minConfidence: 0.35,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    mesh: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+      keepInvalid: false,
+    },
+    iris: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+      scale: 2.2,
+    },
+    description: {
+      enabled: true,
+      minConfidence: 0.2,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    antispoof: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    liveness: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    emotion: {
+      enabled: false,
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    attention: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    gear: {
+      enabled: false,
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+  },
+  gesture: {
+    enabled: false,
+  },
+};
+
+function sleep(durationMs: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
 }
 
 function average(values: number[]) {
@@ -91,16 +385,50 @@ function average(values: number[]) {
   return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-export function isFaceDetectorAvailable() {
-  return (
-    typeof window !== "undefined"
-    && "FaceDetector" in window
-    && typeof window.FaceDetector === "function"
-  );
+function roundMetric(value: number, digits = 3) {
+  return Number(value.toFixed(digits));
 }
 
-export function allowInsecureFaceFallback() {
-  return import.meta.env.VITE_ALLOW_INSECURE_FACE_FALLBACK === "true";
+function createEmptyPoseCoverage(): FacePoseCoverage {
+  return {
+    front: 0,
+    left: 0,
+    right: 0,
+    up: 0,
+    down: 0,
+    unknown: 0,
+  };
+}
+
+function mergePoseCoverage(targets?: Partial<FacePoseCoverage>) {
+  return {
+    ...createEmptyPoseCoverage(),
+    ...(targets ?? {}),
+  };
+}
+
+function resolvePoseTargets(sampleCount: number, poseTargets?: Partial<FacePoseCoverage>) {
+  const explicitTargets = mergePoseCoverage(poseTargets);
+  const explicitTotal = Object.values(explicitTargets).reduce((sum, value) => sum + value, 0);
+  if (explicitTotal > 0) {
+    return explicitTargets;
+  }
+
+  if (sampleCount === DEFAULT_POSE_TARGETS.front + DEFAULT_POSE_TARGETS.left + DEFAULT_POSE_TARGETS.right) {
+    return { ...DEFAULT_POSE_TARGETS };
+  }
+
+  const front = Math.max(6, Math.round(sampleCount * 0.4));
+  const left = Math.max(4, Math.round(sampleCount * 0.3));
+  const right = Math.max(4, sampleCount - front - left);
+  return {
+    front,
+    left,
+    right,
+    up: 0,
+    down: 0,
+    unknown: 0,
+  };
 }
 
 function isIOSDevice() {
@@ -127,8 +455,268 @@ function isSafariBrowser() {
     && !/chrome|crios|edg|edgios|android|fxios/.test(userAgent);
 }
 
+function supportsModelRuntime() {
+  if (typeof window === "undefined" || typeof navigator === "undefined" || typeof document === "undefined") {
+    return false;
+  }
+
+  return (
+    typeof navigator.mediaDevices?.getUserMedia === "function"
+    && typeof WebAssembly !== "undefined"
+    && typeof document.createElement === "function"
+  );
+}
+
+function getFaceBounds(face: FaceResult): FaceCropBounds {
+  return {
+    x: face.box[0],
+    y: face.box[1],
+    width: face.box[2],
+    height: face.box[3],
+  };
+}
+
+function getPoseFromFace(face: FaceResult): FacePose {
+  if (face.mesh && face.mesh.length > 450) {
+    const zDiff = (face.mesh[33]?.[2] || 0) - (face.mesh[263]?.[2] || 0);
+    const xDiff = face.mesh[33]?.[0] - face.mesh[263]?.[0];
+    const facingRatio = xDiff ? Math.abs(zDiff / xDiff) : 0;
+    if (facingRatio > 0.18) {
+      return zDiff < 0 ? "left" : "right";
+    }
+
+    const chinDepth = face.mesh[152]?.[2] || 0;
+    if (chinDepth < -10) {
+      return "up";
+    }
+    if (chinDepth > 10) {
+      return "down";
+    }
+  }
+
+  return "front";
+}
+
+function getTrackingQuality(face: FaceResult, video: HTMLVideoElement) {
+  const bounds = getFaceBounds(face);
+  const centerX = (bounds.x + bounds.width / 2) / Math.max(1, video.videoWidth);
+  const centerY = (bounds.y + bounds.height / 2) / Math.max(1, video.videoHeight);
+  const widthRatio = bounds.width / Math.max(1, video.videoWidth);
+  const heightRatio = bounds.height / Math.max(1, video.videoHeight);
+  const centerPenalty = Math.abs(centerX - 0.5) + Math.abs(centerY - 0.48);
+  const centerScore = clamp(1 - centerPenalty * 1.45, 0, 1);
+  const widthScore = clamp(1 - Math.abs(widthRatio - 0.3) / 0.24, 0, 1);
+  const heightScore = clamp(1 - Math.abs(heightRatio - 0.42) / 0.28, 0, 1);
+  const boxScore = face.boxScore || 0;
+  const faceScore = face.faceScore || face.score || 0;
+  const liveScore = face.live ?? 0.65;
+  const realScore = face.real ?? 0.65;
+
+  return roundMetric(
+    centerScore * 0.18
+    + widthScore * 0.12
+    + heightScore * 0.12
+    + boxScore * 0.18
+    + faceScore * 0.18
+    + liveScore * 0.11
+    + realScore * 0.11,
+  );
+}
+
+function getGuidanceForSnapshot(snapshot: FaceTrackingSnapshot) {
+  switch (snapshot.status) {
+    case "loading":
+      return "Loading the face model and camera frame.";
+    case "no-face":
+      return "Step into view so the camera can find a face.";
+    case "multiple":
+      return "Keep only one face in the camera frame.";
+    case "off-center":
+      return "Move closer and keep the face inside the tracked frame.";
+    case "low-quality":
+      return "Improve lighting and face angle for a sharper biometric read.";
+    case "unsupported":
+      return "This browser cannot run the face ML pipeline reliably.";
+    case "ready":
+    default:
+      return "Face tracked. Hold steady or move through the portal.";
+  }
+}
+
+function buildUnsupportedSnapshot(message: string): FaceTrackingSnapshot {
+  const snapshot: FaceTrackingSnapshot = {
+    status: "unsupported",
+    faceCount: 0,
+    bounds: null,
+    quality: 0,
+    pose: "unknown",
+    yaw: 0,
+    pitch: 0,
+    roll: 0,
+    liveConfidence: 0,
+    realConfidence: 0,
+    distance: null,
+    boxScore: 0,
+    faceScore: 0,
+    descriptor: null,
+    guidance: message,
+  };
+
+  return snapshot;
+}
+
+function buildTrackingSnapshot(video: HTMLVideoElement, faces: FaceResult[]): FaceTrackingSnapshot {
+  if (video.readyState < 2) {
+    return {
+      status: "loading",
+      faceCount: 0,
+      bounds: null,
+      quality: 0,
+      pose: "unknown",
+      yaw: 0,
+      pitch: 0,
+      roll: 0,
+      liveConfidence: 0,
+      realConfidence: 0,
+      distance: null,
+      boxScore: 0,
+      faceScore: 0,
+      descriptor: null,
+      guidance: "Waiting for a live camera frame.",
+    };
+  }
+
+  if (faces.length === 0) {
+    const snapshot: FaceTrackingSnapshot = {
+      status: "no-face",
+      faceCount: 0,
+      bounds: null,
+      quality: 0,
+      pose: "unknown",
+      yaw: 0,
+      pitch: 0,
+      roll: 0,
+      liveConfidence: 0,
+      realConfidence: 0,
+      distance: null,
+      boxScore: 0,
+      faceScore: 0,
+      descriptor: null,
+      guidance: "",
+    };
+    snapshot.guidance = getGuidanceForSnapshot(snapshot);
+    return snapshot;
+  }
+
+  if (faces.length > 1) {
+    const snapshot: FaceTrackingSnapshot = {
+      status: "multiple",
+      faceCount: faces.length,
+      bounds: null,
+      quality: 0,
+      pose: "unknown",
+      yaw: 0,
+      pitch: 0,
+      roll: 0,
+      liveConfidence: 0,
+      realConfidence: 0,
+      distance: null,
+      boxScore: 0,
+      faceScore: 0,
+      descriptor: null,
+      guidance: "",
+    };
+    snapshot.guidance = getGuidanceForSnapshot(snapshot);
+    return snapshot;
+  }
+
+  const face = faces[0];
+  const bounds = getFaceBounds(face);
+  const yaw = roundMetric((face.rotation?.angle.yaw ?? 0) * RAD_TO_DEG, 1);
+  const pitch = roundMetric((face.rotation?.angle.pitch ?? 0) * RAD_TO_DEG, 1);
+  const roll = roundMetric((face.rotation?.angle.roll ?? 0) * RAD_TO_DEG, 1);
+  const quality = getTrackingQuality(face, video);
+  const pose = getPoseFromFace(face);
+  const centerX = (bounds.x + bounds.width / 2) / Math.max(1, video.videoWidth);
+  const centerY = (bounds.y + bounds.height / 2) / Math.max(1, video.videoHeight);
+  const widthRatio = bounds.width / Math.max(1, video.videoWidth);
+  const heightRatio = bounds.height / Math.max(1, video.videoHeight);
+  const centeredEnough =
+    centerX > 0.22
+    && centerX < 0.78
+    && centerY > 0.18
+    && centerY < 0.82;
+  const sizeEnough =
+    widthRatio > 0.16
+    && widthRatio < 0.72
+    && heightRatio > 0.22
+    && heightRatio < 0.88;
+
+  const status = !centeredEnough || !sizeEnough
+    ? "off-center"
+    : quality < DEFAULT_MIN_SAMPLE_QUALITY
+      ? "low-quality"
+      : "ready";
+
+  const snapshot: FaceTrackingSnapshot = {
+    status,
+    faceCount: 1,
+    bounds,
+    quality,
+    pose,
+    yaw,
+    pitch,
+    roll,
+    liveConfidence: roundMetric(face.live ?? 0, 3),
+    realConfidence: roundMetric(face.real ?? 0, 3),
+    distance: typeof face.distance === "number" ? roundMetric(face.distance, 3) : null,
+    boxScore: roundMetric(face.boxScore || 0, 3),
+    faceScore: roundMetric(face.faceScore || face.score || 0, 3),
+    descriptor: face.embedding ?? null,
+    guidance: "",
+  };
+  snapshot.guidance = getGuidanceForSnapshot(snapshot);
+  return snapshot;
+}
+
+async function loadHumanModule() {
+  return import("@vladmandic/human");
+}
+
+async function getHuman() {
+  if (!humanPromise) {
+    humanPromise = loadHumanModule().then(async (module) => {
+      const Human = module.default;
+      const human = new Human(HUMAN_CONFIG);
+      human.env.perfadd = false;
+      await human.load();
+      await human.warmup();
+      return human;
+    }).catch((error) => {
+      humanPromise = null;
+      throw error;
+    });
+  }
+
+  return humanPromise;
+}
+
+async function detectFaces(video: HTMLVideoElement, config: Partial<Config>) {
+  const human = await getHuman();
+  const result = await human.detect(video, config);
+  return result.face ?? [];
+}
+
+export function isFaceDetectorAvailable() {
+  return supportsModelRuntime();
+}
+
+export function allowInsecureFaceFallback() {
+  return import.meta.env.VITE_ALLOW_INSECURE_FACE_FALLBACK === "true";
+}
+
 export function getBiometricRuntimeInfo(): BiometricRuntimeInfo {
-  const detectorAvailable = isFaceDetectorAvailable();
+  const detectorAvailable = supportsModelRuntime();
   const fallbackAllowed = allowInsecureFaceFallback();
 
   return {
@@ -146,497 +734,360 @@ export function getBiometricCameraConstraints(): MediaTrackConstraints {
   return {
     facingMode: "user",
     width: { ideal: runtime.isIOS ? 1280 : 960, min: 640 },
-    height: { ideal: runtime.isIOS ? 720 : 540, min: 480 },
+    height: { ideal: runtime.isIOS ? 960 : 720, min: 480 },
     frameRate: { ideal: 30, max: 30 },
   };
 }
 
-function buildFaceWeightMask(width: number, height: number) {
-  const mask = new Float32Array(width * height);
-  const centerX = width / 2;
-  const centerY = height * FACE_MASK_CENTER_Y;
-  const radiusX = width * FACE_MASK_RADIUS_X;
-  const radiusY = height * FACE_MASK_RADIUS_Y;
-
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const normalizedX = (x - centerX) / Math.max(1, radiusX);
-      const normalizedY = (y - centerY) / Math.max(1, radiusY);
-      const radialDistance = normalizedX * normalizedX + normalizedY * normalizedY;
-      const weight = radialDistance >= 1
-        ? 0.12
-        : Math.max(0.12, 1 - radialDistance);
-
-      mask[y * width + x] = weight * weight;
-    }
+export function describeFacePose(pose: FacePose) {
+  switch (pose) {
+    case "front":
+      return "Front";
+    case "left":
+      return "Left";
+    case "right":
+      return "Right";
+    case "up":
+      return "Up";
+    case "down":
+      return "Down";
+    default:
+      return "Unknown";
   }
-
-  return mask;
 }
 
-function equalizeGrayscale(grayscale: Float32Array) {
-  const histogram = new Uint32Array(256);
-
-  grayscale.forEach((value) => {
-    histogram[Math.max(0, Math.min(255, Math.round(value)))] += 1;
-  });
-
-  const cdf = new Uint32Array(256);
-  let runningTotal = 0;
-  for (let i = 0; i < histogram.length; i++) {
-    runningTotal += histogram[i];
-    cdf[i] = runningTotal;
-  }
-
-  const firstNonZero = cdf.find((value) => value > 0) ?? 0;
-  const totalPixels = grayscale.length;
-  if (!totalPixels || totalPixels === firstNonZero) {
-    return grayscale;
-  }
-
-  const equalized = new Float32Array(totalPixels);
-  for (let i = 0; i < grayscale.length; i++) {
-    const sourceValue = Math.max(0, Math.min(255, Math.round(grayscale[i])));
-    equalized[i] = ((cdf[sourceValue] - firstNonZero) / (totalPixels - firstNonZero)) * 255;
-  }
-
-  return equalized;
+export function getDefaultEnrollmentPoseTargets() {
+  return { ...DEFAULT_POSE_TARGETS };
 }
 
-function getFaceCropRegion(
-  sourceWidth: number,
-  sourceHeight: number,
-  faceBounds?: FaceCropBounds | null,
-) {
-  if (!faceBounds) {
-    const cropSize = Math.min(sourceWidth, sourceHeight) * DEFAULT_FALLBACK_CROP_SCALE;
-    const faceCenterX = sourceWidth / 2;
-    const faceCenterY = sourceHeight * DEFAULT_FALLBACK_FACE_CENTER_Y;
-    return {
-      offsetX: clamp(
-        faceCenterX - cropSize / 2,
-        0,
-        Math.max(0, sourceWidth - cropSize),
-      ),
-      offsetY: clamp(
-        faceCenterY - cropSize / 2,
-        0,
-        Math.max(0, sourceHeight - cropSize),
-      ),
-      cropSize,
-    };
-  }
-
-  const faceCenterX = faceBounds.x + faceBounds.width / 2;
-  const faceCenterY = faceBounds.y + faceBounds.height / 2;
-  const cropSize = Math.max(faceBounds.width, faceBounds.height) * 1.8;
-  const clampedCropSize = Math.min(Math.max(cropSize, 96), Math.min(sourceWidth, sourceHeight));
-  const offsetX = clamp(
-    faceCenterX - clampedCropSize / 2,
-    0,
-    Math.max(0, sourceWidth - clampedCropSize),
-  );
-  const offsetY = clamp(
-    faceCenterY - clampedCropSize / 2,
-    0,
-    Math.max(0, sourceHeight - clampedCropSize),
-  );
-
-  return {
-    offsetX,
-    offsetY,
-    cropSize: clampedCropSize,
-  };
+function getRequiredPoseList(poseTargets: FacePoseCoverage) {
+  return (Object.keys(poseTargets) as FacePose[]).filter((pose) => poseTargets[pose] > 0);
 }
 
-function drawVideoFrame(
-  video: HTMLVideoElement,
-  canvas: HTMLCanvasElement,
-  faceBounds?: FaceCropBounds | null,
-) {
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) {
-    return null;
-  }
-
-  canvas.width = FACE_CAPTURE_SIZE;
-  canvas.height = FACE_CAPTURE_SIZE;
-
-  const sourceWidth = video.videoWidth || FACE_CAPTURE_SIZE;
-  const sourceHeight = video.videoHeight || FACE_CAPTURE_SIZE;
-  const { cropSize, offsetX, offsetY } = getFaceCropRegion(
-    sourceWidth,
-    sourceHeight,
-    faceBounds,
-  );
-
-  ctx.drawImage(
-    video,
-    offsetX,
-    offsetY,
-    cropSize,
-    cropSize,
-    0,
-    0,
-    FACE_CAPTURE_SIZE,
-    FACE_CAPTURE_SIZE,
-  );
-
-  return ctx.getImageData(0, 0, FACE_CAPTURE_SIZE, FACE_CAPTURE_SIZE);
+function hasRequiredPoseCoverage(coverage: FacePoseCoverage, targets: FacePoseCoverage) {
+  return (Object.keys(targets) as FacePose[]).every((pose) => coverage[pose] >= targets[pose]);
 }
 
-export function captureFaceSample(
-  video: HTMLVideoElement,
-  canvas: HTMLCanvasElement,
-  faceBounds?: FaceCropBounds | null,
-): FaceCaptureSample | null {
-  if (!video.videoWidth || !video.videoHeight) {
-    return null;
-  }
-
-  const imageData = drawVideoFrame(video, canvas, faceBounds);
-  if (!imageData) {
-    return null;
-  }
-
-  const { data, width, height } = imageData;
-  const grayscale = new Float32Array(width * height);
-
-  for (let i = 0; i < data.length; i += 4) {
-    const pixelIndex = i / 4;
-    grayscale[pixelIndex] =
-      0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
-  }
-
-  const normalizedGrayscale = equalizeGrayscale(grayscale);
-  const faceMask = buildFaceWeightMask(width, height);
-
-  const blockSize = width / FACE_GRID_SIZE;
-  const brightnessFeatures: number[] = [];
-  const textureFeatures: number[] = [];
-  let maskedBrightnessSum = 0;
-  let maskedWeightSum = 0;
-
-  for (let gridY = 0; gridY < FACE_GRID_SIZE; gridY++) {
-    for (let gridX = 0; gridX < FACE_GRID_SIZE; gridX++) {
-      let brightnessSum = 0;
-      let textureSum = 0;
-      let blockWeightSum = 0;
-
-      const startX = Math.floor(gridX * blockSize);
-      const endX = Math.floor((gridX + 1) * blockSize);
-      const startY = Math.floor(gridY * blockSize);
-      const endY = Math.floor((gridY + 1) * blockSize);
-
-      for (let y = startY; y < endY; y++) {
-        for (let x = startX; x < endX; x++) {
-          const index = y * width + x;
-          const value = normalizedGrayscale[index];
-          const weight = faceMask[index];
-          brightnessSum += value * weight;
-          maskedBrightnessSum += value * weight;
-          maskedWeightSum += weight;
-
-          const right = x + 1 < width ? normalizedGrayscale[index + 1] : value;
-          const down = y + 1 < height ? normalizedGrayscale[index + width] : value;
-          const horizontalGradient = value - right;
-          const verticalGradient = value - down;
-          textureSum += Math.sqrt(
-            horizontalGradient * horizontalGradient
-              + verticalGradient * verticalGradient,
-          ) * weight;
-
-          blockWeightSum += weight;
-        }
-      }
-
-      const normalizedWeight = Math.max(blockWeightSum, 1e-6);
-      brightnessFeatures.push(brightnessSum / (normalizedWeight * 255));
-      textureFeatures.push(textureSum / (normalizedWeight * 255));
-    }
-  }
-
-  const descriptor = normalizeDescriptor([
-    ...brightnessFeatures,
-    ...textureFeatures,
-  ]);
-
-  const averageBrightness = maskedBrightnessSum / Math.max(maskedWeightSum, 1e-6) / 255;
-  const contrast = Math.sqrt(
-    brightnessFeatures.reduce((sum, value) => {
-      const delta = value - averageBrightness;
-      return sum + delta * delta;
-    }, 0) / brightnessFeatures.length,
-  );
-  const sharpness =
-    textureFeatures.reduce((sum, value) => sum + value, 0)
-    / textureFeatures.length;
-  const exposure = 1 - Math.min(1, Math.abs(averageBrightness - 0.5) * 2);
-  const faceCenterX = faceBounds
-    ? (faceBounds.x + faceBounds.width / 2) / Math.max(1, video.videoWidth)
-    : 0.5;
-  const faceCenterY = faceBounds
-    ? (faceBounds.y + faceBounds.height / 2) / Math.max(1, video.videoHeight)
-    : DEFAULT_FALLBACK_FACE_CENTER_Y;
-  const centeredness = 1 - clamp(
-    Math.sqrt(
-      (faceCenterX - 0.5) * (faceCenterX - 0.5)
-      + (faceCenterY - DEFAULT_FALLBACK_FACE_CENTER_Y) * (faceCenterY - DEFAULT_FALLBACK_FACE_CENTER_Y),
-    ) / 0.35,
-    0,
-    1,
-  );
-  const faceCoverage = faceBounds
-    ? (faceBounds.width * faceBounds.height) / Math.max(1, video.videoWidth * video.videoHeight)
-    : 0.18;
-  const framing = 1 - clamp(Math.abs(faceCoverage - 0.18) / 0.14, 0, 1);
-  const quality = clamp(
-    contrast * 2.1
-      + sharpness * 3.3
-      + exposure * 0.55
-      + centeredness * 0.35
-      + framing * 0.35,
-    0,
-    1,
-  );
-
-  return {
-    descriptor,
-    quality: Number(quality.toFixed(3)),
-  };
+function getMissingPoseCoverage(coverage: FacePoseCoverage, targets: FacePoseCoverage) {
+  return (Object.keys(targets) as FacePose[])
+    .filter((pose) => coverage[pose] < targets[pose])
+    .map((pose) => `${describeFacePose(pose)} (${coverage[pose]}/${targets[pose]})`);
 }
 
-export function averageFaceSamples(descriptors: number[][]) {
+function averageFaceSamplesInternal(descriptors: number[][]) {
   if (!descriptors.length) {
     return [];
   }
 
-  const merged = descriptors[0].map((_, index) => {
-    const sum = descriptors.reduce(
-      (runningTotal, descriptor) => runningTotal + descriptor[index],
-      0,
-    );
+  const dimension = descriptors[0].length;
+  const sums = new Array<number>(dimension).fill(0);
 
-    return sum / descriptors.length;
+  descriptors.forEach((descriptor) => {
+    descriptor.forEach((value, index) => {
+      sums[index] += value;
+    });
   });
 
-  return normalizeDescriptor(merged);
+  return sums.map((value) => roundMetric(value / descriptors.length, 6));
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function averageFaceSamples(descriptors: number[][]) {
+  return averageFaceSamplesInternal(descriptors);
+}
+
+function calculateDescriptorDistance(v1: number[], v2: number[]) {
+  if (!v1.length || v1.length !== v2.length) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  let sum = 0;
+  for (let i = 0; i < v1.length; i++) {
+    const diff = v1[i] - v2[i];
+    sum += diff * diff;
+  }
+
+  return roundMetric(25 * sum, 4);
 }
 
 export function calculateDescriptorSimilarity(v1: number[], v2: number[]) {
-  if (!v1 || !v2 || v1.length !== v2.length || !v1.length) {
+  const distance = calculateDescriptorDistance(v1, v2);
+  if (distance === Number.MAX_SAFE_INTEGER) {
     return 0;
   }
-
-  const normalizedV1 = normalizeDescriptor(v1);
-  const normalizedV2 = normalizeDescriptor(v2);
-  let dotProduct = 0;
-
-  for (let i = 0; i < normalizedV1.length; i++) {
-    dotProduct += normalizedV1[i] * normalizedV2[i];
-  }
-
-  return Number((((dotProduct + 1) / 2)).toFixed(4));
-}
-
-function calculateDescriptorSetConsistency(descriptors: number[][]) {
-  if (descriptors.length < 2) {
+  if (distance === 0) {
     return 1;
   }
 
-  const pairScores: number[] = [];
-
-  for (let i = 0; i < descriptors.length; i++) {
-    for (let j = i + 1; j < descriptors.length; j++) {
-      pairScores.push(calculateDescriptorSimilarity(descriptors[i], descriptors[j]));
-    }
-  }
-
-  return Number(average(pairScores).toFixed(4));
+  const root = Math.sqrt(distance);
+  const normalized = (1 - root / 100 - 0.2) / 0.6;
+  return roundMetric(clamp(normalized, 0, 1), 4);
 }
 
-function selectAnchorDescriptors(samples: FaceCaptureSample[], anchorCount = DEFAULT_ANCHOR_COUNT) {
-  if (!samples.length) {
-    return [];
+function calculateDescriptorSetConsistency(descriptors: number[][]) {
+  if (descriptors.length <= 1) {
+    return 1;
   }
 
-  if (samples.length <= anchorCount) {
-    return samples.map((sample) => sample.descriptor);
-  }
-
-  const anchors: number[][] = [];
-  for (let anchorIndex = 0; anchorIndex < anchorCount; anchorIndex++) {
-    const segmentStart = Math.floor((anchorIndex * samples.length) / anchorCount);
-    const segmentEnd = Math.max(
-      segmentStart + 1,
-      Math.floor(((anchorIndex + 1) * samples.length) / anchorCount),
-    );
-    const segmentSamples = samples.slice(segmentStart, segmentEnd);
-    const bestSample =
-      segmentSamples.sort((left, right) => right.quality - left.quality)[0]
-      ?? samples[Math.round((anchorIndex * (samples.length - 1)) / Math.max(1, anchorCount - 1))];
-
-    anchors.push(bestSample.descriptor);
-  }
-
-  return anchors;
+  const averagedDescriptor = averageFaceSamplesInternal(descriptors);
+  const scores = descriptors.map((descriptor) => {
+    return calculateDescriptorSimilarity(descriptor, averagedDescriptor);
+  });
+  return roundMetric(average(scores), 4);
 }
 
-function buildFaceProfile(samples: FaceCaptureSample[], captureMode: FaceCaptureMode): FaceProfile {
-  const merged = mergeFaceCaptureSamples(samples);
-  const anchorDescriptors = selectAnchorDescriptors(samples);
-  const consistency = calculateDescriptorSetConsistency(
-    samples.map((sample) => sample.descriptor),
-  );
+function buildProfileFromSamples(
+  samples: FaceCaptureSample[],
+  human: HumanInstance,
+  targets: FacePoseCoverage,
+): FaceProfileV3 {
+  const grouped = new Map<FacePose, FaceCaptureSample[]>();
+  const coverage = createEmptyPoseCoverage();
+
+  samples.forEach((sample) => {
+    coverage[sample.pose] += 1;
+    grouped.set(sample.pose, [...(grouped.get(sample.pose) ?? []), sample]);
+  });
+
+  const poseEmbeddings = Array.from(grouped.entries())
+    .map(([pose, poseSamples]) => {
+      const descriptors = poseSamples.map((sample) => sample.descriptor);
+      const aggregated: AggregatedPoseEmbedding = {
+        pose,
+        descriptor: averageFaceSamplesInternal(descriptors),
+        sampleCount: poseSamples.length,
+        averageQuality: roundMetric(average(poseSamples.map((sample) => sample.quality))),
+        yaw: roundMetric(average(poseSamples.map((sample) => sample.yaw)), 2),
+        pitch: roundMetric(average(poseSamples.map((sample) => sample.pitch)), 2),
+        roll: roundMetric(average(poseSamples.map((sample) => sample.roll)), 2),
+        averageLive: roundMetric(average(poseSamples.map((sample) => sample.liveConfidence))),
+        averageReal: roundMetric(average(poseSamples.map((sample) => sample.realConfidence))),
+      };
+
+      return aggregated;
+    })
+    .sort((a, b) => b.sampleCount - a.sampleCount);
+
+  const allDescriptors = samples.map((sample) => sample.descriptor);
+  const primaryDescriptor = averageFaceSamplesInternal(allDescriptors);
+  const anchorDescriptors = poseEmbeddings.map((poseEmbedding) => poseEmbedding.descriptor);
 
   return {
-    version: 2,
-    captureMode,
-    primaryDescriptor: merged.descriptor,
+    version: 3,
+    captureMode: "detected",
+    engine: {
+      provider: "human",
+      libraryVersion: human.version,
+      descriptionModel: "faceres.json",
+      detectorModel: "blazeface.json",
+      meshModel: "facemesh.json",
+      irisModel: "iris.json",
+      livenessModel: "liveness.json",
+      antispoofModel: "antispoof.json",
+    },
+    primaryDescriptor,
     anchorDescriptors,
-    averageQuality: merged.averageQuality,
+    averageQuality: roundMetric(average(samples.map((sample) => sample.quality))),
     sampleCount: samples.length,
-    consistency: Number(consistency.toFixed(3)),
+    consistency: calculateDescriptorSetConsistency(allDescriptors),
+    poseEmbeddings: poseEmbeddings.map((poseEmbedding) => ({
+      pose: poseEmbedding.pose,
+      descriptor: poseEmbedding.descriptor,
+      sampleCount: poseEmbedding.sampleCount,
+      averageQuality: poseEmbedding.averageQuality,
+      yaw: poseEmbedding.yaw,
+      pitch: poseEmbedding.pitch,
+      roll: poseEmbedding.roll,
+      averageLive: poseEmbedding.averageLive,
+      averageReal: poseEmbedding.averageReal,
+    })),
+    poseCoverage: coverage,
+    requiredPoses: getRequiredPoseList(targets),
+    averageLive: roundMetric(average(samples.map((sample) => sample.liveConfidence))),
+    averageReal: roundMetric(average(samples.map((sample) => sample.realConfidence))),
+    orientationSpread: {
+      minYaw: roundMetric(Math.min(...samples.map((sample) => sample.yaw)), 2),
+      maxYaw: roundMetric(Math.max(...samples.map((sample) => sample.yaw)), 2),
+      minPitch: roundMetric(Math.min(...samples.map((sample) => sample.pitch)), 2),
+      maxPitch: roundMetric(Math.max(...samples.map((sample) => sample.pitch)), 2),
+      minRoll: roundMetric(Math.min(...samples.map((sample) => sample.roll)), 2),
+      maxRoll: roundMetric(Math.max(...samples.map((sample) => sample.roll)), 2),
+    },
   };
 }
 
-async function getFaceDetector(): Promise<FaceDetectorLike | null> {
-  if (cachedFaceDetector === false) {
-    return null;
+export async function warmupBiometricModels() {
+  if (!supportsModelRuntime()) {
+    throw new Error("This browser cannot run the face ML models.");
   }
 
-  if (cachedFaceDetector) {
-    return cachedFaceDetector;
-  }
-
-  if (
-    typeof window === "undefined"
-    || !("FaceDetector" in window)
-    || typeof window.FaceDetector !== "function"
-  ) {
-    cachedFaceDetector = false;
-    return null;
-  }
-
-  cachedFaceDetector = new window.FaceDetector({
-    fastMode: true,
-    maxDetectedFaces: 1,
-  }) as FaceDetectorLike;
-
-  return cachedFaceDetector;
+  await getHuman();
 }
 
-async function detectSingleFaceBounds(video: HTMLVideoElement) {
-  const detector = await getFaceDetector();
-  if (!detector) {
-    return undefined;
-  }
+export function startFaceTracking(
+  video: HTMLVideoElement,
+  onUpdate: (snapshot: FaceTrackingSnapshot) => void,
+  options: {
+    intervalMs?: number;
+    mode?: "tracking" | "capture";
+  } = {},
+) {
+  let cancelled = false;
+  let inFlight = false;
+  let timeoutId = 0;
 
-  const faces = await detector.detect(video);
-  if (faces.length !== 1) {
-    return null;
-  }
+  const intervalMs = options.intervalMs ?? TRACKING_INTERVAL_MS;
+  const detectConfig = options.mode === "capture" ? CAPTURE_CONFIG : TRACKING_CONFIG;
 
-  return faces[0].boundingBox;
-}
+  const loop = async () => {
+    if (cancelled) {
+      return;
+    }
 
-export function mergeFaceCaptureSamples(samples: FaceCaptureSample[]) {
-  if (!samples.length) {
-    return {
-      descriptor: [],
-      averageQuality: 0,
-    };
-  }
+    if (inFlight) {
+      timeoutId = window.setTimeout(() => {
+        void loop();
+      }, intervalMs);
+      return;
+    }
 
-  const descriptorLength = samples[0]?.descriptor.length ?? 0;
-  if (!descriptorLength) {
-    return {
-      descriptor: [],
-      averageQuality: 0,
-    };
-  }
+    if (!supportsModelRuntime()) {
+      onUpdate(buildUnsupportedSnapshot("This browser cannot run the face ML pipeline."));
+      return;
+    }
 
-  const merged = Array.from({ length: descriptorLength }, (_, index) => {
-    let weightedSum = 0;
-    let totalWeight = 0;
+    inFlight = true;
+    try {
+      const faces = await detectFaces(video, detectConfig);
+      if (!cancelled) {
+        onUpdate(buildTrackingSnapshot(video, faces));
+      }
+    } catch (error) {
+      if (!cancelled) {
+        onUpdate(
+          buildUnsupportedSnapshot(
+            error instanceof Error
+              ? error.message
+              : "The face ML pipeline could not start.",
+          ),
+        );
+      }
+    } finally {
+      inFlight = false;
+      if (!cancelled) {
+        timeoutId = window.setTimeout(() => {
+          void loop();
+        }, intervalMs);
+      }
+    }
+  };
 
-    samples.forEach((sample) => {
-      const weight = Math.max(0.12, sample.quality);
-      weightedSum += sample.descriptor[index] * weight;
-      totalWeight += weight;
-    });
+  void loop();
 
-    return totalWeight ? weightedSum / totalWeight : 0;
-  });
-
-  const averageQuality =
-    samples.reduce((sum, sample) => sum + sample.quality, 0) / samples.length;
-
-  return {
-    descriptor: normalizeDescriptor(merged),
-    averageQuality: Number(averageQuality.toFixed(3)),
+  return () => {
+    cancelled = true;
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+    }
   };
 }
 
 export async function captureFaceTemplate(
   video: HTMLVideoElement,
-  canvas: HTMLCanvasElement,
+  _canvas: HTMLCanvasElement,
   options: FaceTemplateCaptureOptions,
 ): Promise<FaceTemplateCaptureResult> {
-  const {
-    sampleCount,
-    sampleDelayMs = DEFAULT_SAMPLE_DELAY_MS,
-    minQuality = DEFAULT_MIN_SAMPLE_QUALITY,
-    maxAttempts = sampleCount * 3,
-    requireDetector = false,
-    onProgress,
-  } = options;
-  const captureMode: FaceCaptureMode = isFaceDetectorAvailable() ? "detected" : "fallback";
-
-  if (requireDetector && captureMode !== "detected") {
-    throw new Error("Secure face detection is unavailable in this browser. Use Chrome or Edge.");
+  if (!supportsModelRuntime()) {
+    throw new Error("This browser cannot run the face ML pipeline. Use a modern Chrome, Edge, Safari, or iPhone browser with camera support.");
   }
 
+  if (video.readyState < 2) {
+    throw new Error("Camera preview is not ready. Wait for the live video feed, then retry.");
+  }
+
+  const human = await getHuman();
+  const targetCoverage = resolvePoseTargets(options.sampleCount, options.poseTargets);
+  const requiredCoverage = getRequiredPoseList(targetCoverage);
+  const coverage = createEmptyPoseCoverage();
   const acceptedSamples: FaceCaptureSample[] = [];
-  let attempts = 0;
+  const sampleDelayMs = options.sampleDelayMs ?? DEFAULT_SAMPLE_DELAY_MS;
+  const minQuality = options.minQuality ?? DEFAULT_MIN_SAMPLE_QUALITY;
+  const minLiveConfidence = options.minLiveConfidence ?? DEFAULT_MIN_LIVE_CONFIDENCE;
+  const minRealConfidence = options.minRealConfidence ?? DEFAULT_MIN_REAL_CONFIDENCE;
+  const maxAttempts = options.maxAttempts ?? (options.sampleCount * DEFAULT_MAX_ATTEMPTS_MULTIPLIER);
 
-  while (acceptedSamples.length < sampleCount && attempts < maxAttempts) {
-    const detectedFaceBounds = await detectSingleFaceBounds(video);
-    const sample = detectedFaceBounds === null
-      ? null
-      : captureFaceSample(video, canvas, detectedFaceBounds);
-    attempts += 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const faces = await detectFaces(video, CAPTURE_CONFIG);
+    const snapshot = buildTrackingSnapshot(video, faces);
+    const face = faces[0];
 
-    if (sample && sample.quality >= minQuality) {
-      acceptedSamples.push(sample);
-      onProgress?.(acceptedSamples.length, attempts);
+    if (
+      snapshot.status !== "ready"
+      || !face
+      || !snapshot.descriptor?.length
+      || snapshot.quality < minQuality
+      || snapshot.liveConfidence < minLiveConfidence
+      || snapshot.realConfidence < minRealConfidence
+    ) {
+      options.onProgress?.(acceptedSamples.length, attempt, { ...coverage }, snapshot.pose);
+      await sleep(sampleDelayMs);
+      continue;
     }
 
-    if (acceptedSamples.length < sampleCount) {
-      await delay(sampleDelayMs);
+    const pose = snapshot.pose;
+    const poseTarget = targetCoverage[pose] ?? 0;
+    const requiredStillMissing = !hasRequiredPoseCoverage(coverage, targetCoverage);
+
+    if (requiredStillMissing && poseTarget === 0) {
+      options.onProgress?.(acceptedSamples.length, attempt, { ...coverage }, pose);
+      await sleep(sampleDelayMs);
+      continue;
     }
+
+    if (requiredStillMissing && poseTarget > 0 && coverage[pose] >= poseTarget) {
+      options.onProgress?.(acceptedSamples.length, attempt, { ...coverage }, pose);
+      await sleep(sampleDelayMs);
+      continue;
+    }
+
+    acceptedSamples.push({
+      descriptor: snapshot.descriptor,
+      quality: snapshot.quality,
+      pose,
+      yaw: snapshot.yaw,
+      pitch: snapshot.pitch,
+      roll: snapshot.roll,
+      liveConfidence: snapshot.liveConfidence,
+      realConfidence: snapshot.realConfidence,
+      distance: snapshot.distance,
+    });
+    coverage[pose] += 1;
+    options.onProgress?.(acceptedSamples.length, attempt, { ...coverage }, pose);
+
+    const enoughSamples = acceptedSamples.length >= options.sampleCount;
+    if (enoughSamples && hasRequiredPoseCoverage(coverage, targetCoverage)) {
+      const profile = buildProfileFromSamples(acceptedSamples, human, targetCoverage);
+      return {
+        descriptor: profile.primaryDescriptor,
+        anchorDescriptors: profile.anchorDescriptors,
+        averageQuality: profile.averageQuality,
+        acceptedSamples: acceptedSamples.length,
+        attempts: attempt,
+        consistency: profile.consistency,
+        captureMode: "detected",
+        profile,
+        poseCounts: profile.poseCoverage,
+      };
+    }
+
+    await sleep(sampleDelayMs);
   }
 
-  if (acceptedSamples.length < sampleCount) {
-    throw new Error(
-      `Only ${acceptedSamples.length} of ${sampleCount} clear face samples were captured. Keep one face centered, improve lighting, and retry.`,
-    );
-  }
+  const missingCoverage = getMissingPoseCoverage(coverage, targetCoverage);
+  const missingMessage = missingCoverage.length
+    ? `Missing pose coverage: ${missingCoverage.join(", ")}.`
+    : "The capture did not reach the required ML quality target.";
 
-  const profile = buildFaceProfile(acceptedSamples, captureMode);
-
-  return {
-    descriptor: profile.primaryDescriptor,
-    anchorDescriptors: profile.anchorDescriptors,
-    averageQuality: profile.averageQuality,
-    acceptedSamples: acceptedSamples.length,
-    attempts,
-    consistency: profile.consistency,
-    captureMode,
-    profile,
-  };
+  throw new Error(
+    `${missingMessage} Look front, then left, then right while staying inside the tracked frame with stable lighting.`,
+  );
 }

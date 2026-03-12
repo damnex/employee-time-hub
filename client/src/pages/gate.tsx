@@ -8,27 +8,31 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Camera, Scan, KeyRound, AlertCircle, CheckCircle2, Wifi, WifiOff } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import type { FacePose } from "@shared/schema";
 import {
-  allowInsecureFaceFallback,
   captureFaceTemplate,
+  describeFacePose,
   getBiometricCameraConstraints,
   getBiometricRuntimeInfo,
-  isFaceDetectorAvailable,
+  startFaceTracking,
+  type FaceTrackingSnapshot,
 } from "@/lib/biometrics";
 import {
   appendMovementSample,
-  inferMovementDirection,
+  inferDirectionFromPose,
   type DirectionInferenceResult,
   type MovementSample,
 } from "@/lib/movement";
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
 const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
-const GATE_FACE_SAMPLE_COUNT = 25;
-const GATE_FACE_SAMPLE_DELAY_MS = 70;
+const GATE_FACE_SAMPLE_COUNT = 12;
+const GATE_FACE_SAMPLE_DELAY_MS = 90;
 const GATE_DIRECTION_SAMPLE_WINDOW = 25;
 const GATE_DIRECTION_MAX_SAMPLE_AGE_MS = 1800;
 const GATE_DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
+const ENTRY_SIDE_POSE: "left" | "right" = "left";
+const EXIT_SIDE_POSE: "left" | "right" = "right";
 
 type FaceAlignmentState =
   | "unsupported"
@@ -38,21 +42,12 @@ type FaceAlignmentState =
   | "no-face"
   | "multiple";
 
-type DetectedFaceLike = {
-  boundingBox: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
-};
+function isSidePose(pose: FacePose | null | undefined): pose is "left" | "right" {
+  return pose === "left" || pose === "right";
+}
 
-declare global {
-  interface Window {
-    FaceDetector?: new (options?: { fastMode?: boolean; maxDetectedFaces?: number }) => {
-      detect: (source: CanvasImageSource) => Promise<DetectedFaceLike[]>;
-    };
-  }
+function describeSidePose(pose: "left" | "right") {
+  return pose === "left" ? "left-side face" : "right-side face";
 }
 
 export default function GateSimulator() {
@@ -68,8 +63,11 @@ export default function GateSimulator() {
   const [capturedFaceSamples, setCapturedFaceSamples] = useState(0);
   const [liveFaceQuality, setLiveFaceQuality] = useState<number | null>(null);
   const [liveFaceConsistency, setLiveFaceConsistency] = useState<number | null>(null);
+  const [liveLiveness, setLiveLiveness] = useState<number | null>(null);
+  const [liveRealness, setLiveRealness] = useState<number | null>(null);
+  const [trackedPose, setTrackedPose] = useState("Front");
   const [faceAlignmentState, setFaceAlignmentState] = useState<FaceAlignmentState>("searching");
-  const [faceBounds, setFaceBounds] = useState<DetectedFaceLike["boundingBox"] | null>(null);
+  const [trackingSnapshot, setTrackingSnapshot] = useState<FaceTrackingSnapshot | null>(null);
   const [directionState, setDirectionState] = useState<DirectionInferenceResult>({
     direction: "UNKNOWN",
     confidence: 0,
@@ -79,6 +77,10 @@ export default function GateSimulator() {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [readerSourceDeviceId, setReaderSourceDeviceId] = useState<string | null>(null);
   const [liveTapUid, setLiveTapUid] = useState<string | null>(null);
+  const [pendingReaderScan, setPendingReaderScan] = useState<{
+    rfidUid: string;
+    sourceDeviceId: string;
+  } | null>(null);
   const [lastResult, setLastResult] = useState<{
     success: boolean;
     message: string;
@@ -90,23 +92,31 @@ export default function GateSimulator() {
       peakAnchorConfidence: number;
       strongAnchorRatio: number;
       liveConsistency: number;
+      poseConfidence?: number;
+      liveLiveness?: number;
+      liveRealness?: number;
     };
   } | null>(null);
 
   const scanMutation = useScanRFID();
   const { isConnected, lastScanResult, clearResult } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
   const biometricRuntime = getBiometricRuntimeInfo();
-  const detectorAvailable = biometricRuntime.detectorAvailable && isFaceDetectorAvailable();
-  const fallbackCaptureAllowed = biometricRuntime.fallbackAllowed && allowInsecureFaceFallback();
-  const supportsDirectionTracking = detectorAvailable;
-  const compatibilityModeMessage = biometricRuntime.compatibilityMode
+  const detectorAvailable = biometricRuntime.detectorAvailable;
+  const compatibilityModeMessage = biometricRuntime.detectorAvailable
     ? biometricRuntime.isIOS || biometricRuntime.isSafari
-      ? "iPhone/Safari compatibility mode is active. This uses the regular front camera only, not Apple Face ID hardware."
-      : "Browser compatibility mode is active. This uses the standard camera only, so accuracy is lower."
-    : null;
+      ? "Model-backed face tracking is active in the browser camera. This is not Apple Face ID hardware, but it uses a real ML face engine."
+      : "Model-backed face tracking is active. The gate auto-detects face box, side pose, liveness, and direction."
+    : "This browser cannot run the ML face pipeline reliably.";
   const directionReady =
     directionState.direction !== "UNKNOWN"
     && directionState.confidence >= GATE_DIRECTION_CONFIDENCE_THRESHOLD;
+  const showDirectionSource = directionState.axis !== "none";
+  const showTrackingSamples = directionState.sampleCount > 0;
+  const showLastPhysicalTap = Boolean(liveTapUid);
+  const showLiveFaceQuality = liveFaceQuality !== null;
+  const showLiveFaceConsistency = liveFaceConsistency !== null;
+  const showLiveLiveness = liveLiveness !== null;
+  const showLiveRealness = liveRealness !== null;
   const faceFrameTone = !cameraActive
     ? "border-slate-300 shadow-none"
     : lastResult?.success
@@ -128,10 +138,10 @@ export default function GateSimulator() {
           ? "SCANNING"
           : directionReady
             ? directionState.direction === "ENTRY"
-              ? "ENTRY PATH"
-              : "EXIT PATH"
+              ? "ENTRY POSE"
+              : "EXIT POSE"
             : faceAlignmentState === "aligned"
-              ? "TRACK MOTION"
+              ? "ALIGN POSE"
               : "ALIGN FACE";
   const faceGuideMessage = (() => {
     if (!cameraActive) {
@@ -139,10 +149,7 @@ export default function GateSimulator() {
     }
 
     if (faceAlignmentState === "unsupported") {
-      return fallbackCaptureAllowed
-        ? compatibilityModeMessage
-          ?? "Secure detector is unavailable. Compatibility fallback verification is enabled for this environment, but accuracy is lower."
-        : "Secure face detection is unavailable in this browser. Access verification is blocked here. Use Chrome or Edge.";
+      return compatibilityModeMessage;
     }
 
     if (faceAlignmentState === "multiple") {
@@ -150,7 +157,7 @@ export default function GateSimulator() {
     }
 
     if (faceAlignmentState === "off-center") {
-      return "Center your face inside the green guide.";
+      return trackingSnapshot?.guidance ?? "Move the face fully into the tracked frame.";
     }
 
     if (faceAlignmentState === "no-face") {
@@ -158,11 +165,11 @@ export default function GateSimulator() {
     }
 
     if (directionReady) {
-      return `Movement classified as ${directionState.direction.toLowerCase()} with ${Math.round(directionState.confidence * 100)}% confidence.`;
+      return `${directionState.direction === "ENTRY" ? "Entry" : "Exit"} direction locked from side pose at ${Math.round(directionState.confidence * 100)}% confidence.`;
     }
 
     if (faceAlignmentState === "aligned") {
-      return "Walk through the frame before scanning so the camera can classify entry or exit.";
+      return `Pose ${trackedPose}. Show the ${describeSidePose(ENTRY_SIDE_POSE)} for entry or the ${describeSidePose(EXIT_SIDE_POSE)} for exit while tapping the badge.`;
     }
 
     return "Searching for face alignment...";
@@ -236,113 +243,85 @@ export default function GateSimulator() {
   }, [cameraRetryToken]);
 
   useEffect(() => {
-    if (!cameraActive || !videoRef.current) {
+    if (!cameraActive || !videoRef.current || isSamplingFace) {
       setFaceAlignmentState((current) => (current === "unsupported" ? current : "searching"));
-      setFaceBounds(null);
+      setTrackingSnapshot(null);
       resetMotionEvidence();
       return;
     }
 
-    if (!window.FaceDetector) {
+    if (!detectorAvailable) {
       setFaceAlignmentState("unsupported");
-      setFaceBounds(null);
+      setTrackingSnapshot(null);
       resetMotionEvidence();
       return;
     }
 
-    let cancelled = false;
-    const detector = new window.FaceDetector({
-      fastMode: true,
-      maxDetectedFaces: 2,
-    });
+    return startFaceTracking(videoRef.current, (snapshot) => {
+      setTrackingSnapshot(snapshot);
+      setTrackedPose(describeFacePose(snapshot.pose));
 
-    const detectFace = async () => {
-      if (!videoRef.current || videoRef.current.readyState < 2) {
+      if (snapshot.status === "unsupported") {
+        setFaceAlignmentState("unsupported");
+        resetMotionEvidence();
         return;
       }
 
-      try {
-        const faces = await detector.detect(videoRef.current);
-        if (cancelled) {
-          return;
-        }
-
-        if (faces.length === 0) {
-          setFaceBounds(null);
-          setFaceAlignmentState("no-face");
-          resetMotionEvidence();
-          return;
-        }
-
-        if (faces.length > 1) {
-          setFaceBounds(null);
-          setFaceAlignmentState("multiple");
-          resetMotionEvidence();
-          return;
-        }
-
-        const [face] = faces;
-        const bounds = face.boundingBox;
-        const video = videoRef.current;
-        const centerX = bounds.x + bounds.width / 2;
-        const centerY = bounds.y + bounds.height / 2;
-        const normalizedCenterX = centerX / video.videoWidth;
-        const normalizedCenterY = centerY / video.videoHeight;
-        const normalizedWidth = bounds.width / video.videoWidth;
-        const normalizedHeight = bounds.height / video.videoHeight;
-        const centeredEnough =
-          normalizedCenterX > 0.34
-          && normalizedCenterX < 0.66
-          && normalizedCenterY > 0.24
-          && normalizedCenterY < 0.76;
-        const sizeEnough =
-          normalizedWidth > 0.18
-          && normalizedWidth < 0.6
-          && normalizedHeight > 0.24
-          && normalizedHeight < 0.82;
-
-        setFaceBounds(bounds);
-        setFaceAlignmentState(centeredEnough && sizeEnough ? "aligned" : "off-center");
-
-        const nextSamples = appendMovementSample(
-          motionSamplesRef.current,
-          {
-            timestamp: Date.now(),
-            centerX: normalizedCenterX,
-            centerY: normalizedCenterY,
-            area: normalizedWidth * normalizedHeight,
-          },
-          GATE_DIRECTION_SAMPLE_WINDOW,
-        );
-        motionSamplesRef.current = nextSamples;
-        setDirectionState(
-          inferMovementDirection(nextSamples, {
-            maxSamples: GATE_DIRECTION_SAMPLE_WINDOW,
-            maxSampleAgeMs: GATE_DIRECTION_MAX_SAMPLE_AGE_MS,
-          }),
-        );
-      } catch (error) {
-        console.error("Face detection failed:", error);
-        if (!cancelled) {
-          setFaceAlignmentState("unsupported");
-          setFaceBounds(null);
-          resetMotionEvidence();
-        }
+      if (snapshot.status === "no-face") {
+        setFaceAlignmentState("no-face");
+        resetMotionEvidence();
+        return;
       }
-    };
 
-    void detectFace();
-    const intervalId = window.setInterval(() => {
-      void detectFace();
-    }, 320);
+      if (snapshot.status === "multiple") {
+        setFaceAlignmentState("multiple");
+        resetMotionEvidence();
+        return;
+      }
 
-    return () => {
-      cancelled = true;
-      window.clearInterval(intervalId);
-    };
-  }, [cameraActive]);
+      if (!snapshot.bounds || !videoRef.current?.videoWidth || !videoRef.current?.videoHeight) {
+        setFaceAlignmentState("searching");
+        resetMotionEvidence();
+        return;
+      }
 
-  const captureLiveFaceProfile = async () => {
+      const normalizedCenterX =
+        (snapshot.bounds.x + snapshot.bounds.width / 2) / videoRef.current.videoWidth;
+      const normalizedCenterY =
+        (snapshot.bounds.y + snapshot.bounds.height / 2) / videoRef.current.videoHeight;
+      const normalizedWidth = snapshot.bounds.width / videoRef.current.videoWidth;
+      const normalizedHeight = snapshot.bounds.height / videoRef.current.videoHeight;
+
+      setFaceAlignmentState(snapshot.status === "ready" ? "aligned" : "off-center");
+
+      const nextSamples = appendMovementSample(
+        motionSamplesRef.current,
+        {
+          timestamp: Date.now(),
+          centerX: normalizedCenterX,
+          centerY: normalizedCenterY,
+          area: normalizedWidth * normalizedHeight,
+          distance: snapshot.distance,
+          yaw: snapshot.yaw,
+          pose: snapshot.pose,
+        },
+        GATE_DIRECTION_SAMPLE_WINDOW,
+      );
+      motionSamplesRef.current = nextSamples;
+      const poseDirection = inferDirectionFromPose(snapshot.pose, {
+        entryPose: ENTRY_SIDE_POSE,
+        confidence: Math.max(0.72, snapshot.quality),
+      });
+      setDirectionState({
+        ...poseDirection,
+        sampleCount: nextSamples.length,
+      });
+    }, {
+      mode: "tracking",
+    });
+  }, [cameraActive, detectorAvailable, isSamplingFace]);
+
+  const captureLiveFaceProfile = async (expectedPose: "left" | "right") => {
     if (!cameraActive || !videoRef.current || !canvasRef.current) {
       return null;
     }
@@ -350,9 +329,18 @@ export default function GateSimulator() {
     const template = await captureFaceTemplate(videoRef.current, canvasRef.current, {
       sampleCount: GATE_FACE_SAMPLE_COUNT,
       sampleDelayMs: GATE_FACE_SAMPLE_DELAY_MS,
-      minQuality: 0.2,
-      maxAttempts: GATE_FACE_SAMPLE_COUNT * 2,
-      requireDetector: !fallbackCaptureAllowed,
+      minQuality: 0.45,
+      maxAttempts: GATE_FACE_SAMPLE_COUNT * 4,
+      poseTargets: {
+        front: 0,
+        left: expectedPose === "left" ? GATE_FACE_SAMPLE_COUNT : 0,
+        right: expectedPose === "right" ? GATE_FACE_SAMPLE_COUNT : 0,
+        up: 0,
+        down: 0,
+        unknown: 0,
+      },
+      minLiveConfidence: 0.45,
+      minRealConfidence: 0.35,
       onProgress: (acceptedSamples) => {
         setCapturedFaceSamples(acceptedSamples);
       },
@@ -360,6 +348,12 @@ export default function GateSimulator() {
 
     setLiveFaceQuality(template.averageQuality);
     setLiveFaceConsistency(template.consistency);
+    if ("averageLive" in template.profile && typeof template.profile.averageLive === "number") {
+      setLiveLiveness(template.profile.averageLive);
+    }
+    if ("averageReal" in template.profile && typeof template.profile.averageReal === "number") {
+      setLiveRealness(template.profile.averageReal);
+    }
     return template.profile;
   };
 
@@ -375,50 +369,50 @@ export default function GateSimulator() {
     setCapturedFaceSamples(0);
     setLiveFaceQuality(null);
     setLiveFaceConsistency(null);
+    setLiveLiveness(null);
+    setLiveRealness(null);
 
     try {
-      if (faceAlignmentState === "unsupported" && !fallbackCaptureAllowed) {
+      if (faceAlignmentState === "unsupported") {
         setLastResult({
           success: false,
-          message: "Secure face verification is disabled in this browser. Use Chrome or Edge on the gate terminal.",
+          message: "Model-backed face verification is unavailable in this browser. Use a supported gate browser.",
         });
         return;
       }
 
-      const canUseFallbackAlignment =
-        fallbackCaptureAllowed && faceAlignmentState === "unsupported";
-
-      if (faceAlignmentState !== "aligned" && !canUseFallbackAlignment) {
+      if (faceAlignmentState !== "aligned") {
         setLastResult({
           success: false,
-          message: "Center a single face inside the guide before scanning.",
+          message: trackingSnapshot?.guidance ?? "Center a single face inside the tracked frame before scanning.",
         });
         return;
       }
 
-      const latestDirection = supportsDirectionTracking
-        ? inferMovementDirection(motionSamplesRef.current, {
-            maxSamples: GATE_DIRECTION_SAMPLE_WINDOW,
-            maxSampleAgeMs: GATE_DIRECTION_MAX_SAMPLE_AGE_MS,
+      const trackedSidePose = isSidePose(trackingSnapshot?.pose)
+        ? trackingSnapshot.pose
+        : null;
+      const previewDirection = trackedSidePose
+        ? inferDirectionFromPose(trackedSidePose, {
+            entryPose: ENTRY_SIDE_POSE,
+            confidence: Math.max(0.72, trackingSnapshot?.quality ?? 0.72),
           })
         : null;
 
       if (
-        supportsDirectionTracking
-        && latestDirection
-        && (
-          latestDirection.direction === "UNKNOWN"
-          || latestDirection.confidence < GATE_DIRECTION_CONFIDENCE_THRESHOLD
-        )
+        !trackedSidePose
+        || !previewDirection
+        || previewDirection.direction === "UNKNOWN"
+        || previewDirection.confidence < GATE_DIRECTION_CONFIDENCE_THRESHOLD
       ) {
         setLastResult({
           success: false,
-          message: "Movement direction is unclear. Walk fully through the frame before scanning again.",
+          message: `Direction is unclear. Show the ${describeSidePose(ENTRY_SIDE_POSE)} for entry or the ${describeSidePose(EXIT_SIDE_POSE)} for exit while tapping the badge.`,
         });
         return;
       }
 
-      const liveFaceProfile = await captureLiveFaceProfile();
+      const liveFaceProfile = await captureLiveFaceProfile(trackedSidePose);
       if (!liveFaceProfile) {
         setLastResult({
           success: false,
@@ -433,6 +427,28 @@ export default function GateSimulator() {
         setLiveTapUid(normalizedUid);
       }
 
+      const dominantPose = "poseEmbeddings" in liveFaceProfile && liveFaceProfile.poseEmbeddings[0]
+        ? liveFaceProfile.poseEmbeddings[0].pose
+        : trackingSnapshot?.pose;
+      const resolvedDirection = isSidePose(dominantPose)
+        ? inferDirectionFromPose(dominantPose, {
+            entryPose: ENTRY_SIDE_POSE,
+            confidence: 0.96,
+          })
+        : previewDirection;
+
+      if (
+        !resolvedDirection
+        || resolvedDirection.direction === "UNKNOWN"
+        || resolvedDirection.confidence < GATE_DIRECTION_CONFIDENCE_THRESHOLD
+      ) {
+        setLastResult({
+          success: false,
+          message: `Direction is unclear. Hold the ${describeSidePose(ENTRY_SIDE_POSE)} for entry or the ${describeSidePose(EXIT_SIDE_POSE)} for exit and retry.`,
+        });
+        return;
+      }
+
       const data = await scanMutation.mutateAsync({
         rfidUid: normalizedUid,
         deviceId: source === "reader" ? (sourceDeviceId ?? GATE_DEVICE_ID) : GATE_DEVICE_ID,
@@ -441,10 +457,24 @@ export default function GateSimulator() {
         faceConsistency: liveFaceProfile.consistency,
         faceQuality: liveFaceProfile.averageQuality,
         faceCaptureMode: liveFaceProfile.captureMode,
+        facePose: "poseEmbeddings" in liveFaceProfile && liveFaceProfile.poseEmbeddings[0]
+          ? liveFaceProfile.poseEmbeddings[0].pose
+          : "unknown",
+        faceYaw: "poseEmbeddings" in liveFaceProfile && liveFaceProfile.poseEmbeddings[0]
+          ? liveFaceProfile.poseEmbeddings[0].yaw
+          : undefined,
+        facePitch: "poseEmbeddings" in liveFaceProfile && liveFaceProfile.poseEmbeddings[0]
+          ? liveFaceProfile.poseEmbeddings[0].pitch
+          : undefined,
+        faceRoll: "poseEmbeddings" in liveFaceProfile && liveFaceProfile.poseEmbeddings[0]
+          ? liveFaceProfile.poseEmbeddings[0].roll
+          : undefined,
+        faceLiveConfidence: "averageLive" in liveFaceProfile ? liveFaceProfile.averageLive : undefined,
+        faceRealConfidence: "averageReal" in liveFaceProfile ? liveFaceProfile.averageReal : undefined,
         scanTechnology,
-        movementDirection: latestDirection?.direction,
-        movementAxis: latestDirection?.axis,
-        movementConfidence: latestDirection?.confidence,
+        movementDirection: resolvedDirection.direction,
+        movementAxis: resolvedDirection.axis,
+        movementConfidence: resolvedDirection.confidence,
       });
 
       setLastResult({
@@ -487,27 +517,58 @@ export default function GateSimulator() {
       setReaderSourceDeviceId(sourceDeviceId);
       setReaderMessage(
         sourceDeviceId === GATE_DEVICE_ID
-          ? (lastScanResult.message || "Badge detected from physical reader.")
-          : `Badge detected from ${sourceDeviceId}. Processing it on this gate terminal.`,
+          ? `Badge ${detectedUid} detected. Show the ${describeSidePose(ENTRY_SIDE_POSE)} for entry or the ${describeSidePose(EXIT_SIDE_POSE)} for exit.`
+          : `Badge ${detectedUid} detected from ${sourceDeviceId}. Show the side-face direction for this tap.`,
       );
-      void authenticateScan(detectedUid, "reader", sourceDeviceId);
+      setPendingReaderScan({
+        rfidUid: detectedUid,
+        sourceDeviceId,
+      });
       clearResult();
       return;
     }
   }, [lastScanResult, clearResult]);
 
+  useEffect(() => {
+    if (
+      !pendingReaderScan
+      || !cameraActive
+      || faceAlignmentState !== "aligned"
+      || !directionReady
+      || isSamplingFace
+      || scanMutation.isPending
+    ) {
+      return;
+    }
+
+    setReaderMessage(
+      `Badge ${pendingReaderScan.rfidUid} detected. ${directionState.direction === "ENTRY" ? "Entry" : "Exit"} direction locked. Verifying live face data...`,
+    );
+    const nextScan = pendingReaderScan;
+    setPendingReaderScan(null);
+    void authenticateScan(nextScan.rfidUid, "reader", nextScan.sourceDeviceId);
+  }, [
+    pendingReaderScan,
+    cameraActive,
+    faceAlignmentState,
+    directionReady,
+    isSamplingFace,
+    scanMutation.isPending,
+    directionState.direction,
+  ]);
+
   return (
-    <div className="min-h-full bg-[radial-gradient(circle_at_top,_#f8fbff_0%,_#eef5ff_42%,_#e5eefb_100%)] text-slate-950">
-      <div className="mx-auto flex min-h-full max-w-6xl flex-col items-center justify-center px-6 py-10 md:px-8">
-        <div className="mb-8 text-center">
-        <h1 className="text-3xl font-display font-bold text-slate-950">Gate Terminal</h1>
-        <p className="mt-2 max-w-md mx-auto text-slate-600">
+    <div className="h-full overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff_0%,_#eef5ff_42%,_#e5eefb_100%)] text-slate-950">
+      <div className="mx-auto flex h-full w-full max-w-[1500px] flex-col gap-3 px-4 py-3 md:px-5 md:py-4 xl:px-6">
+        <div className="shrink-0 text-center">
+        <h1 className="text-2xl font-display font-bold text-slate-950 md:text-3xl">Gate Terminal</h1>
+        <p className="mt-1 max-w-xl mx-auto text-sm text-slate-600">
           Real-time attendance with live camera and RFID scanning
         </p>
       </div>
 
-      <Card className="w-full max-w-5xl overflow-hidden border border-sky-100 bg-white/90 shadow-[0_24px_80px_rgba(30,64,175,0.12)] backdrop-blur">
-        <div className="flex items-center justify-between bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 p-4 text-white">
+      <Card className="flex min-h-0 w-full flex-1 flex-col overflow-hidden border border-sky-100 bg-white/90 shadow-[0_24px_80px_rgba(30,64,175,0.12)] backdrop-blur">
+        <div className="flex shrink-0 items-center justify-between bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 px-4 py-3 text-white">
           <div className="flex items-center justify-center gap-2">
             <Scan className="size-5" />
             <span className="font-semibold tracking-wide">GATE-01 TERMINAL</span>
@@ -527,12 +588,12 @@ export default function GateSimulator() {
           </div>
         </div>
 
-        <CardContent className="grid gap-6 p-6 md:grid-cols-[minmax(0,1.35fr)_minmax(320px,0.9fr)] md:gap-8 md:p-8 xl:grid-cols-[minmax(0,1.45fr)_minmax(360px,0.85fr)]">
-          <div className="space-y-3">
-            <div className="text-center text-xs font-medium uppercase tracking-wider text-slate-500 md:text-left">
+        <CardContent className="grid min-h-0 flex-1 gap-3 p-3 pt-3 md:grid-cols-[minmax(0,1.45fr)_minmax(330px,0.85fr)] xl:grid-cols-[minmax(0,1.55fr)_minmax(350px,0.82fr)]">
+          <div className="flex min-h-0 flex-col gap-1.5">
+            <div className="shrink-0 text-center text-[11px] font-medium uppercase tracking-wider text-slate-500 md:text-left">
               {cameraActive ? "Live Camera Feed" : cameraError ? "Camera Permission Required" : "Starting Camera"}
             </div>
-            <div className="group relative aspect-[16/9] overflow-hidden rounded-3xl border border-sky-100 bg-slate-950 shadow-inner">
+            <div className="group relative aspect-video max-h-[50vh] min-h-0 flex-1 overflow-hidden rounded-[1.75rem] border border-sky-100 bg-slate-950 shadow-inner md:aspect-[16/9] xl:max-h-[54vh]">
               <video
                 ref={videoRef}
                 autoPlay
@@ -577,14 +638,18 @@ export default function GateSimulator() {
                 <div
                   className={`absolute inset-x-[26%] inset-y-[16%] rounded-[2rem] border-[3px] transition-all duration-300 ease-out ${faceFrameTone}`}
                 />
-                {faceBounds && cameraActive && (
+                {trackingSnapshot?.bounds && cameraActive && (
                   <div
-                    className="absolute border-2 border-cyan-300/70 transition-all duration-200"
+                    className={`absolute rounded-[1.1rem] border-2 transition-all duration-200 ${
+                      trackingSnapshot.status === "ready"
+                        ? "border-cyan-300/80 shadow-[0_0_0_1px_rgba(103,232,249,0.5),0_0_22px_rgba(6,182,212,0.2)]"
+                        : "border-amber-300/80"
+                    }`}
                     style={{
-                      left: `${(faceBounds.x / (videoRef.current?.videoWidth || 1)) * 100}%`,
-                      top: `${(faceBounds.y / (videoRef.current?.videoHeight || 1)) * 100}%`,
-                      width: `${(faceBounds.width / (videoRef.current?.videoWidth || 1)) * 100}%`,
-                      height: `${(faceBounds.height / (videoRef.current?.videoHeight || 1)) * 100}%`,
+                      left: `${(trackingSnapshot.bounds.x / (videoRef.current?.videoWidth || 1)) * 100}%`,
+                      top: `${(trackingSnapshot.bounds.y / (videoRef.current?.videoHeight || 1)) * 100}%`,
+                      width: `${(trackingSnapshot.bounds.width / (videoRef.current?.videoWidth || 1)) * 100}%`,
+                      height: `${(trackingSnapshot.bounds.height / (videoRef.current?.videoHeight || 1)) * 100}%`,
                     }}
                   />
                 )}
@@ -608,75 +673,107 @@ export default function GateSimulator() {
                 </div>
               )}
             </div>
-            <p className="text-center text-xs text-slate-500 md:text-left">{faceGuideMessage}</p>
+            <p className="shrink-0 text-center text-[11px] text-slate-500 md:text-left">{faceGuideMessage}</p>
           </div>
 
-          <div className="flex flex-col gap-4 md:justify-center">
-            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4">
-              <div className="mb-3 flex items-center justify-between gap-3">
+          <div className="flex min-h-0 flex-col gap-2">
+            <div className="rounded-2xl border border-slate-200 bg-slate-50/80 p-2">
+              <div className="mb-2 flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-semibold text-slate-900">Gate Status</p>
-                  <p className="text-xs text-slate-500">Real-time reader and face verification state.</p>
+                  <p className="text-[11px] text-slate-500">Real-time reader and face verification state.</p>
                 </div>
                 <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${isConnected ? "bg-emerald-100 text-emerald-700" : "bg-slate-200 text-slate-600"}`}>
                   {isConnected ? "Live" : "Offline"}
                 </span>
               </div>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-3 text-sm">
+              <div className="space-y-1">
+                <div className="flex items-center justify-between gap-3 text-[13px]">
                   <span className="text-slate-500">Gate event channel</span>
                   <span className={isConnected ? "font-medium text-slate-900" : "text-slate-500"}>
                     {isConnected ? "Listening for reader taps" : "Browser socket offline"}
                   </span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
+                <div className="flex items-center justify-between gap-3 text-[13px]">
                   <span className="text-slate-500">Preferred device</span>
                   <span className="font-mono text-slate-900">{GATE_DEVICE_ID}</span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
+                <div className="flex items-center justify-between gap-3 text-[13px]">
                   <span className="text-slate-500">Browser client</span>
                   <span className="font-mono text-slate-900">{GATE_BROWSER_CLIENT_ID}</span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
+                <div className="flex items-center justify-between gap-3 text-[13px]">
                   <span className="text-slate-500">RFID mode</span>
                   <span className="font-mono text-slate-900">{scanTechnology === "HF_RFID" ? "HF RFID" : "UHF RFID"}</span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Last physical tap</span>
-                  <span className="font-mono text-slate-900">{liveTapUid ?? "--"}</span>
-                </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
+                {showLastPhysicalTap && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Last physical tap</span>
+                    <span className="font-mono text-slate-900">{liveTapUid}</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-3 text-[13px]">
                   <span className="text-slate-500">Face samples / scan</span>
                   <span className="font-mono text-slate-900">{GATE_FACE_SAMPLE_COUNT}</span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Direction samples</span>
-                  <span className="font-mono text-slate-900">{directionState.sampleCount}</span>
-                </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
+                {showDirectionSource && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Direction source</span>
+                    <span className="font-mono text-slate-900">
+                      {directionState.axis === "horizontal"
+                        ? "Horizontal"
+                        : directionState.axis === "depth"
+                          ? "Depth"
+                          : "Face pose"}
+                    </span>
+                  </div>
+                )}
+                {showTrackingSamples && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Tracking samples</span>
+                    <span className="font-mono text-slate-900">{directionState.sampleCount}</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-3 text-[13px]">
                   <span className="text-slate-500">Face alignment</span>
                   <span className={faceAlignmentState === "aligned" ? "font-medium text-emerald-600" : "text-rose-500"}>
                       {faceAlignmentState === "aligned"
                         ? "Ready"
                         : faceAlignmentState === "unsupported"
-                          ? (fallbackCaptureAllowed ? "Fallback" : "Blocked")
-                        : "Adjust"}
+                          ? "Blocked"
+                          : "Adjust"}
                   </span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Live face quality</span>
-                  <span className="font-mono text-slate-900">
-                    {liveFaceQuality === null ? "--" : `${Math.round(liveFaceQuality * 100)}%`}
-                  </span>
+                <div className="flex items-center justify-between gap-3 text-[13px]">
+                  <span className="text-slate-500">Tracked pose</span>
+                  <span className="font-mono text-slate-900">{trackedPose}</span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Scan consistency</span>
-                  <span className="font-mono text-slate-900">
-                    {liveFaceConsistency === null ? "--" : `${Math.round(liveFaceConsistency * 100)}%`}
-                  </span>
-                </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Motion direction</span>
+                {showLiveFaceQuality && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Live face quality</span>
+                    <span className="font-mono text-slate-900">{`${Math.round(liveFaceQuality * 100)}%`}</span>
+                  </div>
+                )}
+                {showLiveFaceConsistency && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Scan consistency</span>
+                    <span className="font-mono text-slate-900">{`${Math.round(liveFaceConsistency * 100)}%`}</span>
+                  </div>
+                )}
+                {showLiveLiveness && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Liveness</span>
+                    <span className="font-mono text-slate-900">{`${Math.round(liveLiveness * 100)}%`}</span>
+                  </div>
+                )}
+                {showLiveRealness && (
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
+                    <span className="text-slate-500">Anti-spoof</span>
+                    <span className="font-mono text-slate-900">{`${Math.round(liveRealness * 100)}%`}</span>
+                  </div>
+                )}
+                <div className="flex items-center justify-between gap-3 text-[13px]">
+                  <span className="text-slate-500">Detected direction</span>
                   <span
                     className={
                       faceAlignmentState === "unsupported"
@@ -689,16 +786,16 @@ export default function GateSimulator() {
                     }
                   >
                     {faceAlignmentState === "unsupported"
-                      ? "Fallback"
+                      ? "Blocked"
                       : directionReady
                         ? directionState.direction
-                        : directionState.sampleCount >= 8
+                        : directionState.axis !== "none"
                           ? "Unclear"
                           : "Learning"}
                   </span>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-sm">
-                  <span className="text-slate-500">Motion confidence</span>
+                <div className="flex items-center justify-between gap-3 text-[13px]">
+                  <span className="text-slate-500">Direction confidence</span>
                   <span className="font-mono text-slate-900">
                     {faceAlignmentState === "unsupported"
                       ? "--"
@@ -706,25 +803,25 @@ export default function GateSimulator() {
                   </span>
                 </div>
                 {readerSourceDeviceId && (
-                  <div className="flex items-center justify-between gap-3 text-sm">
+                  <div className="flex items-center justify-between gap-3 text-[13px]">
                     <span className="text-slate-500">Reader source</span>
                     <span className="font-mono text-slate-900">{readerSourceDeviceId}</span>
                   </div>
                 )}
               </div>
               {readerMessage && (
-                <p className="mt-3 text-sm text-slate-600">{readerMessage}</p>
+                <p className="mt-1.5 text-[11px] leading-4 text-slate-600">{readerMessage}</p>
               )}
-              <p className="mt-3 text-xs text-slate-500">
-                Entry is inferred from left-to-right or approaching-camera motion. Exit uses the reverse path, which becomes critical when simulating UHF portal reads.
+              <p className="mt-2 text-[11px] leading-4 text-slate-500">
+                Left-side tap = entry. Right-side tap = exit.
               </p>
             </div>
 
-            <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="space-y-2">
+            <div className="space-y-2 rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+              <div className="space-y-1.5">
                 <Label className="text-slate-700">RFID Technology</Label>
                 <Select value={scanTechnology} onValueChange={(value) => setScanTechnology(value as "HF_RFID" | "UHF_RFID")}>
-                  <SelectTrigger className="h-11">
+                  <SelectTrigger className="h-9">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
@@ -732,18 +829,18 @@ export default function GateSimulator() {
                     <SelectItem value="UHF_RFID">UHF RFID</SelectItem>
                   </SelectContent>
                 </Select>
-                <p className="text-xs text-slate-500">
-                  HF simulates tap-based verification. UHF simulates portal reads where camera direction becomes more important for accurate entry and exit mapping.
+                <p className="text-[11px] leading-4 text-slate-500">
+                  Tap badge, then show the correct side face.
                 </p>
               </div>
-              <div className="space-y-2">
+              <div className="space-y-1.5">
                 <Label htmlFor="rfid" className="flex items-center gap-2 text-slate-700">
                   <KeyRound className="size-4" /> RFID Badge
                 </Label>
                 <Input
                   id="rfid"
                   placeholder="Tap on the real reader or enter UID manually"
-                  className="border-2 border-slate-200 bg-white py-6 text-center font-mono text-lg tracking-widest focus-visible:ring-primary/20"
+                  className="border-2 border-slate-200 bg-white py-3 text-center font-mono text-sm tracking-[0.22em] focus-visible:ring-primary/20"
                   value={rfidUid}
                   onChange={(e) => setRfidUid(e.target.value.toUpperCase())}
                   disabled={scanMutation.isPending}
@@ -753,17 +850,17 @@ export default function GateSimulator() {
 
               <Button
                 size="lg"
-                className="h-14 w-full bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 text-lg font-semibold text-white shadow-md transition-transform active:scale-[0.98]"
+                className="h-10 w-full bg-gradient-to-r from-blue-600 via-blue-500 to-cyan-500 text-sm font-semibold text-white shadow-md transition-transform active:scale-[0.98]"
                 onClick={handleScan}
-                disabled={scanMutation.isPending || isSamplingFace || !rfidUid.trim() || !cameraActive || (faceAlignmentState === "unsupported" && !fallbackCaptureAllowed)}
+                disabled={scanMutation.isPending || isSamplingFace || !rfidUid.trim() || !cameraActive || faceAlignmentState === "unsupported"}
               >
                 {isSamplingFace ? "Capturing Face..." : scanMutation.isPending ? "Verifying..." : "Scan & Authenticate"}
               </Button>
             </div>
 
-            <div className="min-h-[88px]">
-              {lastResult && (
-                <Alert variant={lastResult.success ? "default" : "destructive"} className={`border-2 ${lastResult.success ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50 text-rose-900"}`}>
+            {lastResult && (
+              <div className="shrink-0">
+                <Alert variant={lastResult.success ? "default" : "destructive"} className={`border-2 p-3 ${lastResult.success ? "border-emerald-200 bg-emerald-50" : "border-rose-200 bg-rose-50 text-rose-900"}`}>
                   {lastResult.success ? (
                     <CheckCircle2 className="size-5 text-emerald-600" />
                   ) : (
@@ -772,7 +869,7 @@ export default function GateSimulator() {
                   <AlertTitle className={lastResult.success ? "font-bold text-emerald-800" : "font-bold"}>
                     {lastResult.success ? "Access Granted" : "Access Denied"}
                   </AlertTitle>
-                  <AlertDescription className={lastResult.success ? "text-emerald-700" : ""}>
+                  <AlertDescription className={`text-xs leading-4 ${lastResult.success ? "text-emerald-700" : ""}`}>
                     {lastResult.message}
                     {typeof lastResult.matchConfidence === "number" && (
                       <span className="mt-1 block font-mono">
@@ -782,12 +879,15 @@ export default function GateSimulator() {
                     {lastResult.matchDetails && (
                       <span className="mt-1 block font-mono text-[11px] leading-5">
                         Primary {(lastResult.matchDetails.primaryConfidence * 100).toFixed(1)}% | Anchors {(lastResult.matchDetails.anchorAverage * 100).toFixed(1)}% | Peak {(lastResult.matchDetails.peakAnchorConfidence * 100).toFixed(1)}% | Stable {(lastResult.matchDetails.strongAnchorRatio * 100).toFixed(0)}% | Consistency {(lastResult.matchDetails.liveConsistency * 100).toFixed(0)}%
+                        {typeof lastResult.matchDetails.poseConfidence === "number" && ` | Pose ${(lastResult.matchDetails.poseConfidence * 100).toFixed(1)}%`}
+                        {typeof lastResult.matchDetails.liveLiveness === "number" && ` | Live ${(lastResult.matchDetails.liveLiveness * 100).toFixed(0)}%`}
+                        {typeof lastResult.matchDetails.liveRealness === "number" && ` | Real ${(lastResult.matchDetails.liveRealness * 100).toFixed(0)}%`}
                       </span>
                     )}
                   </AlertDescription>
                 </Alert>
-              )}
-            </div>
+              </div>
+            )}
           </div>
         </CardContent>
       </Card>

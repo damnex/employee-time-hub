@@ -1,11 +1,15 @@
 export type AttendanceDirection = "ENTRY" | "EXIT" | "UNKNOWN";
-export type MovementAxis = "horizontal" | "depth" | "none";
+export type MovementAxis = "horizontal" | "depth" | "pose" | "none";
+export type FacePose = "front" | "left" | "right" | "up" | "down" | "unknown";
 
 export interface MovementSample {
   timestamp: number;
   centerX: number;
   centerY: number;
   area: number;
+  distance?: number | null;
+  yaw?: number;
+  pose?: FacePose;
 }
 
 export interface DirectionInferenceOptions {
@@ -22,11 +26,21 @@ export interface DirectionInferenceResult {
   sampleCount: number;
 }
 
+interface PoseDirectionOptions {
+  entryPose?: "left" | "right";
+  confidence?: number;
+}
+
+interface MotionAndPoseDirectionOptions extends PoseDirectionOptions {
+  minMotionConfidence?: number;
+}
+
 const DEFAULT_MAX_SAMPLES = 25;
 const DEFAULT_MAX_SAMPLE_AGE_MS = 1800;
 const MIN_AVERAGE_BUCKET_SIZE = 4;
 const MIN_HORIZONTAL_TRAVEL = 0.11;
 const MIN_DEPTH_TRAVEL = 0.02;
+const MIN_DISTANCE_TRAVEL_METERS = 0.06;
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -41,10 +55,15 @@ function average(values: number[]) {
 }
 
 function averageSamplePoints(samples: MovementSample[]) {
+  const distanceValues = samples
+    .map((sample) => sample.distance)
+    .filter((distance): distance is number => typeof distance === "number");
+
   return {
     centerX: average(samples.map((sample) => sample.centerX)),
     centerY: average(samples.map((sample) => sample.centerY)),
     area: average(samples.map((sample) => sample.area)),
+    distance: distanceValues.length ? average(distanceValues) : null,
   };
 }
 
@@ -65,6 +84,78 @@ export function appendMovementSample(
 ) {
   const recentSamples = samples.slice(-(maxSamples - 1));
   return [...recentSamples, sample];
+}
+
+export function inferDirectionFromPose(
+  pose: FacePose | null | undefined,
+  options: PoseDirectionOptions = {},
+): DirectionInferenceResult {
+  const entryPose = options.entryPose ?? "right";
+  const confidence = Number((options.confidence ?? 0.94).toFixed(3));
+  const exitPose = entryPose === "right" ? "left" : "right";
+
+  if (pose === entryPose) {
+    return {
+      direction: "ENTRY",
+      confidence,
+      axis: "pose",
+      sampleCount: 1,
+    };
+  }
+
+  if (pose === exitPose) {
+    return {
+      direction: "EXIT",
+      confidence,
+      axis: "pose",
+      sampleCount: 1,
+    };
+  }
+
+  return {
+    direction: "UNKNOWN",
+    confidence: 0,
+    axis: "pose",
+    sampleCount: pose ? 1 : 0,
+  };
+}
+
+export function inferDirectionFromMotionAndPose(
+  pose: FacePose | null | undefined,
+  movement: DirectionInferenceResult,
+  options: MotionAndPoseDirectionOptions = {},
+): DirectionInferenceResult {
+  const minMotionConfidence = options.minMotionConfidence ?? 0.58;
+  const poseDirection = inferDirectionFromPose(pose, options);
+
+  if (poseDirection.direction === "UNKNOWN") {
+    return {
+      direction: "UNKNOWN",
+      confidence: 0,
+      axis: movement.axis,
+      sampleCount: movement.sampleCount,
+    };
+  }
+
+  if (
+    movement.direction === "UNKNOWN"
+    || movement.axis === "none"
+    || movement.confidence < minMotionConfidence
+  ) {
+    return {
+      direction: "UNKNOWN",
+      confidence: Number(Math.min(movement.confidence, poseDirection.confidence).toFixed(3)),
+      axis: movement.axis,
+      sampleCount: movement.sampleCount,
+    };
+  }
+
+  return {
+    direction: poseDirection.direction,
+    confidence: Number(Math.min(movement.confidence, poseDirection.confidence).toFixed(3)),
+    axis: movement.axis,
+    sampleCount: movement.sampleCount,
+  };
 }
 
 export function inferMovementDirection(
@@ -100,11 +191,24 @@ export function inferMovementDirection(
   const start = averageSamplePoints(startWindow);
   const end = averageSamplePoints(endWindow);
   const horizontalDelta = end.centerX - start.centerX;
-  const depthDelta = end.area - start.area;
+  const areaDepthDelta = end.area - start.area;
+  const distanceDelta =
+    start.distance !== null && end.distance !== null
+      ? start.distance - end.distance
+      : null;
+  const depthDelta = distanceDelta !== null
+    ? distanceDelta
+    : areaDepthDelta;
   const horizontalSteps = recentSamples.slice(1).map((sample, index) => {
     return sample.centerX - recentSamples[index].centerX;
   });
   const depthSteps = recentSamples.slice(1).map((sample, index) => {
+    const currentDistance = sample.distance;
+    const previousDistance = recentSamples[index].distance;
+    if (typeof currentDistance === "number" && typeof previousDistance === "number") {
+      return previousDistance - currentDistance;
+    }
+
     return sample.area - recentSamples[index].area;
   });
   const horizontalConsistency = calculateConsistency(
@@ -124,7 +228,13 @@ export function inferMovementDirection(
     1,
   );
   const depthConfidence = clamp(
-    ((depthTravel - MIN_DEPTH_TRAVEL) / 0.06) * 0.65
+    (
+      (
+        distanceDelta !== null
+          ? (depthTravel - MIN_DISTANCE_TRAVEL_METERS) / 0.12
+          : (depthTravel - MIN_DEPTH_TRAVEL) / 0.06
+      ) * 0.65
+    )
       + depthConsistency * 0.35,
     0,
     1,
@@ -148,7 +258,13 @@ export function inferMovementDirection(
     };
   }
 
-  if (depthTravel >= MIN_DEPTH_TRAVEL && depthConsistency >= 0.58) {
+  if (
+    (
+      (distanceDelta !== null && depthTravel >= MIN_DISTANCE_TRAVEL_METERS)
+      || (distanceDelta === null && depthTravel >= MIN_DEPTH_TRAVEL)
+    )
+    && depthConsistency >= 0.58
+  ) {
     const movingEntry =
       entryDepthDirection === "approaching"
         ? depthDelta > 0

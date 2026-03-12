@@ -6,6 +6,7 @@ import {
   attendances,
   gateEvents,
   faceCaptureModeSchema,
+  facePoseSchema,
   movementAxisSchema,
   scanTechnologySchema,
 } from './schema';
@@ -46,6 +47,9 @@ const matchDetailsSchema = z.object({
   peakAnchorConfidence: z.number(),
   strongAnchorRatio: z.number(),
   liveConsistency: z.number(),
+  poseConfidence: z.number().optional(),
+  liveLiveness: z.number().optional(),
+  liveRealness: z.number().optional(),
 });
 
 export const errorSchemas = {
@@ -126,6 +130,12 @@ export const api = {
         faceConsistency: z.number().min(0).max(1).optional(),
         faceQuality: z.number().min(0).max(1).optional(),
         faceCaptureMode: faceCaptureModeSchema.optional(),
+        facePose: facePoseSchema.optional(),
+        faceYaw: z.number().optional(),
+        facePitch: z.number().optional(),
+        faceRoll: z.number().optional(),
+        faceLiveConfidence: z.number().min(0).max(1).optional(),
+        faceRealConfidence: z.number().min(0).max(1).optional(),
         scanTechnology: scanTechnologySchema.optional(),
         movementDirection: movementDirectionSchema.optional(),
         movementAxis: movementAxisSchema.optional(),
