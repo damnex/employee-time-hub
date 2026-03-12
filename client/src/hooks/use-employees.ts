@@ -72,7 +72,11 @@ export function useDeleteEmployee() {
           throw new Error(error.message || "Employee not found");
         }
 
-        throw new Error("Failed to delete employee");
+        throw new Error(
+          typeof resData?.message === "string" && resData.message.trim()
+            ? resData.message
+            : "Failed to delete employee",
+        );
       }
 
       return api.employees.delete.responses[200].parse(resData);

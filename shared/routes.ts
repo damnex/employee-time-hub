@@ -1,5 +1,14 @@
 import { z } from 'zod';
-import { insertEmployeeSchema, employees, devices, attendances, faceCaptureModeSchema } from './schema';
+import {
+  insertEmployeeSchema,
+  employees,
+  devices,
+  attendances,
+  gateEvents,
+  faceCaptureModeSchema,
+  movementAxisSchema,
+  scanTechnologySchema,
+} from './schema';
 
 const movementDirectionSchema = z.enum(["ENTRY", "EXIT", "UNKNOWN"]);
 const attendanceStatusSchema = z.enum([
@@ -15,6 +24,20 @@ const attendanceFiltersSchema = z.object({
   dateTo: z.string().optional(),
   employeeId: z.coerce.number().optional(),
   status: attendanceStatusSchema.optional(),
+  department: z.string().trim().optional(),
+  deviceId: z.string().trim().optional(),
+  search: z.string().trim().optional(),
+}).optional();
+const gateEventFiltersSchema = z.object({
+  date: z.string().optional(),
+  dateFrom: z.string().optional(),
+  dateTo: z.string().optional(),
+  employeeId: z.coerce.number().optional(),
+  status: attendanceStatusSchema.optional(),
+  department: z.string().trim().optional(),
+  deviceId: z.string().trim().optional(),
+  technology: scanTechnologySchema.optional(),
+  movementDirection: movementDirectionSchema.optional(),
   search: z.string().trim().optional(),
 }).optional();
 const matchDetailsSchema = z.object({
@@ -33,6 +56,9 @@ export const errorSchemas = {
 
 const attendanceWithEmployeeSchema = z.custom<
   typeof attendances.$inferSelect & { employee?: typeof employees.$inferSelect }
+>();
+const gateEventWithEmployeeSchema = z.custom<
+  typeof gateEvents.$inferSelect & { employee?: typeof employees.$inferSelect }
 >();
 
 const dashboardStatsResponseSchema = z.object({
@@ -80,6 +106,14 @@ export const api = {
       responses: { 200: z.array(attendanceWithEmployeeSchema) },
     }
   },
+  gateEvents: {
+    list: {
+      method: 'GET' as const,
+      path: '/api/gate-events' as const,
+      input: gateEventFiltersSchema,
+      responses: { 200: z.array(gateEventWithEmployeeSchema) },
+    }
+  },
   scan: {
     rfid: {
       method: 'POST' as const,
@@ -90,8 +124,11 @@ export const api = {
         faceDescriptor: z.array(z.number()).optional(),
         faceAnchorDescriptors: z.array(z.array(z.number())).optional(),
         faceConsistency: z.number().min(0).max(1).optional(),
+        faceQuality: z.number().min(0).max(1).optional(),
         faceCaptureMode: faceCaptureModeSchema.optional(),
+        scanTechnology: scanTechnologySchema.optional(),
         movementDirection: movementDirectionSchema.optional(),
+        movementAxis: movementAxisSchema.optional(),
         movementConfidence: z.number().min(0).max(1).optional(),
       }),
       responses: {

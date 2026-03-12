@@ -1,15 +1,18 @@
-import { db } from "./db";
+import { db, pool } from "./db";
 import { eq, and, desc, gte, ilike, lte, or, sql } from "drizzle-orm";
 import {
   employees,
   devices,
   attendances,
+  gateEvents,
   type Employee,
   type InsertEmployee,
   type Device,
   type InsertDevice,
   type Attendance,
   type InsertAttendance,
+  type GateEvent,
+  type InsertGateEvent,
 } from "@shared/schema";
 
 export interface IStorage {
@@ -30,18 +33,38 @@ export interface IStorage {
   getOpenAttendance(employeeId: number, date: string): Promise<Attendance | undefined>;
   createAttendance(attendance: InsertAttendance): Promise<Attendance>;
   updateAttendance(id: number, updates: Partial<InsertAttendance>): Promise<Attendance | undefined>;
+
+  // Gate events
+  getGateEvents(filters?: GateEventFilters): Promise<(GateEvent & { employee?: Employee })[]>;
+  createGateEvent(event: InsertGateEvent): Promise<GateEvent>;
   
   // Stats
   getDashboardStats(): Promise<{ totalEmployees: number; presentToday: number; absentToday: number; recentScans: (Attendance & { employee?: Employee })[] }>;
 }
 
 type AttendanceWithEmployee = Attendance & { employee?: Employee };
+type GateEventWithEmployee = GateEvent & { employee?: Employee };
 export interface AttendanceFilters {
   date?: string;
   dateFrom?: string;
   dateTo?: string;
   employeeId?: number;
   status?: Attendance["verificationStatus"];
+  department?: string;
+  deviceId?: string;
+  search?: string;
+}
+
+export interface GateEventFilters {
+  date?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  employeeId?: number;
+  status?: GateEvent["verificationStatus"];
+  department?: string;
+  deviceId?: string;
+  technology?: GateEvent["scanTechnology"];
+  movementDirection?: GateEvent["movementDirection"];
   search?: string;
 }
 
@@ -51,6 +74,84 @@ function requireDb() {
   }
 
   return db;
+}
+
+const GATE_EVENTS_SCHEMA_RECHECK_MS = 30_000;
+let gateEventsAvailability: "unknown" | "available" | "unavailable" = "unknown";
+let gateEventsAvailabilityCheckedAt = 0;
+
+function isGateEventsSchemaError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const errorWithCode = error as { code?: string; message?: string };
+  const message = errorWithCode.message?.toLowerCase() ?? "";
+  return (
+    errorWithCode.code === "42P01"
+    || errorWithCode.code === "42703"
+    || errorWithCode.code === "42704"
+    || message.includes("gate_events")
+    || message.includes("scan_technology")
+    || message.includes("movement_axis")
+    || message.includes("face_capture_mode")
+  );
+}
+
+function markGateEventsUnavailable(reason?: unknown) {
+  gateEventsAvailabilityCheckedAt = Date.now();
+
+  if (gateEventsAvailability === "unavailable") {
+    return;
+  }
+
+  gateEventsAvailability = "unavailable";
+
+  const errorMessage =
+    reason && typeof reason === "object" && "message" in reason && typeof reason.message === "string"
+      ? ` ${reason.message}`
+      : "";
+
+  console.warn(
+    `[storage] gate_events schema is unavailable. Raw gate event logging is disabled until the database is updated.${errorMessage}`,
+  );
+}
+
+async function canUseGateEvents() {
+  if (!pool) {
+    return false;
+  }
+
+  const now = Date.now();
+  if (gateEventsAvailability === "available") {
+    return true;
+  }
+
+  if (
+    gateEventsAvailability === "unavailable"
+    && now - gateEventsAvailabilityCheckedAt < GATE_EVENTS_SCHEMA_RECHECK_MS
+  ) {
+    return false;
+  }
+
+  try {
+    const result = await pool.query("select to_regclass('public.gate_events') as gate_events");
+    gateEventsAvailabilityCheckedAt = now;
+    if (!result.rows[0]?.gate_events) {
+      markGateEventsUnavailable();
+      return false;
+    }
+
+    gateEventsAvailability = "available";
+    return true;
+  } catch (error) {
+    if (isGateEventsSchemaError(error)) {
+      markGateEventsUnavailable(error);
+      return false;
+    }
+
+    throw error;
+  }
 }
 
 export class DatabaseStorage implements IStorage {
@@ -79,6 +180,18 @@ export class DatabaseStorage implements IStorage {
   }
 
   async deleteEmployee(id: number): Promise<Employee | undefined> {
+    if (await canUseGateEvents()) {
+      try {
+        await requireDb().delete(gateEvents).where(eq(gateEvents.employeeId, id));
+      } catch (error) {
+        if (isGateEventsSchemaError(error)) {
+          markGateEventsUnavailable(error);
+        } else {
+          throw error;
+        }
+      }
+    }
+
     return await requireDb().transaction(async (tx) => {
       await tx.delete(attendances).where(eq(attendances.employeeId, id));
       const [deletedEmployee] = await tx.delete(employees).where(eq(employees.id, id)).returning();
@@ -114,6 +227,8 @@ export class DatabaseStorage implements IStorage {
     }
     if (filters.employeeId) conditions.push(eq(attendances.employeeId, filters.employeeId));
     if (filters.status) conditions.push(eq(attendances.verificationStatus, filters.status));
+    if (filters.department) conditions.push(eq(employees.department, filters.department));
+    if (filters.deviceId) conditions.push(eq(attendances.deviceId, filters.deviceId));
     if (filters.search) {
       const searchPattern = `%${filters.search}%`;
       conditions.push(or(
@@ -138,6 +253,66 @@ export class DatabaseStorage implements IStorage {
     }));
   }
 
+  async getGateEvents(filters: GateEventFilters = {}): Promise<GateEventWithEmployee[]> {
+    if (!(await canUseGateEvents())) {
+      return [];
+    }
+
+    try {
+      let query = requireDb().select({
+        gateEvent: gateEvents,
+        employee: employees,
+      })
+      .from(gateEvents)
+      .leftJoin(employees, eq(gateEvents.employeeId, employees.id))
+      .orderBy(desc(gateEvents.id));
+
+      const conditions = [];
+      if (filters.date) {
+        conditions.push(eq(gateEvents.date, filters.date));
+      } else {
+        if (filters.dateFrom) conditions.push(gte(gateEvents.date, filters.dateFrom));
+        if (filters.dateTo) conditions.push(lte(gateEvents.date, filters.dateTo));
+      }
+      if (filters.employeeId) conditions.push(eq(gateEvents.employeeId, filters.employeeId));
+      if (filters.status) conditions.push(eq(gateEvents.verificationStatus, filters.status));
+      if (filters.department) conditions.push(eq(employees.department, filters.department));
+      if (filters.deviceId) conditions.push(eq(gateEvents.deviceId, filters.deviceId));
+      if (filters.technology) conditions.push(eq(gateEvents.scanTechnology, filters.technology));
+      if (filters.movementDirection) conditions.push(eq(gateEvents.movementDirection, filters.movementDirection));
+      if (filters.search) {
+        const searchPattern = `%${filters.search}%`;
+        conditions.push(or(
+          ilike(employees.name, searchPattern),
+          ilike(employees.employeeCode, searchPattern),
+          ilike(employees.department, searchPattern),
+          ilike(employees.rfidUid, searchPattern),
+          ilike(gateEvents.rfidUid, searchPattern),
+          ilike(gateEvents.deviceId, searchPattern),
+          ilike(gateEvents.eventMessage, searchPattern),
+        ));
+      }
+
+      if (conditions.length > 0) {
+        // @ts-ignore
+        query = query.where(and(...conditions));
+      }
+
+      const results = await query;
+      return results.map((row) => ({
+        ...row.gateEvent,
+        employee: row.employee || undefined,
+      }));
+    } catch (error) {
+      if (isGateEventsSchemaError(error)) {
+        markGateEventsUnavailable(error);
+        return [];
+      }
+
+      throw error;
+    }
+  }
+
   async getOpenAttendance(employeeId: number, date: string): Promise<Attendance | undefined> {
     const [attendance] = await requireDb().select()
       .from(attendances)
@@ -157,6 +332,11 @@ export class DatabaseStorage implements IStorage {
   async createAttendance(attendance: InsertAttendance): Promise<Attendance> {
     const [newAttendance] = await requireDb().insert(attendances).values(attendance).returning();
     return newAttendance;
+  }
+
+  async createGateEvent(event: InsertGateEvent): Promise<GateEvent> {
+    const [newEvent] = await requireDb().insert(gateEvents).values(event).returning();
+    return newEvent;
   }
 
   async updateAttendance(id: number, updates: Partial<InsertAttendance>): Promise<Attendance | undefined> {
@@ -208,10 +388,12 @@ export class MemoryStorage implements IStorage {
   private employeeIdSequence = 1;
   private deviceIdSequence = 1;
   private attendanceIdSequence = 1;
+  private gateEventIdSequence = 1;
 
   private employeeStore = new Map<number, Employee>();
   private deviceStore = new Map<string, Device>();
   private attendanceStore = new Map<number, Attendance>();
+  private gateEventStore = new Map<number, GateEvent>();
 
   async getEmployees(): Promise<Employee[]> {
     return Array.from(this.employeeStore.values()).sort((a, b) => a.id - b.id);
@@ -279,6 +461,12 @@ export class MemoryStorage implements IStorage {
       }
     });
 
+    this.gateEventStore.forEach((gateEvent, gateEventId) => {
+      if (gateEvent.employeeId === id) {
+        this.gateEventStore.delete(gateEventId);
+      }
+    });
+
     return existing;
   }
 
@@ -317,6 +505,14 @@ export class MemoryStorage implements IStorage {
       })
       .filter((attendance) => !filters.employeeId || attendance.employeeId === filters.employeeId)
       .filter((attendance) => !filters.status || attendance.verificationStatus === filters.status)
+      .filter((attendance) => !filters.deviceId || attendance.deviceId === filters.deviceId)
+      .filter((attendance) => {
+        if (!filters.department) {
+          return true;
+        }
+
+        return this.employeeStore.get(attendance.employeeId)?.department === filters.department;
+      })
       .sort((a, b) => b.id - a.id)
       .map((attendance) => ({
         ...attendance,
@@ -335,6 +531,66 @@ export class MemoryStorage implements IStorage {
           attendance.employee?.rfidUid,
           attendance.deviceId,
           attendance.verificationStatus,
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+
+        return haystack.includes(searchValue);
+      });
+  }
+
+  async getGateEvents(filters: GateEventFilters = {}): Promise<GateEventWithEmployee[]> {
+    return Array.from(this.gateEventStore.values())
+      .filter((gateEvent) => {
+        if (filters.date) {
+          return gateEvent.date === filters.date;
+        }
+
+        if (filters.dateFrom && gateEvent.date < filters.dateFrom) {
+          return false;
+        }
+
+        if (filters.dateTo && gateEvent.date > filters.dateTo) {
+          return false;
+        }
+
+        return true;
+      })
+      .filter((gateEvent) => !filters.employeeId || gateEvent.employeeId === filters.employeeId)
+      .filter((gateEvent) => !filters.status || gateEvent.verificationStatus === filters.status)
+      .filter((gateEvent) => !filters.deviceId || gateEvent.deviceId === filters.deviceId)
+      .filter((gateEvent) => !filters.technology || gateEvent.scanTechnology === filters.technology)
+      .filter((gateEvent) => !filters.movementDirection || gateEvent.movementDirection === filters.movementDirection)
+      .filter((gateEvent) => {
+        if (!filters.department) {
+          return true;
+        }
+
+        return gateEvent.employeeId != null
+          && this.employeeStore.get(gateEvent.employeeId)?.department === filters.department;
+      })
+      .sort((a, b) => b.id - a.id)
+      .map((gateEvent) => ({
+        ...gateEvent,
+        employee: gateEvent.employeeId != null ? this.employeeStore.get(gateEvent.employeeId) : undefined,
+      }))
+      .filter((gateEvent) => {
+        if (!filters.search) {
+          return true;
+        }
+
+        const searchValue = filters.search.toLowerCase();
+        const haystack = [
+          gateEvent.employee?.name,
+          gateEvent.employee?.employeeCode,
+          gateEvent.employee?.department,
+          gateEvent.employee?.rfidUid,
+          gateEvent.rfidUid,
+          gateEvent.deviceId,
+          gateEvent.eventMessage,
+          gateEvent.scanTechnology,
+          gateEvent.verificationStatus,
         ]
           .filter(Boolean)
           .join(" ")
@@ -369,6 +625,31 @@ export class MemoryStorage implements IStorage {
 
     this.attendanceStore.set(newAttendance.id, newAttendance);
     return newAttendance;
+  }
+
+  async createGateEvent(event: InsertGateEvent): Promise<GateEvent> {
+    const newGateEvent: GateEvent = {
+      id: this.gateEventIdSequence++,
+      employeeId: event.employeeId ?? null,
+      date: event.date,
+      occurredAt: new Date(),
+      rfidUid: event.rfidUid,
+      deviceId: event.deviceId,
+      scanTechnology: event.scanTechnology ?? "HF_RFID",
+      decision: event.decision,
+      verificationStatus: event.verificationStatus,
+      eventMessage: event.eventMessage,
+      movementDirection: event.movementDirection ?? null,
+      movementAxis: event.movementAxis ?? null,
+      movementConfidence: event.movementConfidence ?? null,
+      matchConfidence: event.matchConfidence ?? null,
+      faceQuality: event.faceQuality ?? null,
+      faceConsistency: event.faceConsistency ?? null,
+      faceCaptureMode: event.faceCaptureMode ?? null,
+    };
+
+    this.gateEventStore.set(newGateEvent.id, newGateEvent);
+    return newGateEvent;
   }
 
   async updateAttendance(id: number, updates: Partial<InsertAttendance>): Promise<Attendance | undefined> {

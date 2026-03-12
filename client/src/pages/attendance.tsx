@@ -56,26 +56,45 @@ function SummaryCard(props: { label: string; value: string; hint: string }) {
 export default function Attendance() {
   const [search, setSearch] = useState("");
   const [employeeFilter, setEmployeeFilter] = useState("all");
+  const [departmentFilter, setDepartmentFilter] = useState("all");
+  const [deviceFilter, setDeviceFilter] = useState("all");
   const [statusFilter, setStatusFilter] = useState<AttendanceStatusFilter>("all");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const deferredSearch = useDeferredValue(search.trim());
   const { data: employees } = useEmployees();
+  const departmentOptions = useMemo(() => {
+    return Array.from(new Set((employees ?? []).map((employee) => employee.department))).sort((left, right) => {
+      return left.localeCompare(right);
+    });
+  }, [employees]);
   const filters = useMemo(() => {
     return {
       search: deferredSearch || undefined,
       employeeId: employeeFilter !== "all" ? Number(employeeFilter) : undefined,
+      department: departmentFilter !== "all" ? departmentFilter : undefined,
+      deviceId: deviceFilter !== "all" ? deviceFilter : undefined,
       status: statusFilter !== "all" ? statusFilter : undefined,
       dateFrom: dateFrom || undefined,
       dateTo: dateTo || undefined,
     };
-  }, [dateFrom, dateTo, deferredSearch, employeeFilter, statusFilter]);
+  }, [dateFrom, dateTo, deferredSearch, departmentFilter, deviceFilter, employeeFilter, statusFilter]);
   const { data: logs, isLoading } = useAttendances(filters);
   const summary = useMemo(() => calculateAttendanceSummary(logs ?? []), [logs]);
+  const deviceOptions = useMemo(() => {
+    return Array.from(new Set([
+      ...(logs ?? []).map((log) => log.deviceId),
+      ...(deviceFilter !== "all" ? [deviceFilter] : []),
+    ])).sort((left, right) => {
+      return left.localeCompare(right);
+    });
+  }, [deviceFilter, logs]);
 
   const handleResetFilters = () => {
     setSearch("");
     setEmployeeFilter("all");
+    setDepartmentFilter("all");
+    setDeviceFilter("all");
     setStatusFilter("all");
     setDateFrom("");
     setDateTo("");
@@ -135,7 +154,7 @@ export default function Attendance() {
           </CardTitle>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid gap-4 lg:grid-cols-[1.6fr_1fr_1fr_1fr_1fr_auto]">
+          <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr_1fr_1fr_1fr_1fr_1fr_auto]">
             <div className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
@@ -154,6 +173,32 @@ export default function Attendance() {
                 {employees?.map((employee) => (
                   <SelectItem key={employee.id} value={String(employee.id)}>
                     {employee.name} ({employee.employeeCode})
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={departmentFilter} onValueChange={setDepartmentFilter}>
+              <SelectTrigger>
+                <SelectValue placeholder="All departments" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All departments</SelectItem>
+                {departmentOptions.map((department) => (
+                  <SelectItem key={department} value={department}>
+                    {department}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={deviceFilter} onValueChange={setDeviceFilter}>
+              <SelectTrigger>
+                <SelectValue placeholder="All devices" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All devices</SelectItem>
+                {deviceOptions.map((deviceId) => (
+                  <SelectItem key={deviceId} value={deviceId}>
+                    {deviceId}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -184,6 +229,12 @@ export default function Attendance() {
             </span>
             <span className="rounded-full bg-muted px-3 py-1">
               Active days: {summary.activeDays}
+            </span>
+            <span className="rounded-full bg-muted px-3 py-1">
+              Departments: {departmentFilter === "all" ? "All" : departmentFilter}
+            </span>
+            <span className="rounded-full bg-muted px-3 py-1">
+              Devices: {deviceFilter === "all" ? "All" : deviceFilter}
             </span>
             <span className="rounded-full bg-muted px-3 py-1">
               Search syncs with exports

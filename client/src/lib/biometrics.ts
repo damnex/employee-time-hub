@@ -5,6 +5,11 @@ const FACE_CAPTURE_SIZE = 128;
 const DEFAULT_SAMPLE_DELAY_MS = 80;
 const DEFAULT_MIN_SAMPLE_QUALITY = 0.2;
 const DEFAULT_ANCHOR_COUNT = 5;
+const DEFAULT_FALLBACK_CROP_SCALE = 0.82;
+const DEFAULT_FALLBACK_FACE_CENTER_Y = 0.44;
+const FACE_MASK_CENTER_Y = 0.47;
+const FACE_MASK_RADIUS_X = 0.39;
+const FACE_MASK_RADIUS_Y = 0.5;
 
 interface FaceDetectorLike {
   detect: (source: CanvasImageSource) => Promise<Array<{
@@ -52,6 +57,14 @@ export interface FaceTemplateCaptureResult {
   profile: FaceProfile;
 }
 
+export interface BiometricRuntimeInfo {
+  isIOS: boolean;
+  isSafari: boolean;
+  detectorAvailable: boolean;
+  fallbackAllowed: boolean;
+  compatibilityMode: boolean;
+}
+
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
 }
@@ -90,16 +103,126 @@ export function allowInsecureFaceFallback() {
   return import.meta.env.VITE_ALLOW_INSECURE_FACE_FALLBACK === "true";
 }
 
+function isIOSDevice() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const userAgent = navigator.userAgent.toLowerCase();
+  const touchMac =
+    navigator.platform === "MacIntel"
+    && typeof navigator.maxTouchPoints === "number"
+    && navigator.maxTouchPoints > 1;
+
+  return /iphone|ipad|ipod/.test(userAgent) || touchMac;
+}
+
+function isSafariBrowser() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const userAgent = navigator.userAgent.toLowerCase();
+  return /safari/.test(userAgent)
+    && !/chrome|crios|edg|edgios|android|fxios/.test(userAgent);
+}
+
+export function getBiometricRuntimeInfo(): BiometricRuntimeInfo {
+  const detectorAvailable = isFaceDetectorAvailable();
+  const fallbackAllowed = allowInsecureFaceFallback();
+
+  return {
+    isIOS: isIOSDevice(),
+    isSafari: isSafariBrowser(),
+    detectorAvailable,
+    fallbackAllowed,
+    compatibilityMode: !detectorAvailable && fallbackAllowed,
+  };
+}
+
+export function getBiometricCameraConstraints(): MediaTrackConstraints {
+  const runtime = getBiometricRuntimeInfo();
+
+  return {
+    facingMode: "user",
+    width: { ideal: runtime.isIOS ? 1280 : 960, min: 640 },
+    height: { ideal: runtime.isIOS ? 720 : 540, min: 480 },
+    frameRate: { ideal: 30, max: 30 },
+  };
+}
+
+function buildFaceWeightMask(width: number, height: number) {
+  const mask = new Float32Array(width * height);
+  const centerX = width / 2;
+  const centerY = height * FACE_MASK_CENTER_Y;
+  const radiusX = width * FACE_MASK_RADIUS_X;
+  const radiusY = height * FACE_MASK_RADIUS_Y;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const normalizedX = (x - centerX) / Math.max(1, radiusX);
+      const normalizedY = (y - centerY) / Math.max(1, radiusY);
+      const radialDistance = normalizedX * normalizedX + normalizedY * normalizedY;
+      const weight = radialDistance >= 1
+        ? 0.12
+        : Math.max(0.12, 1 - radialDistance);
+
+      mask[y * width + x] = weight * weight;
+    }
+  }
+
+  return mask;
+}
+
+function equalizeGrayscale(grayscale: Float32Array) {
+  const histogram = new Uint32Array(256);
+
+  grayscale.forEach((value) => {
+    histogram[Math.max(0, Math.min(255, Math.round(value)))] += 1;
+  });
+
+  const cdf = new Uint32Array(256);
+  let runningTotal = 0;
+  for (let i = 0; i < histogram.length; i++) {
+    runningTotal += histogram[i];
+    cdf[i] = runningTotal;
+  }
+
+  const firstNonZero = cdf.find((value) => value > 0) ?? 0;
+  const totalPixels = grayscale.length;
+  if (!totalPixels || totalPixels === firstNonZero) {
+    return grayscale;
+  }
+
+  const equalized = new Float32Array(totalPixels);
+  for (let i = 0; i < grayscale.length; i++) {
+    const sourceValue = Math.max(0, Math.min(255, Math.round(grayscale[i])));
+    equalized[i] = ((cdf[sourceValue] - firstNonZero) / (totalPixels - firstNonZero)) * 255;
+  }
+
+  return equalized;
+}
+
 function getFaceCropRegion(
   sourceWidth: number,
   sourceHeight: number,
   faceBounds?: FaceCropBounds | null,
 ) {
   if (!faceBounds) {
-    const cropSize = Math.min(sourceWidth, sourceHeight);
+    const cropSize = Math.min(sourceWidth, sourceHeight) * DEFAULT_FALLBACK_CROP_SCALE;
+    const faceCenterX = sourceWidth / 2;
+    const faceCenterY = sourceHeight * DEFAULT_FALLBACK_FACE_CENTER_Y;
     return {
-      offsetX: (sourceWidth - cropSize) / 2,
-      offsetY: (sourceHeight - cropSize) / 2,
+      offsetX: clamp(
+        faceCenterX - cropSize / 2,
+        0,
+        Math.max(0, sourceWidth - cropSize),
+      ),
+      offsetY: clamp(
+        faceCenterY - cropSize / 2,
+        0,
+        Math.max(0, sourceHeight - cropSize),
+      ),
       cropSize,
     };
   }
@@ -185,15 +308,20 @@ export function captureFaceSample(
       0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2];
   }
 
+  const normalizedGrayscale = equalizeGrayscale(grayscale);
+  const faceMask = buildFaceWeightMask(width, height);
+
   const blockSize = width / FACE_GRID_SIZE;
   const brightnessFeatures: number[] = [];
   const textureFeatures: number[] = [];
+  let maskedBrightnessSum = 0;
+  let maskedWeightSum = 0;
 
   for (let gridY = 0; gridY < FACE_GRID_SIZE; gridY++) {
     for (let gridX = 0; gridX < FACE_GRID_SIZE; gridX++) {
       let brightnessSum = 0;
       let textureSum = 0;
-      let pixelCount = 0;
+      let blockWeightSum = 0;
 
       const startX = Math.floor(gridX * blockSize);
       const endX = Math.floor((gridX + 1) * blockSize);
@@ -203,24 +331,28 @@ export function captureFaceSample(
       for (let y = startY; y < endY; y++) {
         for (let x = startX; x < endX; x++) {
           const index = y * width + x;
-          const value = grayscale[index];
-          brightnessSum += value;
+          const value = normalizedGrayscale[index];
+          const weight = faceMask[index];
+          brightnessSum += value * weight;
+          maskedBrightnessSum += value * weight;
+          maskedWeightSum += weight;
 
-          const right = x + 1 < width ? grayscale[index + 1] : value;
-          const down = y + 1 < height ? grayscale[index + width] : value;
+          const right = x + 1 < width ? normalizedGrayscale[index + 1] : value;
+          const down = y + 1 < height ? normalizedGrayscale[index + width] : value;
           const horizontalGradient = value - right;
           const verticalGradient = value - down;
           textureSum += Math.sqrt(
             horizontalGradient * horizontalGradient
               + verticalGradient * verticalGradient,
-          );
+          ) * weight;
 
-          pixelCount += 1;
+          blockWeightSum += weight;
         }
       }
 
-      brightnessFeatures.push(brightnessSum / (pixelCount * 255));
-      textureFeatures.push(textureSum / (pixelCount * 255));
+      const normalizedWeight = Math.max(blockWeightSum, 1e-6);
+      brightnessFeatures.push(brightnessSum / (normalizedWeight * 255));
+      textureFeatures.push(textureSum / (normalizedWeight * 255));
     }
   }
 
@@ -229,9 +361,7 @@ export function captureFaceSample(
     ...textureFeatures,
   ]);
 
-  const averageBrightness =
-    brightnessFeatures.reduce((sum, value) => sum + value, 0)
-    / brightnessFeatures.length;
+  const averageBrightness = maskedBrightnessSum / Math.max(maskedWeightSum, 1e-6) / 255;
   const contrast = Math.sqrt(
     brightnessFeatures.reduce((sum, value) => {
       const delta = value - averageBrightness;
@@ -242,8 +372,30 @@ export function captureFaceSample(
     textureFeatures.reduce((sum, value) => sum + value, 0)
     / textureFeatures.length;
   const exposure = 1 - Math.min(1, Math.abs(averageBrightness - 0.5) * 2);
+  const faceCenterX = faceBounds
+    ? (faceBounds.x + faceBounds.width / 2) / Math.max(1, video.videoWidth)
+    : 0.5;
+  const faceCenterY = faceBounds
+    ? (faceBounds.y + faceBounds.height / 2) / Math.max(1, video.videoHeight)
+    : DEFAULT_FALLBACK_FACE_CENTER_Y;
+  const centeredness = 1 - clamp(
+    Math.sqrt(
+      (faceCenterX - 0.5) * (faceCenterX - 0.5)
+      + (faceCenterY - DEFAULT_FALLBACK_FACE_CENTER_Y) * (faceCenterY - DEFAULT_FALLBACK_FACE_CENTER_Y),
+    ) / 0.35,
+    0,
+    1,
+  );
+  const faceCoverage = faceBounds
+    ? (faceBounds.width * faceBounds.height) / Math.max(1, video.videoWidth * video.videoHeight)
+    : 0.18;
+  const framing = 1 - clamp(Math.abs(faceCoverage - 0.18) / 0.14, 0, 1);
   const quality = clamp(
-    contrast * 2.4 + sharpness * 3.2 + exposure * 0.45,
+    contrast * 2.1
+      + sharpness * 3.3
+      + exposure * 0.55
+      + centeredness * 0.35
+      + framing * 0.35,
     0,
     1,
   );
@@ -318,10 +470,17 @@ function selectAnchorDescriptors(samples: FaceCaptureSample[], anchorCount = DEF
 
   const anchors: number[][] = [];
   for (let anchorIndex = 0; anchorIndex < anchorCount; anchorIndex++) {
-    const sampleIndex = Math.round(
-      (anchorIndex * (samples.length - 1)) / Math.max(1, anchorCount - 1),
+    const segmentStart = Math.floor((anchorIndex * samples.length) / anchorCount);
+    const segmentEnd = Math.max(
+      segmentStart + 1,
+      Math.floor(((anchorIndex + 1) * samples.length) / anchorCount),
     );
-    anchors.push(samples[sampleIndex].descriptor);
+    const segmentSamples = samples.slice(segmentStart, segmentEnd);
+    const bestSample =
+      segmentSamples.sort((left, right) => right.quality - left.quality)[0]
+      ?? samples[Math.round((anchorIndex * (samples.length - 1)) / Math.max(1, anchorCount - 1))];
+
+    anchors.push(bestSample.descriptor);
   }
 
   return anchors;

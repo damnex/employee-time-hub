@@ -5,11 +5,14 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Camera, Scan, KeyRound, AlertCircle, CheckCircle2, Wifi, WifiOff } from "lucide-react";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   allowInsecureFaceFallback,
   captureFaceTemplate,
+  getBiometricCameraConstraints,
+  getBiometricRuntimeInfo,
   isFaceDetectorAvailable,
 } from "@/lib/biometrics";
 import {
@@ -54,6 +57,7 @@ declare global {
 
 export default function GateSimulator() {
   const [rfidUid, setRfidUid] = useState("");
+  const [scanTechnology, setScanTechnology] = useState<"HF_RFID" | "UHF_RFID">("HF_RFID");
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const motionSamplesRef = useRef<MovementSample[]>([]);
@@ -91,9 +95,15 @@ export default function GateSimulator() {
 
   const scanMutation = useScanRFID();
   const { isConnected, lastScanResult, clearResult } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
-  const detectorAvailable = isFaceDetectorAvailable();
-  const fallbackCaptureAllowed = allowInsecureFaceFallback();
+  const biometricRuntime = getBiometricRuntimeInfo();
+  const detectorAvailable = biometricRuntime.detectorAvailable && isFaceDetectorAvailable();
+  const fallbackCaptureAllowed = biometricRuntime.fallbackAllowed && allowInsecureFaceFallback();
   const supportsDirectionTracking = detectorAvailable;
+  const compatibilityModeMessage = biometricRuntime.compatibilityMode
+    ? biometricRuntime.isIOS || biometricRuntime.isSafari
+      ? "iPhone/Safari compatibility mode is active. This uses the regular front camera only, not Apple Face ID hardware."
+      : "Browser compatibility mode is active. This uses the standard camera only, so accuracy is lower."
+    : null;
   const directionReady =
     directionState.direction !== "UNKNOWN"
     && directionState.confidence >= GATE_DIRECTION_CONFIDENCE_THRESHOLD;
@@ -130,7 +140,8 @@ export default function GateSimulator() {
 
     if (faceAlignmentState === "unsupported") {
       return fallbackCaptureAllowed
-        ? "Secure detector is unavailable. Compatibility fallback verification is enabled for this environment, but accuracy is lower."
+        ? compatibilityModeMessage
+          ?? "Secure detector is unavailable. Compatibility fallback verification is enabled for this environment, but accuracy is lower."
         : "Secure face detection is unavailable in this browser. Access verification is blocked here. Use Chrome or Edge.";
     }
 
@@ -184,11 +195,7 @@ export default function GateSimulator() {
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 640 },
-            height: { ideal: 480 },
-            facingMode: "user",
-          },
+          video: getBiometricCameraConstraints(),
           audio: false
         });
 
@@ -432,8 +439,11 @@ export default function GateSimulator() {
         faceDescriptor: liveFaceProfile.primaryDescriptor,
         faceAnchorDescriptors: liveFaceProfile.anchorDescriptors,
         faceConsistency: liveFaceProfile.consistency,
+        faceQuality: liveFaceProfile.averageQuality,
         faceCaptureMode: liveFaceProfile.captureMode,
+        scanTechnology,
         movementDirection: latestDirection?.direction,
+        movementAxis: latestDirection?.axis,
         movementConfidence: latestDirection?.confidence,
       });
 
@@ -628,6 +638,10 @@ export default function GateSimulator() {
                   <span className="font-mono text-slate-900">{GATE_BROWSER_CLIENT_ID}</span>
                 </div>
                 <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="text-slate-500">RFID mode</span>
+                  <span className="font-mono text-slate-900">{scanTechnology === "HF_RFID" ? "HF RFID" : "UHF RFID"}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3 text-sm">
                   <span className="text-slate-500">Last physical tap</span>
                   <span className="font-mono text-slate-900">{liveTapUid ?? "--"}</span>
                 </div>
@@ -702,11 +716,26 @@ export default function GateSimulator() {
                 <p className="mt-3 text-sm text-slate-600">{readerMessage}</p>
               )}
               <p className="mt-3 text-xs text-slate-500">
-                Entry is inferred from left-to-right or approaching-camera motion. Exit uses the reverse path.
+                Entry is inferred from left-to-right or approaching-camera motion. Exit uses the reverse path, which becomes critical when simulating UHF portal reads.
               </p>
             </div>
 
             <div className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+              <div className="space-y-2">
+                <Label className="text-slate-700">RFID Technology</Label>
+                <Select value={scanTechnology} onValueChange={(value) => setScanTechnology(value as "HF_RFID" | "UHF_RFID")}>
+                  <SelectTrigger className="h-11">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="HF_RFID">HF RFID</SelectItem>
+                    <SelectItem value="UHF_RFID">UHF RFID</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-slate-500">
+                  HF simulates tap-based verification. UHF simulates portal reads where camera direction becomes more important for accurate entry and exit mapping.
+                </p>
+              </div>
               <div className="space-y-2">
                 <Label htmlFor="rfid" className="flex items-center gap-2 text-slate-700">
                   <KeyRound className="size-4" /> RFID Badge

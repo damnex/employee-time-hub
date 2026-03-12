@@ -26,12 +26,17 @@ export function useScanRFID() {
            const error = api.scan.rfid.responses[res.status as 400 | 404].parse(resData);
            throw new Error(error.message);
         }
-        throw new Error("Scan failed");
+        throw new Error(
+          typeof resData?.message === "string" && resData.message.trim()
+            ? resData.message
+            : "Scan failed",
+        );
       }
       return api.scan.rfid.responses[200].parse(resData);
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: [api.attendances.list.path] });
+      queryClient.invalidateQueries({ queryKey: [api.gateEvents.list.path] });
       queryClient.invalidateQueries({ queryKey: [api.stats.dashboard.path] });
       
       if (data.success) {

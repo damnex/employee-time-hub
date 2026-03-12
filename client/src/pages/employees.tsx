@@ -49,6 +49,8 @@ import { faceProfileSchema, insertEmployeeSchema } from "@shared/schema";
 import {
   allowInsecureFaceFallback,
   captureFaceTemplate,
+  getBiometricCameraConstraints,
+  getBiometricRuntimeInfo,
   isFaceDetectorAvailable,
 } from "@/lib/biometrics";
 import { useDeviceWS } from "@/hooks/use-device-ws";
@@ -108,8 +110,9 @@ export default function Employees() {
   });
 
   const faceDescriptor = form.watch("faceDescriptor");
-  const faceDetectorAvailable = isFaceDetectorAvailable();
-  const fallbackCaptureAllowed = allowInsecureFaceFallback();
+  const biometricRuntime = getBiometricRuntimeInfo();
+  const faceDetectorAvailable = biometricRuntime.detectorAvailable && isFaceDetectorAvailable();
+  const fallbackCaptureAllowed = biometricRuntime.fallbackAllowed && allowInsecureFaceFallback();
   const watchedRfidUid = form.watch("rfidUid");
   const normalizedRfidUid = watchedRfidUid.trim().toUpperCase();
   const mappedBadgeOwner = employees?.find((employee) => {
@@ -118,6 +121,11 @@ export default function Employees() {
   const rfidReady = Boolean(normalizedRfidUid) && !mappedBadgeOwner;
   const faceProfileReady = Boolean(faceDescriptor?.primaryDescriptor?.length);
   const faceError = form.formState.errors.faceDescriptor?.message;
+  const compatibilityModeMessage = biometricRuntime.compatibilityMode
+    ? biometricRuntime.isIOS || biometricRuntime.isSafari
+      ? "iPhone/Safari compatibility mode is active. This uses the regular front camera, not Apple Face ID hardware."
+      : "Browser compatibility mode is active. This uses the standard camera only, so matching is less strict."
+    : null;
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -139,11 +147,7 @@ export default function Employees() {
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            width: { ideal: 960 },
-            height: { ideal: 540 },
-            facingMode: "user",
-          },
+          video: getBiometricCameraConstraints(),
           audio: false,
         });
 
@@ -265,7 +269,9 @@ export default function Employees() {
     if (!faceDetectorAvailable && !fallbackCaptureAllowed) {
       form.setError("faceDescriptor", {
         type: "manual",
-        message: "Use Chrome or Edge for secure biometric enrollment. Fallback capture is disabled.",
+        message: biometricRuntime.isIOS || biometricRuntime.isSafari
+          ? "Secure detector-backed enrollment is unavailable here. Turn on compatibility mode or use Chrome or Edge."
+          : "Use Chrome or Edge for secure biometric enrollment. Fallback capture is disabled.",
       });
       return;
     }
@@ -554,7 +560,7 @@ export default function Employees() {
                         <div>
                           <p className="text-sm font-semibold">Biometric Profile</p>
                           <p className="text-xs text-muted-foreground">
-                            Twenty-five face crops are merged into a biometric profile. Detector-backed capture is recommended; fallback mode is for compatibility only.
+                            Twenty-five face crops are merged into a biometric profile. Detector-backed capture is preferred; compatibility mode works on iPhone/Safari but uses the regular selfie camera only.
                           </p>
                         </div>
                         {faceProfileReady ? (
@@ -590,8 +596,10 @@ export default function Employees() {
                             <Camera className="size-10 text-white/40" />
                             <p className="max-w-xs text-sm text-white/70">
                               {cameraError ?? (!faceDetectorAvailable && !fallbackCaptureAllowed
-                                ? "Use Chrome or Edge for secure biometric enrollment."
-                                : "Starting live camera feed...")}
+                                ? biometricRuntime.isIOS || biometricRuntime.isSafari
+                                  ? "Turn on compatibility mode for iPhone/Safari, or use Chrome or Edge for detector-backed capture."
+                                  : "Use Chrome or Edge for secure biometric enrollment."
+                                : compatibilityModeMessage ?? "Starting live camera feed...")}
                             </p>
                           </div>
                         )}
@@ -693,15 +701,20 @@ export default function Employees() {
                             </p>
                           </div>
                         ) : (
-                          <div className="flex items-start gap-2 text-muted-foreground">
-                            <AlertCircle className="mt-0.5 size-4 shrink-0" />
-                            <p>
-                              {faceDetectorAvailable
-                                ? "Center the face in frame, keep still for one second, then capture all 25 samples."
-                                : fallbackCaptureAllowed
-                                  ? "Compatibility fallback capture is enabled in this environment. Accuracy is lower than detector-backed enrollment."
-                                  : "Open this page in Chrome or Edge before enrolling. Insecure fallback capture is blocked."}
-                            </p>
+                          <div className="space-y-2">
+                            {compatibilityModeMessage && (
+                              <p className="text-amber-700">{compatibilityModeMessage}</p>
+                            )}
+                            <div className="flex items-start gap-2 text-muted-foreground">
+                              <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                              <p>
+                                {faceDetectorAvailable
+                                  ? "Center the face in frame, keep still for one second, then capture all 25 samples."
+                                  : fallbackCaptureAllowed
+                                    ? "Compatibility fallback capture is enabled in this environment. Keep the full face centered, well lit, and close to the camera."
+                                    : "Open this page in Chrome or Edge before enrolling. Insecure fallback capture is blocked."}
+                              </p>
+                            </div>
                           </div>
                         )}
                       </div>

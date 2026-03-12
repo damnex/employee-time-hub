@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { format } from "date-fns";
+import { format, startOfMonth, subDays } from "date-fns";
 import {
   Activity,
   CalendarRange,
@@ -23,16 +23,21 @@ import {
 } from "recharts";
 import { useDashboardStats } from "@/hooks/use-stats";
 import { useAttendances } from "@/hooks/use-attendances";
+import { useGateEvents } from "@/hooks/use-gate-events";
 import { useEmployees } from "@/hooks/use-employees";
 import {
   buildDailyHoursTrend,
   buildEmployeeDetail,
   buildEmployeeRows,
+  calculateGateEventSummary,
   buildStatusDistribution,
   calculateAttendanceSummary,
   exportAttendanceRows,
+  exportGateEventRows,
   formatWorkingDuration,
+  getGateDecisionLabel,
   getAttendanceStatusLabel,
+  getScanTechnologyLabel,
 } from "@/lib/reporting";
 import {
   ChartContainer,
@@ -136,19 +141,59 @@ function renderRecentStatus(status: string) {
   }
 }
 
-export default function Dashboard() {
-  const [employeeId, setEmployeeId] = useState("all");
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+function renderGateDecision(decision: string) {
+  switch (decision) {
+    case "ENTRY":
+      return <Badge className="bg-emerald-500 hover:bg-emerald-600 text-white">Entry</Badge>;
+    case "EXIT":
+      return <Badge variant="secondary" className="bg-blue-100 text-blue-800">Exit</Badge>;
+    case "REJECTED":
+      return <Badge variant="destructive">Rejected</Badge>;
+    default:
+      return <Badge variant="outline">{getGateDecisionLabel(decision)}</Badge>;
+  }
+}
 
-  const { data: stats, isLoading, error } = useDashboardStats();
+export default function Dashboard() {
+  const todayString = format(new Date(), "yyyy-MM-dd");
+  const [employeeId, setEmployeeId] = useState("all");
+  const [departmentFilter, setDepartmentFilter] = useState("all");
+  const [deviceFilter, setDeviceFilter] = useState("all");
+  const [datePreset, setDatePreset] = useState("today");
+  const [dateFrom, setDateFrom] = useState(todayString);
+  const [dateTo, setDateTo] = useState(todayString);
+
+  const { data: stats, isLoading, error, dataUpdatedAt: statsUpdatedAt } = useDashboardStats();
   const { data: employees } = useEmployees();
+  const departmentOptions = useMemo(() => {
+    return Array.from(new Set((employees ?? []).map((employee) => employee.department))).sort((left, right) => {
+      return left.localeCompare(right);
+    });
+  }, [employees]);
   const attendanceFilters = useMemo(() => ({
     employeeId: employeeId !== "all" ? Number(employeeId) : undefined,
     dateFrom: dateFrom || undefined,
     dateTo: dateTo || undefined,
-  }), [dateFrom, dateTo, employeeId]);
-  const { data: filteredAttendances, isLoading: attendanceLoading } = useAttendances(attendanceFilters);
+    department: departmentFilter !== "all" ? departmentFilter : undefined,
+    deviceId: deviceFilter !== "all" ? deviceFilter : undefined,
+  }), [dateFrom, dateTo, departmentFilter, deviceFilter, employeeId]);
+  const gateEventFilters = useMemo(() => ({
+    employeeId: employeeId !== "all" ? Number(employeeId) : undefined,
+    dateFrom: dateFrom || undefined,
+    dateTo: dateTo || undefined,
+    department: departmentFilter !== "all" ? departmentFilter : undefined,
+    deviceId: deviceFilter !== "all" ? deviceFilter : undefined,
+  }), [dateFrom, dateTo, departmentFilter, deviceFilter, employeeId]);
+  const {
+    data: filteredAttendances,
+    isLoading: attendanceLoading,
+    dataUpdatedAt: attendanceUpdatedAt,
+  } = useAttendances(attendanceFilters);
+  const {
+    data: gateEvents,
+    isLoading: gateEventsLoading,
+    dataUpdatedAt: gateEventsUpdatedAt,
+  } = useGateEvents(gateEventFilters);
 
   const selectedEmployee = useMemo(() => {
     if (employeeId === "all") {
@@ -159,17 +204,29 @@ export default function Dashboard() {
   }, [employeeId, employees]);
 
   const filteredSummary = useMemo(() => calculateAttendanceSummary(filteredAttendances ?? []), [filteredAttendances]);
+  const gateEventSummary = useMemo(() => calculateGateEventSummary(gateEvents ?? []), [gateEvents]);
   const selectedEmployeeDetail = useMemo(() => {
     return buildEmployeeDetail(selectedEmployee, filteredAttendances ?? []);
   }, [filteredAttendances, selectedEmployee]);
   const dailyTrend = useMemo(() => buildDailyHoursTrend(filteredAttendances ?? []), [filteredAttendances]);
   const statusDistribution = useMemo(() => buildStatusDistribution(filteredAttendances ?? []), [filteredAttendances]);
   const employeeRows = useMemo(() => buildEmployeeRows(filteredAttendances ?? []), [filteredAttendances]);
+  const deviceOptions = useMemo(() => {
+    return Array.from(new Set([
+      ...(filteredAttendances ?? []).map((record) => record.deviceId),
+      ...(gateEvents ?? []).map((record) => record.deviceId),
+      ...(deviceFilter !== "all" ? [deviceFilter] : []),
+    ])).sort((left, right) => left.localeCompare(right));
+  }, [deviceFilter, filteredAttendances, gateEvents]);
+  const lastUpdatedAt = Math.max(statsUpdatedAt, attendanceUpdatedAt, gateEventsUpdatedAt);
 
   const handleResetFilters = () => {
     setEmployeeId("all");
-    setDateFrom("");
-    setDateTo("");
+    setDepartmentFilter("all");
+    setDeviceFilter("all");
+    setDatePreset("today");
+    setDateFrom(todayString);
+    setDateTo(todayString);
   };
 
   const handleExportFiltered = () => {
@@ -181,6 +238,41 @@ export default function Dashboard() {
       ? `${selectedEmployee.employeeCode.toLowerCase()}-attendance-report.csv`
       : "all-employees-attendance-report.csv";
     exportAttendanceRows(filteredAttendances, filename);
+  };
+
+  const handleExportGateEvents = () => {
+    if (!gateEvents?.length) {
+      return;
+    }
+
+    exportGateEventRows(gateEvents, "gate-events-report.csv");
+  };
+
+  const handlePresetChange = (value: string) => {
+    setDatePreset(value);
+
+    if (value === "custom") {
+      return;
+    }
+
+    const today = new Date();
+    if (value === "today") {
+      const formattedToday = format(today, "yyyy-MM-dd");
+      setDateFrom(formattedToday);
+      setDateTo(formattedToday);
+      return;
+    }
+
+    if (value === "last7") {
+      setDateFrom(format(subDays(today, 6), "yyyy-MM-dd"));
+      setDateTo(format(today, "yyyy-MM-dd"));
+      return;
+    }
+
+    if (value === "month") {
+      setDateFrom(format(startOfMonth(today), "yyyy-MM-dd"));
+      setDateTo(format(today, "yyyy-MM-dd"));
+    }
   };
 
   if (error) {
@@ -199,13 +291,24 @@ export default function Dashboard() {
         <div>
           <h1 className="text-3xl font-bold text-foreground">Operations Dashboard</h1>
           <p className="mt-1 text-muted-foreground">
-            Track live gate activity, drill into a particular employee, and export filtered attendance reports.
+            Track live gate activity, drill into a particular employee, and review both raw gate events and final attendance records.
           </p>
+          {lastUpdatedAt > 0 && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Live refresh every 5 seconds. Last sync: {format(new Date(lastUpdatedAt), "dd MMM yyyy, hh:mm:ss a")}
+            </p>
+          )}
         </div>
-        <Button onClick={handleExportFiltered} disabled={!filteredAttendances?.length} className="shadow-sm">
-          <Download className="mr-2 size-4" />
-          {selectedEmployee ? "Download Employee Report" : "Download Filtered Report"}
-        </Button>
+        <div className="flex flex-col gap-2 sm:flex-row">
+          <Button variant="outline" onClick={handleExportGateEvents} disabled={!gateEvents?.length} className="shadow-sm">
+            <Download className="mr-2 size-4" />
+            Download Gate Events
+          </Button>
+          <Button onClick={handleExportFiltered} disabled={!filteredAttendances?.length} className="shadow-sm">
+            <Download className="mr-2 size-4" />
+            {selectedEmployee ? "Download Employee Report" : "Download Attendance Report"}
+          </Button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-6 md:grid-cols-3">
@@ -238,14 +341,25 @@ export default function Dashboard() {
         <CardHeader className="pb-4">
           <CardTitle className="flex items-center gap-2 text-lg">
             <CalendarRange className="size-4 text-primary" />
-            Employee Analytics Filters
+            Operations Filters
           </CardTitle>
           <CardDescription>
-            Filter the dashboard by employee and date range. Charts, tables, and report downloads follow these filters.
+            Filter by person, department, device, and time window. The charts, gate feed, and exports all follow this scope.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr_1fr_auto]">
+          <div className="grid gap-4 lg:grid-cols-[1fr_1.4fr_1fr_1fr_auto]">
+            <Select value={datePreset} onValueChange={handlePresetChange}>
+              <SelectTrigger>
+                <SelectValue placeholder="Date preset" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="today">Today</SelectItem>
+                <SelectItem value="last7">Last 7 days</SelectItem>
+                <SelectItem value="month">This month</SelectItem>
+                <SelectItem value="custom">Custom range</SelectItem>
+              </SelectContent>
+            </Select>
             <Select value={employeeId} onValueChange={setEmployeeId}>
               <SelectTrigger>
                 <SelectValue placeholder="All employees" />
@@ -259,9 +373,51 @@ export default function Dashboard() {
                 ))}
               </SelectContent>
             </Select>
-            <Input type="date" value={dateFrom} onChange={(event) => setDateFrom(event.target.value)} />
-            <Input type="date" value={dateTo} onChange={(event) => setDateTo(event.target.value)} />
+            <Select value={departmentFilter} onValueChange={setDepartmentFilter}>
+              <SelectTrigger>
+                <SelectValue placeholder="All departments" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All departments</SelectItem>
+                {departmentOptions.map((department) => (
+                  <SelectItem key={department} value={department}>
+                    {department}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={deviceFilter} onValueChange={setDeviceFilter}>
+              <SelectTrigger>
+                <SelectValue placeholder="All devices" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All devices</SelectItem>
+                {deviceOptions.map((deviceId) => (
+                  <SelectItem key={deviceId} value={deviceId}>
+                    {deviceId}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Button variant="outline" onClick={handleResetFilters}>Reset</Button>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-2">
+            <Input
+              type="date"
+              value={dateFrom}
+              onChange={(event) => {
+                setDatePreset("custom");
+                setDateFrom(event.target.value);
+              }}
+            />
+            <Input
+              type="date"
+              value={dateTo}
+              onChange={(event) => {
+                setDatePreset("custom");
+                setDateTo(event.target.value);
+              }}
+            />
           </div>
           <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
             <span className="rounded-full bg-muted px-3 py-1">
@@ -272,6 +428,12 @@ export default function Dashboard() {
             </span>
             <span className="rounded-full bg-muted px-3 py-1">
               Active days: {filteredSummary.activeDays}
+            </span>
+            <span className="rounded-full bg-muted px-3 py-1">
+              Gate events: {gateEventSummary.totalEvents}
+            </span>
+            <span className="rounded-full bg-muted px-3 py-1">
+              Device scope: {deviceFilter === "all" ? "All devices" : deviceFilter}
             </span>
           </div>
         </CardContent>
@@ -308,6 +470,40 @@ export default function Dashboard() {
           icon={TrendingUp}
           accent="text-blue-600"
           isLoading={attendanceLoading}
+        />
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-4">
+        <OverviewCard
+          title="Gate Events"
+          value={gateEventSummary.totalEvents}
+          hint="Raw scans and biometric decisions in the current scope"
+          icon={Activity}
+          isLoading={gateEventsLoading}
+        />
+        <OverviewCard
+          title="Direction Resolved"
+          value={gateEventSummary.directionResolved}
+          hint="Events where entry or exit direction was classified"
+          icon={TrendingUp}
+          accent="text-cyan-600"
+          isLoading={gateEventsLoading}
+        />
+        <OverviewCard
+          title="Rejected Events"
+          value={gateEventSummary.rejectedEvents}
+          hint="Rejected because of face, direction, or badge issues"
+          icon={ShieldAlert}
+          accent="text-rose-600"
+          isLoading={gateEventsLoading}
+        />
+        <OverviewCard
+          title="Average Match"
+          value={`${(gateEventSummary.averageMatchConfidence * 100).toFixed(1)}%`}
+          hint={`${gateEventSummary.trackedEmployees} employees seen in raw gate events`}
+          icon={UserCheck}
+          accent="text-emerald-600"
+          isLoading={gateEventsLoading}
         />
       </div>
 
@@ -581,50 +777,87 @@ export default function Dashboard() {
 
       <Card className="border-border/50 shadow-sm">
         <CardHeader>
-          <CardTitle>Recent Gate Activity</CardTitle>
-          <CardDescription>Live feed of the most recent access logs across all gates.</CardDescription>
+          <CardTitle>Live Gate Event Stream</CardTitle>
+          <CardDescription>
+            Raw gate reads with RFID technology, direction inference, and biometric confidence. This feed is the layer you will keep when moving from HF tap to UHF portal reads.
+          </CardDescription>
         </CardHeader>
         <CardContent>
-          {isLoading ? (
+          {gateEventsLoading ? (
             <div className="space-y-4">
               {[1, 2, 3].map((item) => <Skeleton key={item} className="h-12 w-full" />)}
             </div>
-          ) : !stats?.recentScans?.length ? (
-            <div className="py-8 text-center text-muted-foreground">No recent gate activity.</div>
+          ) : !gateEvents?.length ? (
+            <div className="py-8 text-center text-muted-foreground">No gate events found for the selected filters.</div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Time</TableHead>
-                  <TableHead>Employee</TableHead>
+                  <TableHead>Timestamp</TableHead>
+                  <TableHead>Employee / RFID</TableHead>
+                  <TableHead>Technology</TableHead>
+                  <TableHead>Direction</TableHead>
+                  <TableHead>Decision</TableHead>
+                  <TableHead>Match</TableHead>
                   <TableHead>Device</TableHead>
-                  <TableHead>Status</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {stats.recentScans.map((scan) => {
-                  const timeValue = scan.entryTime ?? scan.exitTime ?? new Date();
-                  const dateObj = new Date(timeValue);
+                {gateEvents.slice(0, 12).map((event) => {
+                  const occurredAt = event.occurredAt ? new Date(event.occurredAt) : null;
 
                   return (
-                    <TableRow key={scan.id} className="hover:bg-muted/50 transition-colors">
+                    <TableRow key={event.id} className="hover:bg-muted/50 transition-colors">
                       <TableCell className="whitespace-nowrap font-medium">
-                        {format(dateObj, "hh:mm:ss a")}
+                        {occurredAt ? format(occurredAt, "dd MMM, hh:mm:ss a") : event.date}
                       </TableCell>
                       <TableCell>
-                        {scan.employee ? (
+                        {event.employee ? (
                           <div className="flex flex-col">
-                            <span className="font-semibold text-foreground">{scan.employee.name}</span>
-                            <span className="text-xs text-muted-foreground">{scan.employee.department}</span>
+                            <span className="font-semibold text-foreground">{event.employee.name}</span>
+                            <span className="text-xs text-muted-foreground">
+                              {event.employee.employeeCode} | {event.employee.department}
+                            </span>
                           </div>
                         ) : (
-                          <span className="italic text-muted-foreground">Unknown User</span>
+                          <div className="flex flex-col">
+                            <span className="italic text-muted-foreground">Unknown employee</span>
+                            <span className="text-xs font-mono text-muted-foreground">{event.rfidUid}</span>
+                          </div>
                         )}
                       </TableCell>
                       <TableCell>
-                        <Badge variant="outline" className="font-mono text-xs">{scan.deviceId}</Badge>
+                        <Badge variant="outline" className="font-mono text-xs">
+                          {getScanTechnologyLabel(event.scanTechnology)}
+                        </Badge>
                       </TableCell>
-                      <TableCell>{renderRecentStatus(scan.verificationStatus)}</TableCell>
+                      <TableCell>
+                        <div className="flex flex-col">
+                          <span className="font-medium text-foreground">{event.movementDirection ?? "UNKNOWN"}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {event.movementAxis ?? "none"} | {Math.round((event.movementConfidence ?? 0) * 100)}%
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-col gap-1">
+                          {renderGateDecision(event.decision)}
+                          <span className="text-xs text-muted-foreground">{event.eventMessage}</span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {typeof event.matchConfidence === "number"
+                          ? `${(event.matchConfidence * 100).toFixed(1)}%`
+                          : "--"}
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-col gap-1">
+                          <Badge variant="outline" className="w-fit font-mono text-xs">{event.deviceId}</Badge>
+                          <div className="text-xs text-muted-foreground">
+                            {renderRecentStatus(event.verificationStatus)}
+                          </div>
+                        </div>
+                      </TableCell>
                     </TableRow>
                   );
                 })}

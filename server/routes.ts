@@ -4,7 +4,15 @@ import { WebSocketServer, WebSocket } from "ws";
 import { storage } from "./storage";
 import { allowInsecureFaceFallback } from "./env";
 import { api } from "@shared/routes";
-import { faceProfileSchema, type Attendance, type Employee, type FaceCaptureMode } from "@shared/schema";
+import {
+  faceProfileSchema,
+  type Attendance,
+  type Employee,
+  type FaceCaptureMode,
+  type MovementAxis,
+  type GateDecision,
+  type ScanTechnology,
+} from "@shared/schema";
 import { z } from "zod";
 
 type ClientType = "browser" | "device";
@@ -25,8 +33,11 @@ interface ProcessScanInput {
   faceDescriptor?: number[];
   faceAnchorDescriptors?: number[][];
   faceConsistency?: number;
+  faceQuality?: number;
   faceCaptureMode?: FaceCaptureMode;
+  scanTechnology?: ScanTechnology;
   movementDirection?: MovementDirection;
+  movementAxis?: MovementAxis;
   movementConfidence?: number;
 }
 
@@ -46,6 +57,7 @@ interface NormalizedFaceProfile {
   primaryDescriptor: number[];
   anchorDescriptors: number[][];
   consistency: number;
+  averageQuality: number;
   captureMode: FaceCaptureMode | "legacy" | "unknown";
   secureCapture: boolean;
   legacy: boolean;
@@ -112,6 +124,7 @@ function normalizeStoredFaceProfile(faceDescriptor: unknown): NormalizedFaceProf
       primaryDescriptor: faceDescriptor,
       anchorDescriptors: [faceDescriptor],
       consistency: 1,
+      averageQuality: 0.55,
       captureMode: "legacy",
       secureCapture: false,
       legacy: true,
@@ -127,6 +140,7 @@ function normalizeStoredFaceProfile(faceDescriptor: unknown): NormalizedFaceProf
     primaryDescriptor: parsedProfile.data.primaryDescriptor,
     anchorDescriptors: parsedProfile.data.anchorDescriptors,
     consistency: parsedProfile.data.consistency,
+    averageQuality: parsedProfile.data.averageQuality,
     captureMode: parsedProfile.data.captureMode ?? "unknown",
     secureCapture: parsedProfile.data.captureMode === "detected",
     legacy: false,
@@ -146,6 +160,7 @@ function normalizeLiveFaceProfile(input: ProcessScanInput): NormalizedFaceProfil
     primaryDescriptor: input.faceDescriptor,
     anchorDescriptors: anchorDescriptors?.length ? anchorDescriptors : [input.faceDescriptor],
     consistency: input.faceConsistency ?? 1,
+    averageQuality: input.faceQuality ?? input.faceConsistency ?? 0.35,
     captureMode: input.faceCaptureMode ?? "fallback",
     secureCapture: input.faceCaptureMode === "detected",
     legacy: false,
@@ -201,7 +216,47 @@ const INSECURE_FACE_ANCHOR_AVG_THRESHOLD = 0.93;
 const INSECURE_FACE_ANCHOR_RATIO_THRESHOLD = 0.9;
 const INSECURE_FACE_SCAN_CONSISTENCY_THRESHOLD = 0.94;
 const LEGACY_FACE_MATCH_THRESHOLD = 0.9;
+const MIN_STORED_FACE_QUALITY = 0.18;
+const MIN_LIVE_FACE_QUALITY = 0.16;
+const MIN_INSECURE_LIVE_FACE_QUALITY = 0.2;
 const DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
+
+function normalizeScanTechnology(scanTechnology?: ScanTechnology): ScanTechnology {
+  return scanTechnology ?? "HF_RFID";
+}
+
+async function logGateEvent(args: {
+  date: string;
+  input: ProcessScanInput;
+  employee?: Employee;
+  verificationStatus: Attendance["verificationStatus"];
+  decision: GateDecision;
+  message: string;
+  matchConfidence?: number;
+  liveFaceProfile?: NormalizedFaceProfile | null;
+}) {
+  try {
+    await storage.createGateEvent({
+      employeeId: args.employee?.id ?? null,
+      date: args.date,
+      rfidUid: args.input.rfidUid.trim().toUpperCase(),
+      deviceId: args.input.deviceId,
+      scanTechnology: normalizeScanTechnology(args.input.scanTechnology),
+      decision: args.decision,
+      verificationStatus: args.verificationStatus,
+      eventMessage: args.message,
+      movementDirection: args.input.movementDirection ?? "UNKNOWN",
+      movementAxis: args.input.movementAxis ?? "none",
+      movementConfidence: args.input.movementConfidence,
+      matchConfidence: args.matchConfidence,
+      faceQuality: args.liveFaceProfile?.averageQuality,
+      faceConsistency: args.liveFaceProfile?.consistency,
+      faceCaptureMode: args.liveFaceProfile?.captureMode,
+    });
+  } catch (error) {
+    console.warn("[gate-events] Skipping raw gate event persistence:", error);
+  }
+}
 
 async function createFailureAttendance(
   employeeId: number,
@@ -395,15 +450,40 @@ async function resolveAttendanceDecision(
 
 async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanResult> {
   const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
+  input.rfidUid = normalizedRfidUid;
   const now = new Date();
   const todayDate = now.toISOString().split("T")[0];
   const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
+  const logAndReturn = async (
+    result: ProcessedScanResult,
+    options: {
+      verificationStatus: Attendance["verificationStatus"];
+      decision: GateDecision;
+      liveFaceProfile?: NormalizedFaceProfile | null;
+    },
+  ) => {
+    await logGateEvent({
+      date: todayDate,
+      input,
+      employee: result.employee ?? employee,
+      verificationStatus: options.verificationStatus,
+      decision: options.decision,
+      message: result.message,
+      matchConfidence: result.matchConfidence,
+      liveFaceProfile: options.liveFaceProfile,
+    });
+
+    return result;
+  };
 
   if (!employee) {
-    return {
+    return logAndReturn({
       success: false,
       message: "Unknown RFID card rejected.",
-    };
+    }, {
+      verificationStatus: "UNKNOWN_RFID",
+      decision: "REJECTED",
+    });
   }
 
   let matchConfidence = 0;
@@ -422,13 +502,17 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       "FAILED_FACE",
     );
 
-    return {
+    return logAndReturn({
       success: false,
       message: "No secure face profile is stored for this employee. Re-enroll the employee in Chrome or Edge.",
       employee,
       attendance,
       matchConfidence,
-    };
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
   }
 
   if (!liveFaceProfile) {
@@ -440,7 +524,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       "FAILED_FACE",
     );
 
-    return {
+    return logAndReturn({
       success: false,
       message: "Live face verification data was not captured. Retry the scan.",
       employee,
@@ -448,7 +532,11 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       matchConfidence,
       movementDirection: input.movementDirection,
       movementConfidence: input.movementConfidence,
-    };
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
   }
 
   if (!storedFaceProfile.secureCapture && !insecureFallbackAllowed) {
@@ -460,13 +548,17 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       "FAILED_FACE",
     );
 
-    return {
+    return logAndReturn({
       success: false,
       message: "This employee face profile was enrolled with an insecure fallback flow. Re-enroll in Chrome or Edge.",
       employee,
       attendance,
       matchConfidence,
-    };
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
   }
 
   if (!liveFaceProfile?.secureCapture && !insecureFallbackAllowed) {
@@ -478,7 +570,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       "FAILED_FACE",
     );
 
-    return {
+    return logAndReturn({
       success: false,
       message: "Secure live face detection is unavailable. Use Chrome or Edge on the gate terminal.",
       employee,
@@ -486,7 +578,61 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       matchConfidence,
       movementDirection: input.movementDirection,
       movementConfidence: input.movementConfidence,
-    };
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
+  }
+
+  if (!storedFaceProfile.legacy && storedFaceProfile.averageQuality < MIN_STORED_FACE_QUALITY) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return logAndReturn({
+      success: false,
+      message: "Stored face profile quality is too low for reliable verification. Re-enroll this employee in brighter, front-facing lighting.",
+      employee,
+      attendance,
+      matchConfidence,
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
+  }
+
+  const requiredLiveQuality = liveFaceProfile.secureCapture
+    ? MIN_LIVE_FACE_QUALITY
+    : MIN_INSECURE_LIVE_FACE_QUALITY;
+
+  if (liveFaceProfile.averageQuality < requiredLiveQuality) {
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      input.deviceId,
+      "FAILED_FACE",
+    );
+
+    return logAndReturn({
+      success: false,
+      message: "Live face quality is too low. Move closer, improve lighting, and keep the full face inside the frame before retrying.",
+      employee,
+      attendance,
+      matchConfidence,
+      movementDirection: input.movementDirection,
+      movementConfidence: input.movementConfidence,
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
   }
 
   if (storedFaceProfile.legacy) {
@@ -540,7 +686,9 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
         + `anchors=${matchDetails.anchorAverage.toFixed(4)} `
         + `peak=${matchDetails.peakAnchorConfidence.toFixed(4)} `
         + `ratio=${matchDetails.strongAnchorRatio.toFixed(4)} `
-        + `consistency=${matchDetails.liveConsistency.toFixed(4)}`,
+        + `consistency=${matchDetails.liveConsistency.toFixed(4)} `
+        + `liveQuality=${liveFaceProfile.averageQuality.toFixed(4)} `
+        + `storedQuality=${storedFaceProfile.averageQuality.toFixed(4)}`,
       );
     }
 
@@ -552,7 +700,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       "FAILED_FACE",
     );
 
-    return {
+    return logAndReturn({
       success: false,
       message: storedFaceProfile?.legacy
         ? "Face verification failed. Access denied. Re-enroll this employee for stricter biometric matching."
@@ -563,7 +711,11 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       matchDetails,
       movementDirection: input.movementDirection,
       movementConfidence: input.movementConfidence,
-    };
+    }, {
+      verificationStatus: "FAILED_FACE",
+      decision: "REJECTED",
+      liveFaceProfile,
+    });
   }
 
   const result = await resolveAttendanceDecision(
@@ -576,10 +728,14 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     input.movementConfidence,
   );
 
-  return {
+  return logAndReturn({
     ...result,
     matchDetails,
-  };
+  }, {
+    verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_DIRECTION"),
+    decision: result.action ?? (result.success ? "UNKNOWN" : "REJECTED"),
+    liveFaceProfile,
+  });
 }
 
 function toSocketScanResult(result: ProcessedScanResult, rfidUid: string) {
@@ -743,11 +899,25 @@ export async function registerRoutes(
               typeof message.faceConsistency === "number"
                 ? message.faceConsistency
                 : undefined,
+            faceQuality:
+              typeof message.faceQuality === "number"
+                ? message.faceQuality
+                : undefined,
+            scanTechnology:
+              message.scanTechnology === "HF_RFID" || message.scanTechnology === "UHF_RFID"
+                ? message.scanTechnology
+                : undefined,
             movementDirection:
               message.movementDirection === "ENTRY"
               || message.movementDirection === "EXIT"
               || message.movementDirection === "UNKNOWN"
                 ? message.movementDirection
+                : undefined,
+            movementAxis:
+              message.movementAxis === "horizontal"
+              || message.movementAxis === "depth"
+              || message.movementAxis === "none"
+                ? message.movementAxis
                 : undefined,
             movementConfidence:
               typeof message.movementConfidence === "number"
@@ -907,6 +1077,23 @@ export async function registerRoutes(
 
       const attendances = await storage.getAttendances(parsedInput?.data);
       res.json(attendances);
+    } catch (err) {
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  app.get(api.gateEvents.list.path, async (req, res) => {
+    try {
+      const parsedInput = api.gateEvents.list.input?.safeParse(req.query);
+      if (parsedInput && !parsedInput.success) {
+        return res.status(400).json({
+          message: parsedInput.error.errors[0]?.message ?? "Invalid gate event filter.",
+          field: parsedInput.error.errors[0]?.path.join("."),
+        });
+      }
+
+      const gateEventRows = await storage.getGateEvents(parsedInput?.data);
+      res.json(gateEventRows);
     } catch (err) {
       res.status(500).json({ message: "Internal server error" });
     }
