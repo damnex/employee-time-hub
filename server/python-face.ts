@@ -291,9 +291,9 @@ class PythonFaceWorker {
         "--labels",
         PYTHON_LBPH_LABELS_PATH,
         "--resize-width",
-        "320",
+        "640",
         "--min-face-size",
-        "100",
+        "72",
       ], {
         cwd: process.cwd(),
         windowsHide: true,
