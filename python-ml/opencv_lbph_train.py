@@ -189,7 +189,26 @@ def main() -> int:
                 skipped_images.append(SkippedImage(folder_name, image_path, "expected-exactly-one-face"))
                 continue
 
-            training_faces.append(extract_face(gray, face_box, args.image_size))
+            face = extract_face(gray, face_box, args.image_size)
+            training_faces.append(face)
+            training_ids.append(label_id)
+            valid_count += 1
+
+            # Data Augmentation: Flip horizontally
+            flipped = cv2.flip(face, 1)
+            training_faces.append(flipped)
+            training_ids.append(label_id)
+            valid_count += 1
+
+            # Data Augmentation: Darker
+            darker = cv2.convertScaleAbs(face, alpha=0.8, beta=0)
+            training_faces.append(darker)
+            training_ids.append(label_id)
+            valid_count += 1
+
+            # Data Augmentation: Brighter
+            brighter = cv2.convertScaleAbs(face, alpha=1.2, beta=0)
+            training_faces.append(brighter)
             training_ids.append(label_id)
             valid_count += 1
 

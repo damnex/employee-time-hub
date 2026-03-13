@@ -454,27 +454,7 @@ async function resolveAttendanceDecision(
     (movementDirection === "ENTRY" || movementDirection === "EXIT")
     && (movementConfidence ?? 0) >= DIRECTION_CONFIDENCE_THRESHOLD;
 
-  if (hasDirectionSignal) {
-    if (!directionIsConfident) {
-      const attendance = await createFailureAttendance(
-        employee.id,
-        todayDate,
-        now,
-        deviceId,
-        "FAILED_DIRECTION",
-      );
-
-      return {
-        success: false,
-        message: "Direction was unclear. Show a clear left or right side-face while scanning again.",
-        employee,
-        attendance,
-        matchConfidence,
-        movementDirection,
-        movementConfidence,
-      };
-    }
-
+  if (hasDirectionSignal && directionIsConfident) {
     if (movementDirection === "ENTRY") {
       if (openEntry) {
         const attendance = await createFailureAttendance(
