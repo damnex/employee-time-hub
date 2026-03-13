@@ -308,7 +308,7 @@ def recognize_frame(
         ]
         ranked_matches.sort(key=lambda item: item.metrics["finalConfidence"], reverse=True)
         k = int(max(1, args.top_k))
-        top_matches = ranked_matches[:k]
+        top_matches = ranked_matches[:k]  # type: ignore
         best_match = top_matches[0] if top_matches else None
         verified = False
         if best_match is not None:
@@ -442,7 +442,7 @@ def draw_overlay(
         cv2.rectangle(canvas, (left, max(0, top - 28)), (right, top), color, -1)
         cv2.putText(
             canvas,
-            label[:42],
+            label[:42],  # type: ignore
             (left + 6, max(18, top - 8)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -526,8 +526,8 @@ def main() -> int:
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
 
-    frame_counter = 0
-    consecutive_hits: Counter[str] = Counter()
+    frame_counter: int = 0
+    consecutive_hits: dict[str, int] = {}
     logged_once: set[str] = set()
     last_logged_at: dict[str, float] = {}
     session_attendance: dict[str, SessionAttendance] = {}
@@ -540,19 +540,19 @@ def main() -> int:
             ok, frame = capture.read()
             if not ok:
                 status_message = "Frame read failed. Check the webcam or RTSP source."
-                if args.no_display:
-                    print(status_message, file=sys.stderr)
-                    break
+            if getattr(args, "no_display", False):
+                print(status_message, file=sys.stderr)
+                break
                 time.sleep(0.1)
                 continue
 
-            frame_counter = frame_counter + 1
-            if frame_counter % max(1, args.process_every_nth_frame) == 0:
+            frame_counter = int(frame_counter) + 1
+            if frame_counter % max(1, getattr(args, "process_every_nth_frame", 3)) == 0:
                 latest_detections = recognize_frame(frame, profiles, args)
                 current_labels = {
-                    detection.best_match.profile.folder_name
+                    match.profile.folder_name
                     for detection in latest_detections
-                    if detection.verified and detection.best_match is not None
+                    if detection.verified and (match := detection.best_match) is not None
                 }
                 for label in list(consecutive_hits.keys()):
                     if label not in current_labels:
@@ -563,6 +563,7 @@ def main() -> int:
                     match = detection.best_match
                     if not detection.verified or match is None:
                         continue
+                    assert match is not None
 
                     label = match.profile.folder_name
                     consecutive_hits[label] = consecutive_hits.get(label, 0) + 1
@@ -592,7 +593,7 @@ def main() -> int:
                         timestamp_token = timestamp_iso.replace(":", "-").replace(".", "-")
                         save_snapshot(frame, snapshot_dir, timestamp_token, label)
 
-            if args.no_display:
+            if getattr(args, "no_display", False):
                 continue
 
             overlay = draw_overlay(
@@ -611,7 +612,7 @@ def main() -> int:
         pass
     finally:
         capture.release()
-        if not args.no_display:
+        if not getattr(args, "no_display", False):
             cv2.destroyAllWindows()
 
     write_session_summary(summary_path, source_label, len(profiles), session_started_at, session_attendance)
