@@ -158,3 +158,16 @@
     background-color: var(--elevate-2);
   }
 }
+
+html, body { height: 100%; overflow: hidden; }
+#root { min-height: 100vh; }
+
+
+#root { min-height: 100vh; overflow-y: auto; }
+
+\n.hide-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }\n.hide-scrollbar::-webkit-scrollbar { display: none; }\n
+
+
+.hide-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.hide-scrollbar::-webkit-scrollbar { display: none; }
+

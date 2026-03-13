@@ -24,6 +24,7 @@ import {
   recognizeLiveFrameWithPython,
   removeEmployeeDataset,
   retrainPythonFaceModel,
+  appendEmployeeDatasetFrames,
   saveEmployeeDatasetPhotos,
   verifyGateFramesWithPython,
 } from "./python-face";
@@ -771,6 +772,16 @@ async function processPythonRfidScan(args: {
       });
     }
 
+    // Enrich training data with the latest gate frames for this employee (non-blocking to avoid latency).
+    if (verification.employee.folderName) {
+      void appendEmployeeDatasetFrames({
+        folderName: verification.employee.folderName,
+        frames: input.faceFrames,
+      }).catch((error) => {
+        console.warn("[python-face] Failed to save live gate frames:", error);
+      });
+    }
+
     const result = await resolveAttendanceDecision(
       employee,
       now,
@@ -1318,6 +1329,25 @@ function replaceExistingConnection(deviceId: string, clientType: ClientType) {
   });
 }
 
+function sendDevicePresence(ws: WebSocket, deviceId: string, online: boolean) {
+  ws.send(JSON.stringify({
+    type: "device_presence",
+    deviceId,
+    online,
+  }));
+}
+
+function broadcastDevicePresence(deviceId: string, online: boolean) {
+  broadcastMessage(
+    {
+      type: "device_presence",
+      deviceId,
+      online,
+    },
+    (client) => client.clientType === "browser",
+  );
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -1353,11 +1383,21 @@ export async function registerRoutes(
       console.log(
         `[WebSocket] Reader connected: ${deviceId} from ${connectionIp}. Reader is online and ready to read badges.`,
       );
+      broadcastDevicePresence(deviceId, true);
     } else {
       console.log(`[WebSocket] ${clientType} connected: ${deviceId} from ${connectionIp}`);
     }
     activeConnections.add(connection);
     
+    // On browser connect, send snapshot of current device presence
+    if (clientType === "browser") {
+      activeConnections.forEach((existing) => {
+        if (existing.clientType === "device") {
+          sendDevicePresence(ws, existing.deviceId, true);
+        }
+      });
+    }
+
     ws.send(JSON.stringify({
       type: "connected",
       deviceId,
@@ -1490,6 +1530,7 @@ export async function registerRoutes(
         console.log(
           `[WebSocket] Reader disconnected: ${deviceId} from ${connectionIp}. Reader is no longer ready.`,
         );
+        broadcastDevicePresence(deviceId, false);
       } else {
         console.log(`[WebSocket] ${clientType} disconnected: ${deviceId} from ${connectionIp}`);
       }

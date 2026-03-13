@@ -39,16 +39,16 @@ import {
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
 const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
-const GATE_FRAME_COUNT = 4;
-const GATE_FRAME_DELAY_MS = 35;
-const GATE_MAX_FRAME_WIDTH = 640;
-const GATE_FRAME_JPEG_QUALITY = 0.68;
+const GATE_FRAME_COUNT = 3;
+const GATE_FRAME_DELAY_MS = 20;
+const GATE_MAX_FRAME_WIDTH = 480;
+const GATE_FRAME_JPEG_QUALITY = 0.55;
 const LIVE_TRACKING_INTERVAL_MS = 120;
 const LIVE_TRACKING_BUSY_INTERVAL_MS = 190;
 const LIVE_RECOGNITION_INTERVAL_MS = 650;
 const LIVE_RECOGNITION_IDLE_DELAY_MS = 260;
 const LIVE_RECOGNITION_MAX_FRAME_WIDTH = 640;
-const LIVE_RECOGNITION_JPEG_QUALITY = 0.78;
+const LIVE_RECOGNITION_JPEG_QUALITY = 0.6;
 const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.68;
 const LIVE_RECOGNITION_STABLE_HITS = 3;
 const LIVE_RECOGNITION_TTL_MS = 2200;
@@ -451,6 +451,7 @@ export default function GateTerminal() {
   const scanMutation = useScanRFID();
   const {
     isConnected,
+    deviceOnline,
     lastScanResult,
     clearResult,
   } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
@@ -492,6 +493,7 @@ export default function GateTerminal() {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const latestEmployee = lastResult?.employee ?? lastResult?.badgeOwner ?? selectedBadgeOwner;
+  const latestProfileImage = lastResult?.previewImage ?? null;
   const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
   const pythonRosterCount = (employees ?? []).filter((employee) => {
     return Boolean(getPythonFaceMeta(employee.faceDescriptor));
@@ -1123,84 +1125,52 @@ export default function GateTerminal() {
       : "border-rose-200 bg-rose-50/90";
 
   return (
-    <div className="space-y-6 p-6 md:p-8 animate-in fade-in duration-500">
-      <Card className="overflow-hidden border-border/60 bg-[radial-gradient(circle_at_top_left,_rgba(14,165,233,0.16),_transparent_40%),linear-gradient(135deg,_rgba(15,23,42,0.03),_rgba(255,255,255,0.9))] shadow-sm">
-        <CardContent className="flex flex-col gap-5 p-6">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge variant="outline" className="border-sky-200 bg-sky-50 text-sky-700">
-                  Python Gate Flow
-                </Badge>
-                <Badge
-                  variant={isConnected ? "secondary" : "outline"}
-                  className={cn(
-                    isConnected
-                      ? "bg-emerald-100 text-emerald-800"
-                      : "border-slate-300 text-slate-600",
-                  )}
-                >
-                  {isConnected ? "Reader Listening" : "Reader Offline"}
-                </Badge>
-                <Badge
-                  variant={cameraActive ? "secondary" : "outline"}
-                  className={cn(
-                    cameraActive
-                      ? "bg-cyan-100 text-cyan-800"
-                      : "border-slate-300 text-slate-600",
-                  )}
-                >
-                  {cameraActive ? "Webcam Ready" : "Webcam Needed"}
-                </Badge>
-              </div>
-              <div>
-                <h1 className="text-3xl font-bold tracking-tight text-foreground">Gate Terminal</h1>
-                <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
-                  Python continuously labels visible employees on the live webcam feed, and a badge tap still
-                  triggers the burst verification that decides entry or exit from movement direction.
-                </p>
-              </div>
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-white/50 bg-white/75 px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Python Roster</p>
-                <p className="mt-1 text-2xl font-semibold text-foreground">{pythonTrainedCount}</p>
-                <p className="text-xs text-muted-foreground">trained of {pythonRosterCount} enrolled</p>
-              </div>
-              <div className="rounded-2xl border border-white/50 bg-white/75 px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Burst Frames</p>
-                <p className="mt-1 text-2xl font-semibold text-foreground">{GATE_FRAME_COUNT}</p>
-                <p className="text-xs text-muted-foreground">captured every scan</p>
-              </div>
-              <div className="rounded-2xl border border-white/50 bg-white/75 px-4 py-3 shadow-sm">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Motion Rule</p>
-                <p className="mt-1 text-2xl font-semibold text-foreground">L/R</p>
-                <p className="text-xs text-muted-foreground">left-to-right entry, right-to-left exit</p>
-              </div>
-            </div>
+    <div className="flex h-[calc(100vh-60px)] flex-col gap-2 px-6 md:px-8 lg:px-10 xl:px-12 py-3 animate-in fade-in duration-300 overflow-hidden">
+      <Card className="overflow-hidden border-border/60 bg-white/90 shadow-sm">
+        <CardContent className="flex flex-wrap items-center justify-between gap-2 p-3">
+          <div className="flex items-baseline gap-2">
+            <h1 className="text-2xl font-semibold tracking-tight text-foreground">Gate Monitor</h1>
+            <p className="text-sm text-muted-foreground">RFID tap + live face verification in one view.</p>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              variant={deviceOnline ? "secondary" : "outline"}
+              className={cn(
+                deviceOnline
+                  ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                  : "border-slate-300 text-slate-600",
+              )}
+            >
+              {deviceOnline ? "Reader Online" : "Reader Offline"}
+            </Badge>
+            <Badge
+              variant={cameraActive ? "secondary" : "outline"}
+              className={cn(
+                cameraActive ? "bg-cyan-100 text-cyan-800" : "border-slate-300 text-slate-600",
+              )}
+            >
+              {cameraActive ? "Camera Ready" : "Camera Blocked"}
+            </Badge>
+            <Badge variant="outline" className="border-slate-200 text-slate-700">
+              {pythonTrainedCount} trained / {pythonRosterCount} enrolled
+            </Badge>
           </div>
         </CardContent>
       </Card>
 
-      <div className="grid gap-6 xl:grid-cols-[1.35fr_0.95fr]">
-        <Card className="overflow-hidden border-border/60 shadow-sm">
-          <CardContent className="space-y-5 p-5">
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                  Live Gate Camera
-                </p>
-                <h2 className="mt-1 text-xl font-semibold text-foreground">Laptop webcam live recognition</h2>
-              </div>
+      <div className="grid flex-1 min-h-0 gap-2 xl:grid-cols-[1.65fr_0.85fr]">
+        <Card className="h-full overflow-hidden border-border/60 shadow-sm">
+          <CardContent className="flex h-full flex-col gap-2 p-3">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <h2 className="text-xl font-semibold text-foreground">Live gate camera</h2>
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 {isConnected ? <Wifi className="size-4 text-emerald-600" /> : <WifiOff className="size-4" />}
                 <span>{readerSourceDeviceId ?? GATE_DEVICE_ID}</span>
               </div>
             </div>
 
-            <div className="relative overflow-hidden rounded-[2rem] border border-border/60 bg-slate-950">
-              <div ref={cameraViewportRef} className="aspect-[16/10] overflow-hidden">
+            <div className="relative flex-1 overflow-hidden rounded-[1.6rem] border border-border/60 bg-slate-950 min-h-[320px]">
+              <div ref={cameraViewportRef} className="h-full w-full overflow-hidden">
                 <video
                   ref={videoRef}
                   autoPlay
@@ -1228,11 +1198,6 @@ export default function GateTerminal() {
               </div>
 
               <div className="pointer-events-none absolute inset-0">
-                <div className="absolute inset-5 rounded-[1.8rem] border border-white/15" />
-                <div className={cn(
-                  "absolute inset-x-[22%] inset-y-[12%] rounded-[2rem] border-[3px] transition-all duration-300",
-                  cameraFrameTone,
-                )} />
                 {liveTrackedFaces.map((face) => (
                   <div
                     key={`track-${face.trackId}`}
@@ -1263,8 +1228,6 @@ export default function GateTerminal() {
                       ? "PYTHON LIVE RECOGNITION"
                       : "FAST LIVE FACE TRACKER"}
                 </div>
-                <div className="absolute inset-x-[28%] top-1/2 h-px -translate-y-1/2 bg-gradient-to-r from-transparent via-cyan-200/80 to-transparent" />
-                <div className="absolute left-1/2 inset-y-[16%] w-px -translate-x-1/2 bg-gradient-to-b from-transparent via-white/35 to-transparent" />
               </div>
 
               {busy && (
@@ -1286,33 +1249,33 @@ export default function GateTerminal() {
               )}
             </div>
 
-            <div className="space-y-3">
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
-                <span>Frame burst progress</span>
-                <span>{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "idle"}</span>
+            <div className="space-y-2 text-xs text-muted-foreground overflow-auto">
+              <div className="flex items-center justify-between">
+                <span>Scan progress</span>
+                <span>{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "Idle"}</span>
               </div>
               <Progress value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0} />
-              <p className="text-xs text-muted-foreground">
+              <p>
                 {liveTrackerAvailable === false
-                  ? `${liveRecognitionMessage ?? "Python live recognition is active."} Visible faces: ${liveTrackedFaces.length}. Stable name tags: ${liveMatchedCount}.`
+                  ? `${liveRecognitionMessage ?? "Python live recognition is active."} Faces: ${liveTrackedFaces.length}, names: ${liveMatchedCount}.`
                   : liveRecognitionMode === "python"
-                    ? `${liveRecognitionMessage ?? "Fast local tracking and Python naming are both active."} Visible tracks: ${browserTrackedFaces.length}. Stable name tags: ${liveMatchedCount}.`
-                    : `${liveRecognitionMessage ?? "Fast local tracking is active while Python samples lower-resolution frames for stable names."} Visible tracks: ${browserTrackedFaces.length}. Stable name tags: ${liveMatchedCount}.`}
+                    ? `${liveRecognitionMessage ?? "Tracking with Python names."} Tracks: ${browserTrackedFaces.length}, names: ${liveMatchedCount}.`
+                    : `${liveRecognitionMessage ?? "Tracking locally while Python samples frames."} Tracks: ${browserTrackedFaces.length}, names: ${liveMatchedCount}.`}
               </p>
             </div>
 
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3">
+            <div className="grid gap-2 sm:grid-cols-3">
+              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Tap</p>
                 <p className="mt-1 font-mono text-sm text-foreground">{lastTapDisplay}</p>
               </div>
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3">
+              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Queue</p>
                 <p className="mt-1 text-sm text-foreground">
                   {pendingReaderScan ? `Waiting ${pendingReaderScan.rfidUid}` : "No queued badge"}
                 </p>
               </div>
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3">
+              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Reader Channel</p>
                 <p className="mt-1 text-sm text-foreground">{isConnected ? "Live" : "Offline"}</p>
               </div>
@@ -1320,13 +1283,13 @@ export default function GateTerminal() {
           </CardContent>
         </Card>
 
-        <div className="space-y-6">
+        <div className="space-y-3 w-full xl:max-w-[360px] xl:justify-self-end min-h-0 overflow-auto hide-scrollbar">
           <Card className={cn("border shadow-sm", lastResultTone)}>
-            <CardContent className="space-y-4 p-5">
-              <div className="flex items-start gap-4">
-                <Avatar className="size-20 rounded-[1.5rem] border border-white/60 shadow-sm">
-                  <AvatarImage src={lastResult?.previewImage ?? undefined} alt={latestEmployee?.name ?? "Latest gate preview"} />
-                  <AvatarFallback className="rounded-[1.5rem] bg-slate-200 text-lg font-semibold text-slate-700">
+            <CardContent className="space-y-2 p-3">
+              <div className="flex items-start gap-4 md:gap-5">
+                <Avatar className="size-28 rounded-[2rem] border border-white/60 shadow-sm">
+                  <AvatarImage src={latestProfileImage ?? undefined} alt={latestEmployee?.name ?? "Latest gate preview"} />
+                  <AvatarFallback className="rounded-[2rem] bg-slate-200 text-lg font-semibold text-slate-700">
                     {getEmployeeInitials(latestEmployee)}
                   </AvatarFallback>
                 </Avatar>
@@ -1334,10 +1297,10 @@ export default function GateTerminal() {
                 <div className="min-w-0 flex-1">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.24em] text-muted-foreground">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
                         Latest Verification
                       </p>
-                      <h2 className="truncate text-xl font-semibold text-foreground">
+                      <h2 className="truncate text-lg font-semibold text-foreground leading-tight">
                         {latestEmployee?.name ?? "Waiting for next badge tap"}
                       </h2>
                       <p className="truncate text-sm text-muted-foreground">
@@ -1365,34 +1328,34 @@ export default function GateTerminal() {
                     </Badge>
                   </div>
 
-                  <div className="mt-4 grid grid-cols-2 gap-2 text-[11px]">
-                    <div className="rounded-xl bg-white/80 p-3">
+                  <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
+                    <div className="rounded-xl bg-white/80 p-2">
                       <p className="uppercase tracking-[0.18em] text-muted-foreground">Badge</p>
                       <p className="mt-1 font-mono text-foreground">
                         {(lastResult?.badgeOwner?.rfidUid ?? normalizedRfidUid) || "--"}
                       </p>
                     </div>
-                    <div className="rounded-xl bg-white/80 p-3">
+                    <div className="rounded-xl bg-white/80 p-2">
                       <p className="uppercase tracking-[0.18em] text-muted-foreground">Latency</p>
                       <p className="mt-1 font-mono text-foreground">
                         {lastResult ? `${lastResult.latencyMs} ms` : "--"}
                       </p>
                     </div>
-                    <div className="rounded-xl bg-white/80 p-3">
+                    <div className="rounded-xl bg-white/80 p-2">
                       <p className="uppercase tracking-[0.18em] text-muted-foreground">Match</p>
                       <p className="mt-1 font-mono text-foreground">{formatPercent(lastResult?.matchConfidence)}</p>
                     </div>
-                    <div className="rounded-xl bg-white/80 p-3">
+                    <div className="rounded-xl bg-white/80 p-2">
                       <p className="uppercase tracking-[0.18em] text-muted-foreground">Direction</p>
                       <p className="mt-1 font-mono text-foreground">
                         {lastResult?.movementDirection ?? "--"} {lastResult ? `(${formatPercent(lastResult.movementConfidence)})` : ""}
                       </p>
                     </div>
-                    <div className="rounded-xl bg-white/80 p-3">
+                    <div className="rounded-xl bg-white/80 p-2">
                       <p className="uppercase tracking-[0.18em] text-muted-foreground">Verified At</p>
                       <p className="mt-1 font-mono text-foreground">{lastResult?.verifiedAt ?? "--"}</p>
                     </div>
-                    <div className="rounded-xl bg-white/80 p-3">
+                    <div className="rounded-xl bg-white/80 p-2">
                       <p className="uppercase tracking-[0.18em] text-muted-foreground">Source</p>
                       <p className="mt-1 font-mono text-foreground">{lastResult?.source ?? "--"}</p>
                     </div>
@@ -1417,44 +1380,10 @@ export default function GateTerminal() {
                   <ShieldCheck className="size-4 text-slate-500" />
                 )}
                 <AlertTitle>{lastResult?.success ? "Access granted" : lastResult ? "Access denied" : "Ready for next employee"}</AlertTitle>
-                <AlertDescription>
-                  {lastResult?.message ?? "The latest Python face verification result will appear here after a badge tap."}
-                </AlertDescription>
+                {lastResult?.message && (
+                  <AlertDescription>{lastResult.message}</AlertDescription>
+                )}
               </Alert>
-
-              {lastResult?.previewImage && (
-                <div className="rounded-2xl border border-border/60 bg-white/80 p-3">
-                  <div className="mb-2 flex items-center justify-between gap-3">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                      Detected Face
-                    </p>
-                    <Badge variant="outline" className="border-cyan-300 bg-cyan-50 text-cyan-700">
-                      {lastResult.detectedFaceLabel ?? latestEmployee?.name ?? "Face"}
-                    </Badge>
-                  </div>
-
-                  <div className="relative overflow-hidden rounded-[1.5rem] border border-slate-200 bg-slate-950">
-                    <div className="aspect-[16/10]">
-                      <img
-                        src={lastResult.previewImage}
-                        alt={lastResult.detectedFaceLabel ?? latestEmployee?.name ?? "Detected face"}
-                        className="h-full w-full object-cover"
-                      />
-                    </div>
-
-                    {detectedFaceBoxStyle && (
-                      <div
-                        className="absolute rounded-[1.25rem] border-[3px] border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.5),0_0_24px_rgba(34,211,238,0.22)]"
-                        style={detectedFaceBoxStyle}
-                      >
-                        <div className="absolute left-0 top-0 -translate-y-[calc(100%+0.45rem)] rounded-full bg-black/80 px-3 py-1 text-[11px] font-semibold text-white shadow-lg">
-                          {lastResult.detectedFaceLabel ?? latestEmployee?.name ?? "Detected Face"}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
 
               {lastResult?.matchDetails && (
                 <div className="rounded-2xl border border-border/60 bg-white/75 px-4 py-3 font-mono text-[11px] leading-6 text-muted-foreground">
@@ -1491,7 +1420,7 @@ export default function GateTerminal() {
           </Card>
 
           <Card className="border-border/60 shadow-sm">
-            <CardContent className="space-y-5 p-5">
+            <CardContent className="space-y-3 p-4">
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
                   Manual Trigger
@@ -1528,20 +1457,19 @@ export default function GateTerminal() {
                   />
                 </div>
 
-                <div className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
-                  <div className="flex items-start gap-2">
-                    <ScanLine className="mt-0.5 size-4 shrink-0" />
-                    <div className="space-y-1">
-                      <p>
-                        {readerMessage
-                          ?? "Use the laptop webcam now. Later you can swap the source to the real CCTV stream without changing the enrollment data."}
-                      </p>
-                      <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                        Source: {readerSourceDeviceId ?? GATE_DEVICE_ID}
-                      </p>
+                {!!readerMessage && (
+                  <div className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+                    <div className="flex items-start gap-2">
+                      <ScanLine className="mt-0.5 size-4 shrink-0" />
+                      <div className="space-y-1">
+                        <p>{readerMessage}</p>
+                        <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
+                          Source: {readerSourceDeviceId ?? GATE_DEVICE_ID}
+                        </p>
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
 
                 <Button
                   type="submit"
@@ -1570,66 +1498,21 @@ export default function GateTerminal() {
             </CardContent>
           </Card>
 
-          <Card className="border-border/60 shadow-sm">
-            <CardContent className="space-y-4 p-5">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                  Gate Rules
-                </p>
-                <h2 className="mt-1 text-xl font-semibold text-foreground">How motion is read</h2>
-              </div>
-
-              <div className="grid gap-3">
-                <div className="rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3">
-                  <div className="flex items-start gap-3">
-                    <MoveHorizontal className="mt-0.5 size-4 shrink-0 text-emerald-700" />
-                    <div>
-                      <p className="font-medium text-emerald-900">Entry</p>
-                      <p className="mt-1 text-sm text-emerald-800">
-                        Walk left to right across the frame, or move slightly toward the camera while tapping.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3">
-                  <div className="flex items-start gap-3">
-                    <MoveHorizontal className="mt-0.5 size-4 shrink-0 text-sky-700" />
-                    <div>
-                      <p className="font-medium text-sky-900">Exit</p>
-                      <p className="mt-1 text-sm text-sky-800">
-                        Walk right to left across the frame, or move slightly away from the camera while tapping.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border border-border/60 bg-muted/20 px-4 py-3">
-                  <div className="flex items-start gap-3">
-                    <UserCircle2 className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                    <div>
-                      <p className="font-medium text-foreground">Best capture</p>
-                      <p className="mt-1 text-sm text-muted-foreground">
-                        Keep one face visible, use front lighting, and let the burst capture natural movement instead of holding perfectly still.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {!cameraActive && cameraError && (
-                <Alert className="border-amber-200 bg-amber-50">
-                  <AlertCircle className="size-4 text-amber-700" />
-                  <AlertTitle>Camera access is required</AlertTitle>
-                  <AlertDescription>{cameraError}</AlertDescription>
-                </Alert>
-              )}
-            </CardContent>
-          </Card>
+          {!cameraActive && cameraError && (
+            <Alert className="border-amber-200 bg-amber-50">
+              <AlertCircle className="size-4 text-amber-700" />
+              <AlertTitle>Camera access is required</AlertTitle>
+              <AlertDescription>{cameraError}</AlertDescription>
+            </Alert>
+          )}
         </div>
       </div>
     </div>
   );
 }
+
+
+
+
 
 

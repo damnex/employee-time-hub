@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 
 export interface DeviceScanResult {
-  type: 'scan_result' | 'connected' | 'error' | 'rfid_detected';
+  type: 'scan_result' | 'connected' | 'error' | 'rfid_detected' | 'device_presence';
   success?: boolean;
   message: string;
   employee?: { id: number; name: string };
@@ -10,6 +10,7 @@ export interface DeviceScanResult {
   rfidUid?: string;
   available?: boolean;
   deviceId?: string;
+  online?: boolean;
 }
 
 interface UseDeviceWSOptions {
@@ -26,9 +27,11 @@ export function useDeviceWS(
   const shouldReconnectRef = useRef(true);
   const generatedDeviceIdRef = useRef(`web-${Math.random().toString(36).slice(2, 10)}`);
   const [isConnected, setIsConnected] = useState(false);
+  const [deviceOnline, setDeviceOnline] = useState(false); // presence of any hardware device
   const [lastScanResult, setLastScanResult] = useState<DeviceScanResult | null>(null);
   const clientType = options.clientType ?? 'browser';
   const resolvedDeviceId = deviceId ?? generatedDeviceIdRef.current;
+  const onlineDevicesRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -79,12 +82,24 @@ export function useDeviceWS(
           console.log('[DeviceWS] Connected to device server:', wsUrl);
           reconnectAttemptRef.current = 0;
           setIsConnected(true);
+          onlineDevicesRef.current.clear();
+          setDeviceOnline(false);
         };
 
         socket.onmessage = (event) => {
           try {
             const message = JSON.parse(event.data) as DeviceScanResult;
             setLastScanResult(message);
+            if (message.type === "device_presence") {
+              const online = Boolean((message as any).online);
+              const id = (message as any).deviceId || "unknown";
+              if (online) {
+                onlineDevicesRef.current.add(id);
+              } else {
+                onlineDevicesRef.current.delete(id);
+              }
+              setDeviceOnline(onlineDevicesRef.current.size > 0);
+            }
             console.log('[DeviceWS] Received:', message);
           } catch (error) {
             console.error('[DeviceWS] Error parsing message:', error);
@@ -101,6 +116,8 @@ export function useDeviceWS(
           }
 
           setIsConnected(false);
+          onlineDevicesRef.current.clear();
+          setDeviceOnline(false);
           reconnectAttemptRef.current += 1;
           console.log(
             `[DeviceWS] Disconnected (code=${event.code}). Reconnecting attempt ${reconnectAttemptRef.current}...`,
@@ -110,6 +127,7 @@ export function useDeviceWS(
       } catch (error) {
         console.error('[DeviceWS] Failed to create WebSocket:', error);
         setIsConnected(false);
+        setDeviceOnline(false);
         reconnectAttemptRef.current += 1;
         scheduleReconnect();
       }
@@ -156,6 +174,7 @@ export function useDeviceWS(
 
   return {
     isConnected,
+    deviceOnline,
     lastScanResult,
     sendRFIDScan,
     sendRFIDDetected,

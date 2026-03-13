@@ -206,12 +206,14 @@ def main() -> int:
             training_ids.append(label_id)
             valid_count += 1  # type: ignore
 
-            # Data Augmentation: Brighter
-            brighter = cv2.convertScaleAbs(face, alpha=1.2, beta=0)
-            training_faces.append(brighter)
-            training_ids.append(label_id)
-            valid_count += 1  # type: ignore
-
+            # Data Augmentation: Brighter\n            brighter = cv2.convertScaleAbs\(face, alpha=1.2, beta=0\)\n            training_faces.append\(brighter\)\n            training_ids.append\(label_id\)\n            valid_count \+= 1  # type: ignore\n
+            # Data Augmentation: Small rotations
+            for angle in (-12, 12):
+                matrix = cv2.getRotationMatrix2D((args.image_size / 2, args.image_size / 2), angle, 1.0)
+                rotated = cv2.warpAffine(face, matrix, (args.image_size, args.image_size), borderMode=cv2.BORDER_REPLICATE)
+                training_faces.append(rotated)
+                training_ids.append(label_id)
+                valid_count += 1  # type: ignore
         label_samples[folder_name] = valid_count
 
     valid_labels = {
@@ -307,3 +309,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -122,7 +122,7 @@ function slugifyDatasetLabel(value: string) {
     .slice(0, 64) || `employee_${Date.now()}`;
 }
 
-function parseDataUrl(dataUrl: string) {
+export function parseDataUrl(dataUrl: string) {
   const match = /^data:image\/[a-zA-Z0-9.+-]+;base64,(.+)$/.exec(dataUrl);
   if (!match) {
     throw new Error("Invalid image payload. Expected a base64 data URL.");
@@ -133,6 +133,34 @@ function parseDataUrl(dataUrl: string) {
 
 async function ensureDirectory(targetPath: string) {
   await fs.mkdir(targetPath, { recursive: true });
+}
+
+export async function appendEmployeeDatasetFrames(args: { folderName: string; frames: string[] }) {
+  const { folderName, frames } = args;
+  if (!folderName || !frames.length) {
+    return;
+  }
+
+  const targetDir = path.join(DATASET_ROOT, folderName);
+  await ensureDirectory(targetDir);
+
+  const entries = await fs.readdir(targetDir, { withFileTypes: true });
+  const sampleRegex = /^sample-(\d+)\.jpg$/i;
+  const nextIndex =
+    entries.reduce((max, entry) => {
+      const match = sampleRegex.exec(entry.name);
+      return match ? Math.max(max, Number(match[1])) : max;
+    }, 0) + 1;
+
+  await Promise.all(
+    frames.map(async (frame, idx) => {
+      const targetFile = path.join(
+        targetDir,
+        `sample-${String(nextIndex + idx).padStart(3, "0")}.jpg`,
+      );
+      await fs.writeFile(targetFile, parseDataUrl(frame));
+    }),
+  );
 }
 
 async function runPythonScript(scriptPath: string, args: string[], timeoutMs = 180000) {
@@ -291,9 +319,9 @@ class PythonFaceWorker {
         "--labels",
         PYTHON_LBPH_LABELS_PATH,
         "--resize-width",
-        "640",
+        "480",
         "--min-face-size",
-        "72",
+        "52",
       ], {
         cwd: process.cwd(),
         windowsHide: true,
@@ -367,7 +395,7 @@ class PythonFaceWorker {
       entryDepthDirection: "approaching",
     };
 
-    return await this.sendRequest<PythonGateVerificationResult>(request, 5000);
+    return await this.sendRequest<PythonGateVerificationResult>(request, 12000);
   }
 
   async recognizeFrame(frame: string, maxFaces = 50) {
@@ -379,7 +407,7 @@ class PythonFaceWorker {
       maxFaces,
     };
 
-    return await this.sendRequest<PythonLiveRecognitionResult>(request, 4000);
+    return await this.sendRequest<PythonLiveRecognitionResult>(request, 8000);
   }
 }
 

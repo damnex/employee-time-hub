@@ -8,6 +8,7 @@ import base64
 import json
 import re
 import sys
+import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,10 +55,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True, type=Path, help="Path to lbph-model.yml")
     parser.add_argument("--labels", required=True, type=Path, help="Path to lbph-labels.json")
     parser.add_argument("--distance-threshold", type=float, help="Override the threshold from the label map.")
-    parser.add_argument("--resize-width", type=int, default=640, help="Resize frames before detection. Use 0 to disable.")
-    parser.add_argument("--scale-factor", type=float, default=1.1, help="Haar cascade scale factor.")
+    parser.add_argument("--resize-width", type=int, default=800, help="Resize frames before detection. Use 0 to disable.")
+    parser.add_argument("--scale-factor", type=float, default=1.08, help="Haar cascade scale factor.")
     parser.add_argument("--min-neighbors", type=int, default=6, help="Haar cascade minNeighbors.")
-    parser.add_argument("--min-face-size", type=int, default=72, help="Minimum face size in pixels.")
+    parser.add_argument("--min-face-size", type=int, default=52, help="Minimum face size in pixels.")
     return parser.parse_args()
 
 
@@ -106,6 +107,21 @@ def decode_frame(frame_payload: str) -> np.ndarray:
     return image
 
 
+def normalize_lighting(image: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2]
+    mean_intensity = float(np.mean(v_channel)) / 255.0
+    if mean_intensity > 0:
+        gamma = math.log(0.55) / math.log(max(mean_intensity, 1e-3))
+        gamma = float(np.clip(gamma, 0.6, 1.6))
+        v_gamma = np.power(v_channel / 255.0, gamma)
+        v_channel = np.clip(v_gamma * 255.0, 0, 255).astype(np.uint8)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    v_eq = clahe.apply(v_channel)
+    hsv[:, :, 2] = v_eq
+    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+
 def resize_frame(frame: np.ndarray, resize_width: int) -> tuple[np.ndarray, float]:
     if resize_width <= 0:
         return frame, 1.0
@@ -125,23 +141,29 @@ def detect_faces(
     detector: cv2.CascadeClassifier,
     args: argparse.Namespace,
 ) -> list[tuple[int, int, int, int]]:
-    faces = detector.detectMultiScale(
-        gray_frame,
-        scaleFactor=args.scale_factor,
-        minNeighbors=args.min_neighbors,
-        minSize=(args.min_face_size, args.min_face_size),
-    )
-    if len(faces) == 0:
-        return []
+    def run(scale_factor: float, min_face: int) -> list[tuple[int, int, int, int]]:
+        faces = detector.detectMultiScale(
+            gray_frame,
+            scaleFactor=scale_factor,
+            minNeighbors=args.min_neighbors,
+            minSize=(min_face, min_face),
+        )
+        return sorted(
+            [
+                (int(x), int(y), int(width), int(height))
+                for x, y, width, height in faces
+            ],
+            key=lambda item: item[2] * item[3],
+            reverse=True,
+        )
 
-    return sorted(
-        [
-            (int(x), int(y), int(width), int(height))
-            for x, y, width, height in faces
-        ],
-        key=lambda item: item[2] * item[3],
-        reverse=True,
-    )
+    primary = run(args.scale_factor, args.min_face_size)
+    if primary:
+        return primary
+
+    fallback_size = max(24, int(args.min_face_size * 0.7))
+    fallback_scale = max(1.02, min(args.scale_factor - 0.02, 1.12))
+    return run(fallback_scale, fallback_size)
 
 
 def prepare_face_crop(
@@ -219,7 +241,7 @@ def predict_frame(
     distance_threshold: float,
     args: argparse.Namespace,
 ) -> FramePrediction:
-    image = decode_frame(frame_payload)
+    image = normalize_lighting(decode_frame(frame_payload))
     working_frame, scale_factor = resize_frame(image, args.resize_width)
     gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
     detected_faces = detect_faces(gray_working, detector, args)
@@ -412,7 +434,7 @@ def handle_recognize_frame(
     if not isinstance(frame_payload, str) or not frame_payload.strip():
         raise ValueError("No frame was provided for live recognition.")
 
-    image = decode_frame(str(frame_payload))
+    image = normalize_lighting(decode_frame(str(frame_payload)))
     frame_height, frame_width = image.shape[:2]
     working_frame, scale_factor = resize_frame(image, args.resize_width)
     gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
@@ -545,4 +567,11 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+
+
+
+
+
 

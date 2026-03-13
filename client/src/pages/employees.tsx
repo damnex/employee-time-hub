@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/table";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -151,9 +152,11 @@ export default function Employees() {
   const pythonEnrollEmployee = usePythonEnrollEmployee();
   const {
     isConnected: enrollmentSocketConnected,
+    deviceOnline: enrollmentDeviceOnline,
     lastScanResult: lastDeviceMessage,
     clearResult: clearDeviceMessage,
   } = useDeviceWS(ENROLLMENT_CAMERA_ID, { clientType: "browser" });
+  const enrollmentReaderOnline = enrollmentDeviceOnline;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -484,8 +487,15 @@ export default function Employees() {
                           <FormItem>
                             <div className="flex items-center justify-between gap-3">
                               <FormLabel>RFID UID</FormLabel>
-                              <Badge variant={enrollmentSocketConnected ? "secondary" : "outline"}>
-                                {enrollmentSocketConnected ? "Reader Listening" : "Reader Offline"}
+                              <Badge
+                                variant={enrollmentReaderOnline ? "secondary" : "outline"}
+                                className={cn(
+                                  enrollmentReaderOnline
+                                    ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                                    : "border-slate-300 text-slate-600",
+                                )}
+                              >
+                                {enrollmentReaderOnline ? "Reader Online" : "Reader Offline"}
                               </Badge>
                             </div>
                             <FormControl>
