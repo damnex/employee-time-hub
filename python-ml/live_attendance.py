@@ -546,7 +546,7 @@ def main() -> int:
                 time.sleep(0.1)
                 continue
 
-            frame_counter = int(frame_counter) + 1
+            frame_counter += 1
             if frame_counter % max(1, getattr(args, "process_every_nth_frame", 3)) == 0:
                 latest_detections = recognize_frame(frame, profiles, args)
                 current_labels = {
@@ -567,7 +567,8 @@ def main() -> int:
 
                     label = match.profile.folder_name
                     consecutive_hits[label] = consecutive_hits.get(label, 0) + 1
-                    if consecutive_hits[label] < max(1, args.min_consecutive_detections):
+                    min_req = max(1, int(getattr(args, "min_consecutive_detections", 2)))
+                    if consecutive_hits[label] < min_req:
                         continue
                     if not should_mark_attendance(
                         label,
