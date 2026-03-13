@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distance-threshold", type=float, help="Override the threshold from the label map.")
     parser.add_argument("--resize-width", type=int, default=640, help="Resize frames before detection. Use 0 to disable.")
     parser.add_argument("--scale-factor", type=float, default=1.1, help="Haar cascade scale factor.")
-    parser.add_argument("--min-neighbors", type=int, default=5, help="Haar cascade minNeighbors.")
+    parser.add_argument("--min-neighbors", type=int, default=6, help="Haar cascade minNeighbors.")
     parser.add_argument("--min-face-size", type=int, default=72, help="Minimum face size in pixels.")
     return parser.parse_args()
 
@@ -545,3 +545,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

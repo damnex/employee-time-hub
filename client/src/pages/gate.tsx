@@ -47,12 +47,12 @@ const LIVE_TRACKING_INTERVAL_MS = 120;
 const LIVE_TRACKING_BUSY_INTERVAL_MS = 190;
 const LIVE_RECOGNITION_INTERVAL_MS = 650;
 const LIVE_RECOGNITION_IDLE_DELAY_MS = 260;
-const LIVE_RECOGNITION_MAX_FRAME_WIDTH = 480;
-const LIVE_RECOGNITION_JPEG_QUALITY = 0.56;
-const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.62;
-const LIVE_RECOGNITION_STABLE_HITS = 2;
+const LIVE_RECOGNITION_MAX_FRAME_WIDTH = 640;
+const LIVE_RECOGNITION_JPEG_QUALITY = 0.78;
+const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.68;
+const LIVE_RECOGNITION_STABLE_HITS = 3;
 const LIVE_RECOGNITION_TTL_MS = 2200;
-const LIVE_RECOGNITION_MATCH_DISTANCE = 0.16;
+const LIVE_RECOGNITION_MATCH_DISTANCE = 0.12;
 
 type PythonFaceStatus = "training" | "trained" | "failed";
 
@@ -422,7 +422,7 @@ function matchRecognizedFacesToTrackedFaces(
 
         const overlap = getProjectedFaceOverlap(face, trackedFace);
         const distance = getProjectedFaceDistance(face, trackedFace);
-        if (overlap < 0.12 && distance > LIVE_RECOGNITION_MATCH_DISTANCE) {
+        if (overlap < 0.18 && distance > LIVE_RECOGNITION_MATCH_DISTANCE) {
           continue;
         }
 
@@ -1631,4 +1631,5 @@ export default function GateTerminal() {
     </div>
   );
 }
+
 
