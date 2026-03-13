@@ -118,6 +118,7 @@ export const api = {
         rfidUid: z.string().trim().min(1),
         isActive: z.boolean().optional(),
         datasetPhotos: z.array(z.string()).min(12).max(100),
+        profilePhoto: z.string().trim().optional(),
       }),
       responses: { 201: z.custom<typeof employees.$inferSelect>(), 400: errorSchemas.validation },
     },

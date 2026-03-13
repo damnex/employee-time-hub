@@ -18,6 +18,7 @@ import {
 import { z } from "zod";
 import {
   buildPythonFaceDescriptorMeta,
+  PYTHON_DATASET_ROOT,
   PYTHON_LBPH_LABELS_PATH,
   PYTHON_LBPH_MODEL_PATH,
   readPythonFaceDescriptorMeta,
@@ -25,9 +26,11 @@ import {
   removeEmployeeDataset,
   retrainPythonFaceModel,
   appendEmployeeDatasetFrames,
+  parseDataUrl,
   saveEmployeeDatasetPhotos,
   verifyGateFramesWithPython,
 } from "./python-face";
+import path from "path";
 
 type ClientType = "browser" | "device";
 
@@ -1590,6 +1593,45 @@ export async function registerRoutes(
     res.json(employee);
   });
 
+  app.get("/api/employees/:id/photo", async (req, res) => {
+    const employeeId = Number(req.params.id);
+    if (!Number.isFinite(employeeId)) {
+      return res.status(400).json({ message: "Invalid employee id" });
+    }
+
+    const employee = await storage.getEmployee(employeeId);
+    if (!employee) {
+      return res.status(404).json({ message: "Employee not found" });
+    }
+
+    const pythonMeta = readPythonFaceDescriptorMeta(employee.faceDescriptor);
+    const folderName = pythonMeta?.folderName;
+    if (!folderName) {
+      return res.status(404).json({ message: "No face dataset available for this employee." });
+    }
+
+    const datasetDir = path.join(PYTHON_DATASET_ROOT, folderName);
+    try {
+      const entries = await fs.readdir(datasetDir, { withFileTypes: true });
+      const profile = entries.find((entry) => entry.isFile() && /^profile\.(jpe?g|png)$/i.test(entry.name));
+      const jpgs = entries
+        .filter((entry) => entry.isFile() && /\.(jpe?g|png)$/i.test(entry.name))
+        .map((entry) => entry.name)
+        .sort();
+      const sampleFile = profile?.name ?? jpgs[0];
+      if (!sampleFile) {
+        return res.status(404).json({ message: "No dataset images found for this employee." });
+      }
+
+      const filePath = path.join(datasetDir, sampleFile);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return res.sendFile(filePath);
+    } catch (error) {
+      console.warn("[employee-photo] Unable to read dataset folder:", error);
+      return res.status(404).json({ message: "Employee photo unavailable." });
+    }
+  });
+
   app.post(api.employees.enrollPython.path, async (req, res) => {
     try {
       const input = api.employees.enrollPython.input.parse(req.body);
@@ -1604,6 +1646,10 @@ export async function registerRoutes(
         folderName: input.employeeCode,
         datasetPhotos: input.datasetPhotos,
       });
+      if (input.profilePhoto) {
+        const profilePath = path.join(dataset.directory, "profile.jpg");
+        await fs.writeFile(profilePath, parseDataUrl(input.profilePhoto));
+      }
       const employee = await storage.createEmployee({
         employeeCode: input.employeeCode,
         name: input.name,

@@ -493,7 +493,8 @@ export default function GateTerminal() {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const latestEmployee = lastResult?.employee ?? lastResult?.badgeOwner ?? selectedBadgeOwner;
-  const latestProfileImage = lastResult?.previewImage ?? null;
+  const latestProfileImage = lastResult?.previewImage
+    ?? (latestEmployee ? `/api/employees/${latestEmployee.id}/photo` : null);
   const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
   const pythonRosterCount = (employees ?? []).filter((employee) => {
     return Boolean(getPythonFaceMeta(employee.faceDescriptor));

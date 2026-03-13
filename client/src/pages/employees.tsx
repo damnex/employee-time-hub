@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ChangeEvent } from "react";
 import { useDeleteEmployee, useEmployees, usePythonEnrollEmployee } from "@/hooks/use-employees";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -161,11 +161,12 @@ export default function Employees() {
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryToken, setCameraRetryToken] = useState(0);
-  const [datasetSamplesTarget, setDatasetSamplesTarget] = useState(DEFAULT_DATASET_SAMPLES);
-  const [datasetPhotos, setDatasetPhotos] = useState<string[]>([]);
-  const [isCapturingDataset, setIsCapturingDataset] = useState(false);
-  const [captureProgress, setCaptureProgress] = useState(0);
-  const [datasetError, setDatasetError] = useState<string | null>(null);
+const [datasetSamplesTarget, setDatasetSamplesTarget] = useState(DEFAULT_DATASET_SAMPLES);
+const [datasetPhotos, setDatasetPhotos] = useState<string[]>([]);
+const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
+const [isCapturingDataset, setIsCapturingDataset] = useState(false);
+const [captureProgress, setCaptureProgress] = useState(0);
+const [datasetError, setDatasetError] = useState<string | null>(null);
   const [rfidReaderMessage, setRfidReaderMessage] = useState<string | null>(null);
   const [rfidSourceDeviceId, setRfidSourceDeviceId] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -300,6 +301,7 @@ export default function Employees() {
 
   const resetEnrollment = () => {
     setDatasetPhotos([]);
+    setProfilePhoto(null);
     setCaptureProgress(0);
     setDatasetError(null);
     setDatasetSamplesTarget(DEFAULT_DATASET_SAMPLES);
@@ -358,6 +360,23 @@ export default function Employees() {
     setDatasetError(null);
   };
 
+  const handleProfilePhotoChange = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      setProfilePhoto(null);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result;
+      if (typeof result === "string") {
+        setProfilePhoto(result);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
   const onSubmit = (values: FormValues) => {
     if (!datasetReady) {
       setDatasetError(`Capture at least ${MIN_DATASET_SAMPLES} dataset photos before saving.`);
@@ -369,6 +388,7 @@ export default function Employees() {
       rfidUid: values.rfidUid.trim().toUpperCase(),
       isActive: values.isActive ?? true,
       datasetPhotos,
+      profilePhoto: profilePhoto ?? undefined,
     }, {
       onSuccess: () => {
         setIsDialogOpen(false);
@@ -594,6 +614,23 @@ export default function Employees() {
                             </div>
                           )}
                         </div>
+                      </div>
+
+                      <div className="space-y-2 rounded-xl border border-dashed border-border/70 bg-muted/20 p-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Profile photo (optional)</p>
+                            <p className="text-sm text-foreground">Add a cover photo for badges and dashboards. If empty, we’ll use a dataset sample.</p>
+                          </div>
+                          {profilePhoto && (
+                            <img
+                              src={profilePhoto}
+                              alt="Profile preview"
+                              className="h-14 w-14 rounded-2xl object-cover border border-border/70 shadow-sm"
+                            />
+                          )}
+                        </div>
+                        <Input type="file" accept="image/*" onChange={handleProfilePhotoChange} />
                       </div>
 
                       <div className="grid gap-3 sm:grid-cols-3">

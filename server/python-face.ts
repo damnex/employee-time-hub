@@ -13,6 +13,7 @@ const TRAIN_SCRIPT = path.join(PYTHON_ML_ROOT, "opencv_lbph_train.py");
 const FACE_SERVICE_SCRIPT = path.join(PYTHON_ML_ROOT, "opencv_face_service.py");
 export const PYTHON_LBPH_MODEL_PATH = path.join(OUTPUT_ROOT, "lbph-model.yml");
 export const PYTHON_LBPH_LABELS_PATH = path.join(OUTPUT_ROOT, "lbph-labels.json");
+export const PYTHON_DATASET_ROOT = DATASET_ROOT;
 
 export type PythonFaceStatus = "training" | "trained" | "failed";
 
