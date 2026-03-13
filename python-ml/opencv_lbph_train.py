@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image-size", type=int, default=200, help="Square face crop size used for training.")
     parser.add_argument("--scale-factor", type=float, default=1.1, help="Haar cascade scale factor.")
     parser.add_argument("--min-neighbors", type=int, default=5, help="Haar cascade minNeighbors.")
-    parser.add_argument("--min-face-size", type=int, default=80, help="Minimum face size in pixels.")
+    parser.add_argument("--min-face-size", type=int, default=40, help="Minimum face size in pixels.")
     parser.add_argument(
         "--lbph-radius",
         type=int,
