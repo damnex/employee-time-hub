@@ -14,8 +14,9 @@ from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
-import face_recognition
-import numpy as np
+import cv2  # type: ignore
+import face_recognition  # type: ignore
+import numpy as np  # type: ignore
 from sklearn import neighbors, svm
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -69,7 +70,7 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 
 def round_float(value: float, digits: int = 6) -> float:
-    return round(float(value), digits)
+    return float(np.round(value, digits))
 
 
 def to_descriptor(values: np.ndarray) -> list[float]:
@@ -151,41 +152,47 @@ def collect_samples(args: argparse.Namespace) -> tuple[dict[str, list[FaceSample
 
         for image_path in iter_image_files(person_dir):
             try:
-                image = face_recognition.load_image_file(str(image_path))
-                locations = face_recognition.face_locations(
-                    image,
-                    number_of_times_to_upsample=args.upsample,
-                    model=args.detection_model,
-                )
+                base_image = face_recognition.load_image_file(str(image_path))
             except Exception as exc:  # noqa: BLE001
                 skipped_images.append(SkippedImage(label, image_path, f"load-error: {exc}"))
                 continue
 
-            if len(locations) == 0:
-                skipped_images.append(SkippedImage(label, image_path, "no-face-detected"))
-                continue
-            if len(locations) > 1:
-                skipped_images.append(SkippedImage(label, image_path, "multiple-faces-detected"))
-                continue
+            variations = [base_image]
+            if hasattr(cv2, "flip"):
+                variations.append(cv2.flip(base_image, 1))
+                variations.append(cv2.convertScaleAbs(base_image, alpha=0.8, beta=0))
+                variations.append(cv2.convertScaleAbs(base_image, alpha=1.2, beta=0))
+            
+            for image in variations:
+                try:
+                    locations = face_recognition.face_locations(
+                        image,
+                        number_of_times_to_upsample=args.upsample,
+                        model=args.detection_model,
+                    )
+                except Exception as exc:
+                    continue
 
-            encodings = face_recognition.face_encodings(
-                image,
-                known_face_locations=locations,
-                num_jitters=args.jitters,
-                model=args.landmark_model,
-            )
-            if not encodings:
-                skipped_images.append(SkippedImage(label, image_path, "encoding-failed"))
-                continue
+                if len(locations) != 1:
+                    continue
 
-            samples.append(
-                FaceSample(
-                    label=label,
-                    image_path=image_path,
-                    encoding=np.asarray(encodings[0], dtype=np.float32),
-                    quality=image_quality(image, locations[0]),
+                encodings = face_recognition.face_encodings(
+                    image,
+                    known_face_locations=locations,
+                    num_jitters=args.jitters,
+                    model=args.landmark_model,
                 )
-            )
+                if not encodings:
+                    continue
+
+                samples.append(
+                    FaceSample(
+                        label=label,
+                        image_path=image_path,
+                        encoding=np.asarray(encodings[0], dtype=np.float32),
+                        quality=image_quality(image, locations[0]),
+                    )
+                )
 
         if len(samples) < args.min_samples:
             skipped_people.append(
@@ -232,6 +239,7 @@ def select_anchor_descriptors(samples: list[FaceSample], max_anchors: int) -> li
                 best_index = index
         if best_index is None:
             break
+        assert best_index is not None
         chosen_indices.append(best_index)
 
     chosen = [samples[index].encoding for index in chosen_indices]
@@ -401,7 +409,7 @@ def build_report(
 
 
 def main() -> int:
-    args = parse_args()
+    args: Any = parse_args()
     args.dataset = args.dataset.resolve()
     args.output = args.output.resolve()
 

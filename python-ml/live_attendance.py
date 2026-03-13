@@ -14,9 +14,9 @@ from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
-import cv2
-import face_recognition
-import numpy as np
+import cv2  # type: ignore
+import face_recognition  # type: ignore
+import numpy as np  # type: ignore
 
 FACE_MATCH_THRESHOLD = 0.87
 FACE_PRIMARY_THRESHOLD = 0.88
@@ -152,7 +152,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def round_float(value: float, digits: int = 4) -> float:
-    return round(float(value), digits)
+    return float(np.round(value, digits))
 
 
 def average(values: list[float]) -> float:
@@ -282,7 +282,7 @@ def scale_locations(
 def recognize_frame(
     frame: np.ndarray,
     profiles: list[LoadedProfile],
-    args: argparse.Namespace,
+    args: Any,
 ) -> list[DetectionResult]:
     working_frame, scale_factor = resize_frame(frame, args.resize_width)
     rgb_frame = cv2.cvtColor(working_frame, cv2.COLOR_BGR2RGB)
@@ -307,7 +307,8 @@ def recognize_frame(
             for profile in profiles
         ]
         ranked_matches.sort(key=lambda item: item.metrics["finalConfidence"], reverse=True)
-        top_matches = ranked_matches[: max(1, args.top_k)]
+        k = int(max(1, args.top_k))
+        top_matches = ranked_matches[:k]
         best_match = top_matches[0] if top_matches else None
         verified = False
         if best_match is not None:
@@ -429,9 +430,10 @@ def draw_overlay(
 
     for detection in detections:
         top, right, bottom, left = detection.box
-        if detection.verified and detection.best_match is not None:
+        match = detection.best_match
+        if detection.verified and match is not None:
             color = (60, 200, 80)
-            label = f"{detection.best_match.profile.display_name} {detection.best_match.metrics['finalConfidence']:.2f}"
+            label = f"{match.profile.display_name} {match.metrics['finalConfidence']:.2f}"
         else:
             color = (30, 30, 220)
             label = "Unknown"
@@ -501,7 +503,7 @@ def write_session_summary(
 
 
 def main() -> int:
-    args = parse_args()
+    args: Any = parse_args()
     profiles = load_profiles(args.profiles)
     if not profiles:
         print("No valid profiles were loaded. Train first and check output/profiles.json.", file=sys.stderr)
@@ -544,7 +546,7 @@ def main() -> int:
                 time.sleep(0.1)
                 continue
 
-            frame_counter += 1
+            frame_counter = frame_counter + 1
             if frame_counter % max(1, args.process_every_nth_frame) == 0:
                 latest_detections = recognize_frame(frame, profiles, args)
                 current_labels = {
@@ -558,11 +560,12 @@ def main() -> int:
 
                 now_ts = time.time()
                 for detection in latest_detections:
-                    if not detection.verified or detection.best_match is None:
+                    match = detection.best_match
+                    if not detection.verified or match is None:
                         continue
 
-                    label = detection.best_match.profile.folder_name
-                    consecutive_hits[label] += 1
+                    label = match.profile.folder_name
+                    consecutive_hits[label] = consecutive_hits.get(label, 0) + 1
                     if consecutive_hits[label] < max(1, args.min_consecutive_detections):
                         continue
                     if not should_mark_attendance(
@@ -575,14 +578,14 @@ def main() -> int:
                         continue
 
                     timestamp_iso = datetime.now(UTC).isoformat()
-                    event_row = create_event_row(source_label, detection, detection.best_match, timestamp_iso)
+                    event_row = create_event_row(source_label, detection, match, timestamp_iso)
                     append_attendance_event(event_log_path, event_row)
-                    update_session_attendance(session_attendance, detection.best_match, timestamp_iso)
+                    update_session_attendance(session_attendance, match, timestamp_iso)
                     logged_once.add(label)
                     last_logged_at[label] = now_ts
                     consecutive_hits[label] = 0
                     status_message = (
-                        f"Attendance marked for {detection.best_match.profile.display_name} "
+                        f"Attendance marked for {match.profile.display_name} "
                         f"at {timestamp_iso}."
                     )
                     if args.save_snapshots:
