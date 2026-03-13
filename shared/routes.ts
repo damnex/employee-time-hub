@@ -51,6 +51,22 @@ const matchDetailsSchema = z.object({
   liveLiveness: z.number().optional(),
   liveRealness: z.number().optional(),
 });
+const faceBoxSchema = z.object({
+  top: z.number(),
+  right: z.number(),
+  bottom: z.number(),
+  left: z.number(),
+});
+const liveRecognizedFaceSchema = z.object({
+  label: z.string(),
+  employeeCode: z.string().nullish(),
+  department: z.string().nullish(),
+  rfidUid: z.string().nullish(),
+  confidence: z.number(),
+  distance: z.number().nullish(),
+  verified: z.boolean(),
+  box: faceBoxSchema,
+});
 
 export const errorSchemas = {
   validation: z.object({ message: z.string(), field: z.string().optional() }),
@@ -90,6 +106,21 @@ export const api = {
       input: insertEmployeeSchema,
       responses: { 201: z.custom<typeof employees.$inferSelect>(), 400: errorSchemas.validation },
     },
+    enrollPython: {
+      method: 'POST' as const,
+      path: '/api/employees/enroll-python' as const,
+      input: z.object({
+        employeeCode: z.string().trim().min(1),
+        name: z.string().trim().min(1),
+        department: z.string().trim().min(1),
+        phone: z.string().trim().optional(),
+        email: z.string().trim().optional(),
+        rfidUid: z.string().trim().min(1),
+        isActive: z.boolean().optional(),
+        datasetPhotos: z.array(z.string()).min(12).max(100),
+      }),
+      responses: { 201: z.custom<typeof employees.$inferSelect>(), 400: errorSchemas.validation },
+    },
     update: {
       method: 'PATCH' as const,
       path: '/api/employees/:id' as const,
@@ -125,6 +156,7 @@ export const api = {
       input: z.object({
         rfidUid: z.string(),
         deviceId: z.string(),
+        faceFrames: z.array(z.string()).min(3).max(16).optional(),
         faceDescriptor: z.array(z.number()).optional(),
         faceAnchorDescriptors: z.array(z.array(z.number())).optional(),
         faceConsistency: z.number().min(0).max(1).optional(),
@@ -152,9 +184,30 @@ export const api = {
           action: z.enum(["ENTRY", "EXIT"]).optional(),
           movementDirection: movementDirectionSchema.optional(),
           movementConfidence: z.number().optional(),
+          detectedFaceLabel: z.string().optional(),
+          detectedFaceBox: faceBoxSchema.nullish(),
         }),
         400: errorSchemas.validation,
         404: errorSchemas.notFound
+      }
+    },
+    liveFaces: {
+      method: 'POST' as const,
+      path: '/api/scan/live-faces' as const,
+      input: z.object({
+        deviceId: z.string().trim().min(1),
+        frame: z.string().trim().min(1),
+      }),
+      responses: {
+        200: z.object({
+          success: z.boolean(),
+          message: z.string(),
+          processedAt: z.string(),
+          frameWidth: z.number().optional(),
+          frameHeight: z.number().optional(),
+          faces: z.array(liveRecognizedFaceSchema),
+        }),
+        400: errorSchemas.validation,
       }
     }
   },
@@ -180,3 +233,5 @@ export function buildUrl(path: string, params?: Record<string, string | number>)
   }
   return url;
 }
+
+

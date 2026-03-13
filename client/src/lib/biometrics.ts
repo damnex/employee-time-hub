@@ -66,6 +66,20 @@ export interface FaceTrackingSnapshot {
   guidance: string;
 }
 
+export interface LiveTrackedFaceDetection {
+  bounds: FaceCropBounds;
+  quality: number;
+  pose: FacePose;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  liveConfidence: number;
+  realConfidence: number;
+  distance: number | null;
+  boxScore: number;
+  faceScore: number;
+}
+
 export interface FaceTemplateCaptureOptions {
   sampleCount: number;
   sampleDelayMs?: number;
@@ -271,6 +285,68 @@ const TRACKING_CONFIG: Partial<Config> = {
       minConfidence: 0.2,
       skipFrames: 0,
       skipTime: 0,
+    },
+    antispoof: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    liveness: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    emotion: {
+      enabled: false,
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    attention: {
+      enabled: false,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+    gear: {
+      enabled: false,
+      minConfidence: 0.1,
+      skipFrames: 99,
+      skipTime: 1500,
+    },
+  },
+  gesture: {
+    enabled: false,
+  },
+};
+
+const MULTI_FACE_TRACKING_CONFIG: Partial<Config> = {
+  face: {
+    enabled: true,
+    detector: {
+      enabled: true,
+      rotation: true,
+      maxDetected: 50,
+      minConfidence: 0.22,
+      skipFrames: 0,
+      skipTime: 0,
+    },
+    mesh: {
+      enabled: true,
+      skipFrames: 0,
+      skipTime: 0,
+      keepInvalid: false,
+    },
+    iris: {
+      enabled: false,
+      skipFrames: 2,
+      skipTime: 120,
+      scale: 2.2,
+    },
+    description: {
+      enabled: false,
+      minConfidence: 0.2,
+      skipFrames: 2,
+      skipTime: 120,
     },
     antispoof: {
       enabled: false,
@@ -707,6 +783,49 @@ async function detectFaces(video: HTMLVideoElement, config: Partial<Config>) {
   return result.face ?? [];
 }
 
+function buildLiveTrackedFace(video: HTMLVideoElement, face: FaceResult): LiveTrackedFaceDetection {
+  const bounds = getFaceBounds(face);
+  return {
+    bounds,
+    quality: getTrackingQuality(face, video),
+    pose: getPoseFromFace(face),
+    yaw: roundMetric((face.rotation?.angle.yaw ?? 0) * RAD_TO_DEG, 1),
+    pitch: roundMetric((face.rotation?.angle.pitch ?? 0) * RAD_TO_DEG, 1),
+    roll: roundMetric((face.rotation?.angle.roll ?? 0) * RAD_TO_DEG, 1),
+    liveConfidence: roundMetric(face.live ?? 0, 3),
+    realConfidence: roundMetric(face.real ?? 0, 3),
+    distance: typeof face.distance === "number" ? roundMetric(face.distance, 3) : null,
+    boxScore: roundMetric(face.boxScore || 0, 3),
+    faceScore: roundMetric(face.faceScore || face.score || 0, 3),
+  };
+}
+
+export async function detectLiveTrackingFaces(
+  video: HTMLVideoElement,
+  options: {
+    maxDetected?: number;
+  } = {},
+): Promise<LiveTrackedFaceDetection[]> {
+  if (!supportsModelRuntime() || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+    return [];
+  }
+
+  const maxDetected = Math.max(1, Math.min(options.maxDetected ?? 20, 50));
+  const faces = await detectFaces(video, {
+    face: {
+      ...MULTI_FACE_TRACKING_CONFIG.face,
+      detector: {
+        ...MULTI_FACE_TRACKING_CONFIG.face?.detector,
+        maxDetected,
+      },
+    },
+  });
+
+  return faces
+    .map((face) => buildLiveTrackedFace(video, face))
+    .sort((left, right) => left.bounds.x - right.bounds.x);
+}
+
 export function isFaceDetectorAvailable() {
   return supportsModelRuntime();
 }
@@ -1091,3 +1210,4 @@ export async function captureFaceTemplate(
     `${missingMessage} Look front, then left, then right while staying inside the tracked frame with stable lighting.`,
   );
 }
+

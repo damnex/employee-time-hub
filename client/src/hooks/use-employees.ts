@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, buildUrl } from "@shared/routes";
 import { type InsertEmployee } from "@shared/schema";
 import { useToast } from "@/hooks/use-toast";
+import { z } from "zod";
 
 export function useEmployees() {
   return useQuery({
@@ -50,6 +51,52 @@ export function useCreateEmployee() {
     onError: (error: Error) => {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     }
+  });
+}
+
+type PythonEnrollRequest = z.infer<typeof api.employees.enrollPython.input>;
+
+export function usePythonEnrollEmployee() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+
+  return useMutation({
+    mutationFn: async (data: PythonEnrollRequest) => {
+      const validated = api.employees.enrollPython.input.parse(data);
+      const res = await fetch(api.employees.enrollPython.path, {
+        method: api.employees.enrollPython.method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(validated),
+        credentials: "include",
+      });
+
+      const resData = await res.json();
+
+      if (!res.ok) {
+        if (res.status === 400) {
+          const error = api.employees.enrollPython.responses[400].parse(resData);
+          throw new Error(error.message || "Python enrollment failed");
+        }
+        throw new Error(
+          typeof resData?.message === "string" && resData.message.trim()
+            ? resData.message
+            : "Failed to enroll employee with Python training",
+        );
+      }
+
+      return api.employees.enrollPython.responses[201].parse(resData);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [api.employees.list.path] });
+      queryClient.invalidateQueries({ queryKey: [api.stats.dashboard.path] });
+      toast({
+        title: "Success",
+        description: "Employee saved and Python training refreshed.",
+      });
+    },
+    onError: (error: Error) => {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    },
   });
 }
 

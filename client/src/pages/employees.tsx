@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useEmployees, useCreateEmployee, useDeleteEmployee } from "@/hooks/use-employees";
+import { useDeleteEmployee, useEmployees, usePythonEnrollEmployee } from "@/hooks/use-employees";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -25,10 +25,11 @@ import {
   AlertCircle,
   Camera,
   CheckCircle2,
+  Database,
   Loader2,
   Plus,
   RefreshCcw,
-  ScanFace,
+  ScanLine,
   ShieldCheck,
   Trash2,
   UserCircle,
@@ -45,35 +46,15 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { faceProfileSchema, insertEmployeeSchema, type FacePoseCoverage } from "@shared/schema";
-import {
-  captureFaceTemplate,
-  describeFacePose,
-  getDefaultEnrollmentPoseTargets,
-  getBiometricCameraConstraints,
-  getBiometricRuntimeInfo,
-  startFaceTracking,
-  type FaceTrackingSnapshot,
-} from "@/lib/biometrics";
+import { insertEmployeeSchema } from "@shared/schema";
 import { useDeviceWS } from "@/hooks/use-device-ws";
 
-const ENROLLMENT_POSE_TARGETS = getDefaultEnrollmentPoseTargets();
-const ENROLLMENT_SAMPLE_COUNT =
-  ENROLLMENT_POSE_TARGETS.front
-  + ENROLLMENT_POSE_TARGETS.left
-  + ENROLLMENT_POSE_TARGETS.right;
-const ENROLLMENT_SAMPLE_DELAY_MS = 110;
-
-function createEmptyPoseCounts(): FacePoseCoverage {
-  return {
-    front: 0,
-    left: 0,
-    right: 0,
-    up: 0,
-    down: 0,
-    unknown: 0,
-  };
-}
+const ENROLLMENT_CAMERA_ID = "ENROLLMENT-CONSOLE-01";
+const MIN_DATASET_SAMPLES = 20;
+const DEFAULT_DATASET_SAMPLES = 60;
+const MAX_DATASET_SAMPLES = 100;
+const DATASET_CAPTURE_DELAY_MS = 160;
+const DATASET_CAPTURE_SIZE = 360;
 
 const defaultFormValues = {
   employeeCode: "",
@@ -83,72 +64,122 @@ const defaultFormValues = {
   email: "",
   rfidUid: "",
   isActive: true,
-  faceDescriptor: null,
 };
 
 const formSchema = insertEmployeeSchema
+  .omit({ faceDescriptor: true })
   .extend({
-    faceDescriptor: faceProfileSchema.nullable().optional(),
-  })
-  .superRefine((values, ctx) => {
-    if (!values.faceDescriptor?.primaryDescriptor?.length) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["faceDescriptor"],
-        message: "Capture a live biometric profile before saving.",
-      });
-    }
+    employeeCode: z.string().trim().min(1, "Employee code is required."),
+    name: z.string().trim().min(1, "Employee name is required."),
+    department: z.string().trim().min(1, "Department is required."),
+    rfidUid: z.string().trim().min(1, "RFID badge is required."),
+    phone: z.string().trim().optional(),
+    email: z.string().trim().optional(),
   });
+
+type FormValues = z.infer<typeof formSchema>;
+
+function sleep(durationMs: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, durationMs);
+  });
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(Math.max(value, minimum), maximum);
+}
+
+function getCameraConstraints(): MediaTrackConstraints {
+  return {
+    facingMode: "user",
+    width: { ideal: 1280, min: 640 },
+    height: { ideal: 720, min: 480 },
+    frameRate: { ideal: 30, max: 30 },
+  };
+}
+
+function captureDatasetFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement) {
+  const context = canvas.getContext("2d");
+  if (!context || !video.videoWidth || !video.videoHeight) {
+    return null;
+  }
+
+  const sourceSize = Math.min(video.videoWidth, video.videoHeight);
+  const sourceX = Math.max(0, (video.videoWidth - sourceSize) / 2);
+  const sourceY = Math.max(0, (video.videoHeight - sourceSize) / 2);
+
+  canvas.width = DATASET_CAPTURE_SIZE;
+  canvas.height = DATASET_CAPTURE_SIZE;
+  context.clearRect(0, 0, DATASET_CAPTURE_SIZE, DATASET_CAPTURE_SIZE);
+  context.drawImage(
+    video,
+    sourceX,
+    sourceY,
+    sourceSize,
+    sourceSize,
+    0,
+    0,
+    DATASET_CAPTURE_SIZE,
+    DATASET_CAPTURE_SIZE,
+  );
+
+  return canvas.toDataURL("image/jpeg", 0.78);
+}
+
+function getPythonFaceStatus(faceDescriptor: unknown) {
+  if (!faceDescriptor || typeof faceDescriptor !== "object") {
+    return null;
+  }
+
+  const candidate = faceDescriptor as Record<string, unknown>;
+  if (candidate.provider !== "python-opencv-lbph") {
+    return null;
+  }
+
+  return {
+    status: typeof candidate.status === "string" ? candidate.status : "failed",
+    datasetSampleCount:
+      typeof candidate.datasetSampleCount === "number" ? candidate.datasetSampleCount : 0,
+    lastTrainingMessage:
+      typeof candidate.lastTrainingMessage === "string" ? candidate.lastTrainingMessage : null,
+  };
+}
 
 export default function Employees() {
   const { data: employees, isLoading } = useEmployees();
-  const createEmployee = useCreateEmployee();
   const deleteEmployee = useDeleteEmployee();
+  const pythonEnrollEmployee = usePythonEnrollEmployee();
   const {
     isConnected: enrollmentSocketConnected,
     lastScanResult: lastDeviceMessage,
     clearResult: clearDeviceMessage,
-  } = useDeviceWS("ENROLLMENT-CONSOLE-01", { clientType: "browser" });
+  } = useDeviceWS(ENROLLMENT_CAMERA_ID, { clientType: "browser" });
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryToken, setCameraRetryToken] = useState(0);
-  const [isCapturingFace, setIsCapturingFace] = useState(false);
-  const [capturedSamples, setCapturedSamples] = useState(0);
-  const [captureQuality, setCaptureQuality] = useState<number | null>(null);
-  const [capturePoseCounts, setCapturePoseCounts] = useState<FacePoseCoverage>(createEmptyPoseCounts);
-  const [latestTrackedPose, setLatestTrackedPose] = useState<string>("Front");
-  const [trackingSnapshot, setTrackingSnapshot] = useState<FaceTrackingSnapshot | null>(null);
+  const [datasetSamplesTarget, setDatasetSamplesTarget] = useState(DEFAULT_DATASET_SAMPLES);
+  const [datasetPhotos, setDatasetPhotos] = useState<string[]>([]);
+  const [isCapturingDataset, setIsCapturingDataset] = useState(false);
+  const [captureProgress, setCaptureProgress] = useState(0);
+  const [datasetError, setDatasetError] = useState<string | null>(null);
   const [rfidReaderMessage, setRfidReaderMessage] = useState<string | null>(null);
   const [rfidSourceDeviceId, setRfidSourceDeviceId] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  const form = useForm<z.infer<typeof formSchema>>({
+  const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: defaultFormValues,
   });
 
-  const faceDescriptor = form.watch("faceDescriptor");
-  const biometricRuntime = getBiometricRuntimeInfo();
-  const modelCaptureAvailable = biometricRuntime.detectorAvailable;
   const watchedRfidUid = form.watch("rfidUid");
   const normalizedRfidUid = watchedRfidUid.trim().toUpperCase();
   const mappedBadgeOwner = employees?.find((employee) => {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const rfidReady = Boolean(normalizedRfidUid) && !mappedBadgeOwner;
-  const faceProfileReady = Boolean(faceDescriptor?.primaryDescriptor?.length);
-  const faceError = form.formState.errors.faceDescriptor?.message;
-  const poseCoverageReady =
-    capturePoseCounts.front >= ENROLLMENT_POSE_TARGETS.front
-    && capturePoseCounts.left >= ENROLLMENT_POSE_TARGETS.left
-    && capturePoseCounts.right >= ENROLLMENT_POSE_TARGETS.right;
-  const compatibilityModeMessage = biometricRuntime.detectorAvailable
-    ? biometricRuntime.isIOS || biometricRuntime.isSafari
-      ? "Model-backed face capture is active in the browser camera. This is not Apple Face ID hardware, but it now uses a real ML face engine."
-      : "Model-backed face capture is active. The camera auto-tracks the face and records multi-angle embeddings."
-    : "This browser cannot run the ML face capture reliably.";
+  const datasetReady = datasetPhotos.length >= MIN_DATASET_SAMPLES;
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -170,7 +201,7 @@ export default function Employees() {
 
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: getBiometricCameraConstraints(),
+          video: getCameraConstraints(),
           audio: false,
         });
 
@@ -190,7 +221,7 @@ export default function Employees() {
       } catch (error) {
         console.error("Camera enrollment failed:", error);
         setCameraActive(false);
-        setCameraError("Allow camera access to enroll the employee face profile.");
+        setCameraError("Allow camera access to capture the employee dataset.");
       }
     };
 
@@ -209,20 +240,7 @@ export default function Employees() {
         stream.getTracks().forEach((track) => track.stop());
       }
     };
-  }, [isDialogOpen, cameraRetryToken]);
-
-  useEffect(() => {
-    if (!isDialogOpen || !cameraActive || !videoRef.current || isCapturingFace) {
-      return;
-    }
-
-    return startFaceTracking(videoRef.current, (snapshot) => {
-      setTrackingSnapshot(snapshot);
-      setLatestTrackedPose(describeFacePose(snapshot.pose));
-    }, {
-      mode: "tracking",
-    });
-  }, [cameraActive, isCapturingFace, isDialogOpen]);
+  }, [cameraRetryToken, isDialogOpen]);
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -239,7 +257,6 @@ export default function Employees() {
       shouldTouch: true,
       shouldValidate: true,
     });
-
     setRfidReaderMessage(lastDeviceMessage.message);
     setRfidSourceDeviceId(lastDeviceMessage.deviceId ?? null);
 
@@ -275,24 +292,18 @@ export default function Employees() {
       return;
     }
 
-    setRfidReaderMessage((currentMessage) => {
-      return currentMessage && currentMessage.includes("already mapped")
-        ? "Badge ready to assign."
-        : currentMessage;
-    });
     form.clearErrors("rfidUid");
   }, [form, isDialogOpen, mappedBadgeOwner, normalizedRfidUid]);
 
   const resetEnrollment = () => {
-    setIsCapturingFace(false);
-    setCapturedSamples(0);
-    setCaptureQuality(null);
-     setCapturePoseCounts(createEmptyPoseCounts());
-     setLatestTrackedPose("Front");
-     setTrackingSnapshot(null);
-    setCameraError(null);
+    setDatasetPhotos([]);
+    setCaptureProgress(0);
+    setDatasetError(null);
+    setDatasetSamplesTarget(DEFAULT_DATASET_SAMPLES);
     setRfidReaderMessage(null);
     setRfidSourceDeviceId(null);
+    setCameraError(null);
+    setIsCapturingDataset(false);
     form.reset(defaultFormValues);
   };
 
@@ -304,78 +315,58 @@ export default function Employees() {
     }
   };
 
-  const handleCaptureFace = async () => {
-    if (!modelCaptureAvailable) {
-      form.setError("faceDescriptor", {
-        type: "manual",
-        message: "This browser cannot run the ML face capture. Use a supported desktop browser or recent iPhone/Safari browser with camera access.",
-      });
+  const handleCaptureDataset = async () => {
+    if (!cameraActive || !videoRef.current || !canvasRef.current) {
+      setDatasetError("Camera is not ready. Allow access, then retry capture.");
       return;
     }
 
-    if (!videoRef.current || !canvasRef.current || !cameraActive) {
-      form.setError("faceDescriptor", {
-        type: "manual",
-        message: "Camera is not ready. Allow access, then retry capture.",
-      });
-      return;
-    }
-
-    setIsCapturingFace(true);
-    setCapturedSamples(0);
-    setCaptureQuality(null);
-    setCapturePoseCounts(createEmptyPoseCounts());
-    form.clearErrors("faceDescriptor");
+    setIsCapturingDataset(true);
+    setCaptureProgress(0);
+    setDatasetError(null);
+    setDatasetPhotos([]);
 
     try {
-      const template = await captureFaceTemplate(videoRef.current, canvasRef.current, {
-        sampleCount: ENROLLMENT_SAMPLE_COUNT,
-        sampleDelayMs: ENROLLMENT_SAMPLE_DELAY_MS,
-        minQuality: 0.5,
-        maxAttempts: ENROLLMENT_SAMPLE_COUNT * 6,
-        poseTargets: ENROLLMENT_POSE_TARGETS,
-        minLiveConfidence: 0.45,
-        minRealConfidence: 0.35,
-        onProgress: (acceptedSamples, _attemptCount, poseCounts, latestPose) => {
-          setCapturedSamples(acceptedSamples);
-          setCapturePoseCounts(poseCounts);
-          setLatestTrackedPose(describeFacePose(latestPose));
-        },
-      });
-
-      form.setValue("faceDescriptor", template.profile, {
-        shouldDirty: true,
-        shouldTouch: true,
-        shouldValidate: true,
-      });
-      setCaptureQuality(template.averageQuality);
-      setCapturePoseCounts(template.poseCounts);
+      const capturedPhotos: string[] = [];
+      for (let index = 0; index < datasetSamplesTarget; index += 1) {
+        const frame = captureDatasetFrame(videoRef.current, canvasRef.current);
+        if (!frame) {
+          throw new Error("Dataset frame capture failed. Retry with the employee centered in the camera.");
+        }
+        capturedPhotos.push(frame);
+        setDatasetPhotos([...capturedPhotos]);
+        setCaptureProgress(index + 1);
+        await sleep(DATASET_CAPTURE_DELAY_MS);
+      }
     } catch (error) {
-      form.setError("faceDescriptor", {
-        type: "manual",
-        message:
-          error instanceof Error
-            ? error.message
-            : "Unable to capture the biometric profile.",
-      });
+      setDatasetError(
+        error instanceof Error
+          ? error.message
+          : "Unable to capture the dataset photos.",
+      );
     } finally {
-      setIsCapturingFace(false);
+      setIsCapturingDataset(false);
     }
   };
 
-  const handleClearEnrollment = () => {
-    setCapturedSamples(0);
-    setCaptureQuality(null);
-    setCapturePoseCounts(createEmptyPoseCounts());
-    form.setValue("faceDescriptor", null, {
-      shouldDirty: true,
-      shouldTouch: true,
-      shouldValidate: true,
-    });
+  const handleClearDataset = () => {
+    setDatasetPhotos([]);
+    setCaptureProgress(0);
+    setDatasetError(null);
   };
 
-  const onSubmit = (values: z.infer<typeof formSchema>) => {
-    createEmployee.mutate(values as z.infer<typeof insertEmployeeSchema>, {
+  const onSubmit = (values: FormValues) => {
+    if (!datasetReady) {
+      setDatasetError(`Capture at least ${MIN_DATASET_SAMPLES} dataset photos before saving.`);
+      return;
+    }
+
+    pythonEnrollEmployee.mutate({
+      ...values,
+      rfidUid: values.rfidUid.trim().toUpperCase(),
+      isActive: values.isActive ?? true,
+      datasetPhotos,
+    }, {
       onSuccess: () => {
         setIsDialogOpen(false);
         resetEnrollment();
@@ -385,7 +376,7 @@ export default function Employees() {
 
   const handleDeleteEmployee = (employeeId: number, employeeName: string) => {
     const shouldDelete = window.confirm(
-      `Delete ${employeeName} and all related attendance logs? This cannot be undone.`,
+      `Delete ${employeeName} and all related attendance logs? This will also remove the Python dataset for that employee.`,
     );
 
     if (!shouldDelete) {
@@ -396,26 +387,26 @@ export default function Employees() {
   };
 
   return (
-    <div className="p-6 md:p-8 space-y-6 animate-in fade-in duration-500">
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
+    <div className="space-y-6 p-6 md:p-8 animate-in fade-in duration-500">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-3xl font-bold text-foreground">Directory</h1>
-          <p className="text-muted-foreground mt-1">
-            Manage personnel, credentials, and biometric data.
+          <p className="mt-1 text-muted-foreground">
+            Register employees, assign cards, and capture Python training datasets.
           </p>
         </div>
 
         <Dialog open={isDialogOpen} onOpenChange={handleDialogChange}>
           <DialogTrigger asChild>
             <Button className="shadow-sm hover:-translate-y-0.5 transition-transform">
-              <Plus className="size-4 mr-2" /> Add Employee
+              <Plus className="mr-2 size-4" /> Add Employee
             </Button>
           </DialogTrigger>
-          <DialogContent className="sm:max-w-[760px] max-h-[90vh] overflow-y-auto">
+          <DialogContent className="sm:max-w-[820px] max-h-[90vh] overflow-y-auto">
             <DialogHeader>
               <DialogTitle>Register New Employee</DialogTitle>
               <DialogDescription>
-                Capture live credentials and biometric data in one enrollment session.
+                Fill the employee details, register the RFID badge, and capture a dataset for Python training.
               </DialogDescription>
             </DialogHeader>
 
@@ -455,7 +446,7 @@ export default function Employees() {
                       <FormItem>
                         <FormLabel>Department</FormLabel>
                         <FormControl>
-                          <Input placeholder="Engineering" {...field} />
+                          <Input placeholder="Operations" {...field} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -468,12 +459,7 @@ export default function Employees() {
                       <FormItem>
                         <FormLabel>Email (Optional)</FormLabel>
                         <FormControl>
-                          <Input
-                            type="email"
-                            placeholder="jane@company.com"
-                            {...field}
-                            value={field.value || ""}
-                          />
+                          <Input placeholder="jane@company.com" {...field} value={field.value || ""} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -481,17 +467,15 @@ export default function Employees() {
                   />
                 </div>
 
-                <div className="border-t pt-5 space-y-5">
+                <div className="space-y-5 border-t pt-5">
                   <div className="space-y-1">
-                    <h4 className="text-sm font-semibold tracking-wide">
-                      Access Credentials
-                    </h4>
+                    <h4 className="text-sm font-semibold tracking-wide">Access Credentials</h4>
                     <p className="text-sm text-muted-foreground">
-                      Enroll the RFID badge and live face profile before saving.
+                      Register the card and capture many dataset images so Python can train the face model well.
                     </p>
                   </div>
 
-                  <div className="grid gap-5 lg:grid-cols-[0.8fr_1.2fr]">
+                  <div className="grid gap-5 lg:grid-cols-[0.82fr_1.18fr]">
                     <div className="space-y-4">
                       <FormField
                         control={form.control}
@@ -501,17 +485,17 @@ export default function Employees() {
                             <div className="flex items-center justify-between gap-3">
                               <FormLabel>RFID UID</FormLabel>
                               <Badge variant={enrollmentSocketConnected ? "secondary" : "outline"}>
-                                {enrollmentSocketConnected ? "Socket Listening" : "Socket Offline"}
+                                {enrollmentSocketConnected ? "Reader Listening" : "Reader Offline"}
                               </Badge>
                             </div>
                             <FormControl>
                               <Input
-                                placeholder="Tap a real badge or type A1B2C3D4"
+                                placeholder="Tap a badge or type A1B2C3D4"
                                 className="font-mono uppercase tracking-[0.2em]"
                                 {...field}
-                                onChange={(event) =>
-                                  field.onChange(event.target.value.toUpperCase())
-                                }
+                                onChange={(event) => {
+                                  field.onChange(event.target.value.toUpperCase());
+                                }}
                               />
                             </FormControl>
                             <FormMessage />
@@ -519,225 +503,101 @@ export default function Employees() {
                         )}
                       />
 
-                      <div className="rounded-2xl border border-border/70 bg-background p-4 space-y-3 shadow-sm">
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <p className="text-sm font-semibold">Real RFID Reader</p>
-                            <p className="text-xs text-muted-foreground">
-                              Tap a physical badge on the connected reader. The UID will auto-fill and be checked against the existing employee map.
+                      <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm">
+                        <div className="flex items-start gap-2 text-muted-foreground">
+                          <ShieldCheck className="mt-0.5 size-4 shrink-0" />
+                          <div className="space-y-1">
+                            <p>
+                              {rfidReaderMessage ?? "Tap a real RFID card on the enrollment reader or type the UID manually."}
+                            </p>
+                            <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
+                              Source: {rfidSourceDeviceId ?? ENROLLMENT_CAMERA_ID}
                             </p>
                           </div>
-                          <Badge variant={rfidReady ? "secondary" : "outline"}>
-                            {rfidReady ? "Ready" : normalizedRfidUid ? "Check" : "Waiting"}
-                          </Badge>
-                        </div>
-
-                        <div className="rounded-xl border border-dashed border-border/80 bg-muted/20 px-3 py-3 text-sm">
-                          <div className="flex items-center justify-between gap-3">
-                            <span className="text-muted-foreground">Last badge read</span>
-                            <span className="font-mono text-foreground">
-                              {normalizedRfidUid || "--"}
-                            </span>
-                          </div>
-                          <div className="mt-2 flex items-center justify-between gap-3">
-                            <span className="text-muted-foreground">Mapping status</span>
-                            <span className={mappedBadgeOwner ? "text-destructive font-medium" : normalizedRfidUid ? "text-emerald-600 font-medium" : ""}>
-                              {mappedBadgeOwner
-                                ? `Mapped to ${mappedBadgeOwner.name}`
-                                : normalizedRfidUid
-                                  ? "Available"
-                                  : "Waiting for scan"}
-                            </span>
-                          </div>
-                          {rfidSourceDeviceId && (
-                            <div className="mt-2 flex items-center justify-between gap-3">
-                              <span className="text-muted-foreground">Source device</span>
-                              <span className="font-mono text-foreground">{rfidSourceDeviceId}</span>
-                            </div>
-                          )}
-                          {rfidReaderMessage && (
-                            <p className={`mt-3 text-sm ${mappedBadgeOwner ? "text-destructive" : "text-muted-foreground"}`}>
-                              {rfidReaderMessage}
-                            </p>
-                          )}
                         </div>
                       </div>
 
-                      <div className="rounded-2xl border border-border/70 bg-muted/20 p-4 space-y-3">
-                        <div className="flex items-center gap-2">
-                          <ShieldCheck className="size-4 text-primary" />
-                          <p className="text-sm font-medium">
-                            Enrollment Checklist
-                          </p>
+                      <div className="rounded-xl bg-muted/30 p-4 space-y-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Dataset Target</p>
+                            <p className="text-sm text-foreground">Capture more samples for better Python training coverage.</p>
+                          </div>
+                          <Input
+                            type="number"
+                            min={MIN_DATASET_SAMPLES}
+                            max={MAX_DATASET_SAMPLES}
+                            value={datasetSamplesTarget}
+                            onChange={(event) => {
+                              setDatasetSamplesTarget(clamp(Number(event.target.value) || DEFAULT_DATASET_SAMPLES, MIN_DATASET_SAMPLES, MAX_DATASET_SAMPLES));
+                            }}
+                            className="w-24 text-center"
+                            disabled={isCapturingDataset}
+                          />
                         </div>
-                        <div className="space-y-2 text-sm text-muted-foreground">
-                          <div className="flex items-center justify-between">
-                            <span>Badge assigned</span>
-                            <span className={rfidReady ? "text-foreground" : mappedBadgeOwner ? "text-destructive" : ""}>
-                              {mappedBadgeOwner
-                                ? "Conflict"
-                                : rfidReady
-                                  ? "Ready"
-                                  : "Waiting"}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <span>Face profile captured</span>
-                            <span className={faceProfileReady ? "text-emerald-600" : ""}>
-                              {faceProfileReady ? "Ready" : "Required"}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <span>Pose coverage</span>
-                            <span className={poseCoverageReady ? "text-emerald-600" : ""}>
-                              {poseCoverageReady ? "Front + sides" : "Need front/left/right"}
-                            </span>
-                          </div>
-                          <div className="flex items-center justify-between">
-                            <span>Capture quality</span>
-                            <span>
-                              {captureQuality !== null
-                                ? `${Math.round(captureQuality * 100)}%`
-                                : "--"}
-                            </span>
-                          </div>
-                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Ask the employee to look front, slightly left, slightly right, and move naturally while the dataset is being captured.
+                        </p>
                       </div>
                     </div>
 
-                    <div className="rounded-2xl border border-border/70 bg-background shadow-sm p-4 space-y-4">
-                      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                        <div>
-                          <p className="text-sm font-semibold">Biometric Profile</p>
-                          <p className="text-xs text-muted-foreground">
-                            The ML engine auto-tracks the face and captures front, left, and right embeddings during enrollment. Ask the employee to look straight, then turn left and right naturally.
-                          </p>
-                        </div>
-                        {faceProfileReady ? (
-                          <Badge className="bg-emerald-50 text-emerald-700 border-transparent hover:bg-emerald-50">
-                            Enrolled
-                          </Badge>
-                        ) : (
-                          <Badge variant="outline">Pending</Badge>
-                        )}
-                      </div>
-
-                      <div className="aspect-video rounded-2xl border border-border overflow-hidden bg-black relative">
-                        <video
-                          ref={videoRef}
-                          autoPlay
-                          muted
-                          playsInline
-                          className={`h-full w-full object-cover transition-opacity duration-300 ${cameraActive ? "opacity-100" : "opacity-0"}`}
-                        />
-                        <canvas ref={canvasRef} className="hidden" />
-
-                        {cameraActive && (
-                          <>
-                            <div className="absolute inset-5 rounded-[1.25rem] border border-primary/20" />
-                            <div className="absolute left-4 top-4 rounded-full bg-black/55 px-3 py-1 text-[11px] font-medium text-white">
-                              ML enrollment camera
-                            </div>
-                            <div className="absolute right-4 top-4 rounded-full bg-black/55 px-3 py-1 text-[11px] font-medium text-white">
-                              Pose: {latestTrackedPose}
-                            </div>
-                            {trackingSnapshot?.bounds && (
-                              <div
-                                className={`absolute rounded-[1.1rem] border-2 transition-all duration-200 ${
-                                  trackingSnapshot.status === "ready"
-                                    ? "border-emerald-300 shadow-[0_0_0_1px_rgba(110,231,183,0.6),0_0_24px_rgba(16,185,129,0.22)]"
-                                    : "border-amber-300 shadow-[0_0_0_1px_rgba(252,211,77,0.6),0_0_20px_rgba(252,211,77,0.18)]"
-                                }`}
-                                style={{
-                                  left: `${(trackingSnapshot.bounds.x / (videoRef.current?.videoWidth || 1)) * 100}%`,
-                                  top: `${(trackingSnapshot.bounds.y / (videoRef.current?.videoHeight || 1)) * 100}%`,
-                                  width: `${(trackingSnapshot.bounds.width / (videoRef.current?.videoWidth || 1)) * 100}%`,
-                                  height: `${(trackingSnapshot.bounds.height / (videoRef.current?.videoHeight || 1)) * 100}%`,
-                                }}
-                              />
-                            )}
-                          </>
-                        )}
-
-                        {!cameraActive && (
-                          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
-                            <Camera className="size-10 text-white/40" />
-                            <p className="max-w-xs text-sm text-white/70">
-                              {cameraError ?? compatibilityModeMessage ?? "Starting live camera feed..."}
-                            </p>
-                          </div>
-                        )}
-
-                        {isCapturingFace && (
-                          <div className="absolute inset-0 bg-primary/15 backdrop-blur-[2px] flex items-center justify-center">
-                            <div className="space-y-2 rounded-2xl bg-black/70 px-4 py-3 text-center text-sm font-medium text-white">
-                              <div>Capturing sample {Math.min(capturedSamples + 1, ENROLLMENT_SAMPLE_COUNT)} / {ENROLLMENT_SAMPLE_COUNT}</div>
-                              <div className="text-xs text-white/80">
-                                Required poses: Front {capturePoseCounts.front}/{ENROLLMENT_POSE_TARGETS.front}, Left {capturePoseCounts.left}/{ENROLLMENT_POSE_TARGETS.left}, Right {capturePoseCounts.right}/{ENROLLMENT_POSE_TARGETS.right}
+                    <div className="space-y-4">
+                      <div className="relative overflow-hidden rounded-[1.9rem] border border-border/70 bg-black">
+                        <div className="aspect-[4/3] overflow-hidden">
+                          <video
+                            ref={videoRef}
+                            autoPlay
+                            playsInline
+                            muted
+                            className={`h-full w-full object-cover transition-opacity duration-300 ${
+                              cameraActive ? "opacity-100" : "opacity-0"
+                            }`}
+                          />
+                          {!cameraActive && (
+                            <div className="absolute inset-0 flex items-center justify-center bg-slate-950 text-center text-sm text-white/80">
+                              <div className="space-y-2 px-6">
+                                <Camera className="mx-auto size-7 text-white/70" />
+                                <p>{cameraError ?? "Waiting for camera preview..."}</p>
                               </div>
                             </div>
+                          )}
+                          <canvas ref={canvasRef} className="hidden" />
+                          <div className="pointer-events-none absolute inset-0">
+                            <div className="absolute inset-5 rounded-[1.8rem] border border-white/20" />
+                            <div className="absolute inset-x-[22%] inset-y-[12%] rounded-[2rem] border-[3px] border-emerald-300/70 shadow-[0_0_0_1px_rgba(110,231,183,0.35),0_0_24px_rgba(16,185,129,0.18)]" />
+                            <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
+                              PYTHON DATASET
+                            </div>
                           </div>
-                        )}
+                          {isCapturingDataset && (
+                            <div className="absolute inset-0 flex items-center justify-center bg-black/35 backdrop-blur-[2px]">
+                              <div className="rounded-2xl bg-black/70 px-4 py-3 text-center text-sm text-white">
+                                Capturing sample {captureProgress} / {datasetSamplesTarget}
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       </div>
 
-                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      <div className="grid gap-3 sm:grid-cols-3">
                         <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                            Samples
-                          </p>
-                          <p className="text-lg font-semibold text-foreground">
-                            {capturedSamples} / {ENROLLMENT_SAMPLE_COUNT}
-                          </p>
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Captured</p>
+                          <p className="text-lg font-semibold text-foreground">{datasetPhotos.length}</p>
                         </div>
                         <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                            Quality
-                          </p>
-                          <p className="text-lg font-semibold text-foreground">
-                            {captureQuality !== null
-                              ? `${Math.round(captureQuality * 100)}%`
-                              : "--"}
-                          </p>
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Minimum</p>
+                          <p className="text-lg font-semibold text-foreground">{MIN_DATASET_SAMPLES}</p>
                         </div>
                         <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                            Front
-                          </p>
-                          <p className="text-lg font-semibold text-foreground">
-                            {capturePoseCounts.front} / {ENROLLMENT_POSE_TARGETS.front}
-                          </p>
-                        </div>
-                        <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.2em] text-muted-foreground">
-                            Side Poses
-                          </p>
-                          <div className="mt-2 grid grid-cols-2 gap-2">
-                            <div className="rounded-lg bg-background/80 px-2 py-1.5">
-                              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-                                Left
-                              </p>
-                              <p className="text-base font-semibold text-foreground">
-                                {capturePoseCounts.left} / {ENROLLMENT_POSE_TARGETS.left}
-                              </p>
-                            </div>
-                            <div className="rounded-lg bg-background/80 px-2 py-1.5 text-right">
-                              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
-                                Right
-                              </p>
-                              <p className="text-base font-semibold text-foreground">
-                                {capturePoseCounts.right} / {ENROLLMENT_POSE_TARGETS.right}
-                              </p>
-                            </div>
-                          </div>
+                          <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Training</p>
+                          <p className="text-lg font-semibold text-foreground">{datasetReady ? "Ready" : "Pending"}</p>
                         </div>
                       </div>
 
                       <div className="h-2 overflow-hidden rounded-full bg-muted">
                         <div
                           className="h-full rounded-full bg-primary transition-all duration-300"
-                          style={{
-                            width: `${(capturedSamples / ENROLLMENT_SAMPLE_COUNT) * 100}%`,
-                          }}
+                          style={{ width: `${(datasetPhotos.length / Math.max(1, datasetSamplesTarget)) * 100}%` }}
                         />
                       </div>
 
@@ -745,40 +605,36 @@ export default function Employees() {
                         <Button
                           type="button"
                           className="flex-1"
-                          onClick={handleCaptureFace}
-                          disabled={!cameraActive || !modelCaptureAvailable || isCapturingFace}
+                          onClick={handleCaptureDataset}
+                          disabled={!cameraActive || isCapturingDataset}
                         >
-                          {isCapturingFace ? (
+                          {isCapturingDataset ? (
                             <>
                               <Loader2 className="mr-2 size-4 animate-spin" />
-                              Capturing...
+                              Capturing Dataset...
                             </>
-                          ) : faceProfileReady ? (
+                          ) : datasetReady ? (
                             <>
-                              <ScanFace className="mr-2 size-4" />
-                              Re-Capture Face
+                              <Database className="mr-2 size-4" />
+                              Re-Capture Dataset
                             </>
                           ) : (
                             <>
-                              <ScanFace className="mr-2 size-4" />
-                              Capture Face Data
+                              <ScanLine className="mr-2 size-4" />
+                              Capture Dataset Photos
                             </>
                           )}
                         </Button>
                         <Button
                           type="button"
                           variant="outline"
-                          onClick={
-                            faceProfileReady
-                              ? handleClearEnrollment
-                              : () => setCameraRetryToken((value) => value + 1)
-                          }
-                          disabled={isCapturingFace}
+                          onClick={datasetPhotos.length ? handleClearDataset : () => setCameraRetryToken((value) => value + 1)}
+                          disabled={isCapturingDataset}
                         >
-                          {faceProfileReady ? (
+                          {datasetPhotos.length ? (
                             <>
                               <RefreshCcw className="mr-2 size-4" />
-                              Clear
+                              Clear Dataset
                             </>
                           ) : (
                             <>
@@ -790,109 +646,40 @@ export default function Employees() {
                       </div>
 
                       <div className="rounded-xl border border-dashed border-border/80 bg-muted/20 px-4 py-3 text-sm">
-                        {faceProfileReady ? (
+                        {datasetReady ? (
                           <div className="flex items-start gap-2 text-emerald-700">
                             <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
                             <p>
-                              Live facial profile captured. This employee can now use
-                              gate verification on the same camera setup.
+                              Dataset captured. Saving will store the employee, write the dataset images, and refresh the Python face model.
+                              Aim for 60 to 100 samples for the strongest roster quality.
                             </p>
                           </div>
                         ) : (
-                          <div className="space-y-2">
-                            {compatibilityModeMessage && (
-                              <p className="text-muted-foreground">{compatibilityModeMessage}</p>
-                            )}
-                            <div className="flex items-start gap-2 text-muted-foreground">
-                              <AlertCircle className="mt-0.5 size-4 shrink-0" />
-                              <p>
-                                {trackingSnapshot?.guidance
-                                  ?? "Keep the tracked face box visible. The system will collect front, left, and right face embeddings for the new ML profile."}
-                              </p>
-                            </div>
-                            <div className="space-y-2">
-                              <p className="text-[11px] font-medium uppercase tracking-[0.18em] text-muted-foreground">
-                                Pose Checklist
-                              </p>
-                              <div className={`rounded-xl border px-3 py-2.5 ${capturePoseCounts.front >= ENROLLMENT_POSE_TARGETS.front ? "border-emerald-300 bg-emerald-50/70 text-emerald-700" : "border-border/70 bg-background/75 text-foreground"}`}>
-                                <div className="flex items-center justify-between gap-3">
-                                  <div>
-                                    <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                                      Front Capture
-                                    </p>
-                                    <p className="text-sm font-medium">
-                                      Straight face toward camera
-                                    </p>
-                                  </div>
-                                  <p className="text-lg font-semibold">
-                                    {capturePoseCounts.front} / {ENROLLMENT_POSE_TARGETS.front}
-                                  </p>
-                                </div>
-                              </div>
-                              <div className="grid gap-2 sm:grid-cols-2">
-                                <div className={`rounded-xl border px-3 py-3 ${capturePoseCounts.left >= ENROLLMENT_POSE_TARGETS.left ? "border-emerald-300 bg-emerald-50/70 text-emerald-700" : "border-border/70 bg-background/75 text-foreground"}`}>
-                                  <div className="flex items-start justify-between gap-3">
-                                    <div>
-                                      <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                                        Left Side
-                                      </p>
-                                      <p className="mt-1 text-sm font-medium">
-                                        Turn slightly left
-                                      </p>
-                                    </div>
-                                    <p className="text-xl font-semibold">
-                                      {capturePoseCounts.left} / {ENROLLMENT_POSE_TARGETS.left}
-                                    </p>
-                                  </div>
-                                </div>
-                                <div className={`rounded-xl border px-3 py-3 ${capturePoseCounts.right >= ENROLLMENT_POSE_TARGETS.right ? "border-emerald-300 bg-emerald-50/70 text-emerald-700" : "border-border/70 bg-background/75 text-foreground"}`}>
-                                  <div className="flex items-start justify-between gap-3">
-                                    <div>
-                                      <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">
-                                        Right Side
-                                      </p>
-                                      <p className="mt-1 text-sm font-medium">
-                                        Turn slightly right
-                                      </p>
-                                    </div>
-                                    <p className="text-xl font-semibold">
-                                      {capturePoseCounts.right} / {ENROLLMENT_POSE_TARGETS.right}
-                                    </p>
-                                  </div>
-                                </div>
-                              </div>
-                            </div>
+                          <div className="flex items-start gap-2 text-muted-foreground">
+                            <AlertCircle className="mt-0.5 size-4 shrink-0" />
+                            <p>
+                              Capture at least {MIN_DATASET_SAMPLES} photos. For better accuracy, aim for 60 or more with good lighting and natural face turns.
+                            </p>
                           </div>
                         )}
                       </div>
 
-                      {faceError && (
-                        <p className="text-sm font-medium text-destructive">
-                          {faceError}
-                        </p>
+                      {datasetError && (
+                        <p className="text-sm font-medium text-destructive">{datasetError}</p>
                       )}
                     </div>
                   </div>
                 </div>
 
                 <DialogFooter className="pt-2">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    onClick={() => handleDialogChange(false)}
-                  >
+                  <Button type="button" variant="ghost" onClick={() => handleDialogChange(false)}>
                     Cancel
                   </Button>
                   <Button
                     type="submit"
-                    disabled={
-                      createEmployee.isPending
-                      || isCapturingFace
-                      || !faceProfileReady
-                      || !rfidReady
-                    }
+                    disabled={pythonEnrollEmployee.isPending || isCapturingDataset || !datasetReady || !rfidReady}
                   >
-                    {createEmployee.isPending ? "Saving..." : "Save Employee"}
+                    {pythonEnrollEmployee.isPending ? "Saving & Training..." : "Save Employee"}
                   </Button>
                 </DialogFooter>
               </form>
@@ -910,110 +697,102 @@ export default function Employees() {
                 <TableHead>Code</TableHead>
                 <TableHead>Department</TableHead>
                 <TableHead>RFID Badge</TableHead>
-                <TableHead>Biometrics</TableHead>
+                <TableHead>Python Face</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead className="text-right pr-6">Actions</TableHead>
+                <TableHead className="pr-6 text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {isLoading ? (
-                Array.from({ length: 5 }).map((_, i) => (
-                  <TableRow key={i}>
-                    <TableCell className="pl-6">
-                      <Skeleton className="h-5 w-32" />
-                    </TableCell>
-                    <TableCell>
-                      <Skeleton className="h-5 w-20" />
-                    </TableCell>
-                    <TableCell>
-                      <Skeleton className="h-5 w-24" />
-                    </TableCell>
-                    <TableCell>
-                      <Skeleton className="h-5 w-24" />
-                    </TableCell>
-                    <TableCell>
-                      <Skeleton className="h-5 w-16" />
-                    </TableCell>
-                    <TableCell>
-                      <Skeleton className="h-5 w-16" />
-                    </TableCell>
-                    <TableCell className="pr-6">
-                      <Skeleton className="ml-auto h-9 w-20" />
-                    </TableCell>
+                Array.from({ length: 5 }).map((_, index) => (
+                  <TableRow key={index}>
+                    <TableCell className="pl-6"><Skeleton className="h-5 w-32" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-20" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-24" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-24" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-24" /></TableCell>
+                    <TableCell><Skeleton className="h-5 w-16" /></TableCell>
+                    <TableCell className="pr-6"><Skeleton className="ml-auto h-9 w-20" /></TableCell>
                   </TableRow>
                 ))
               ) : employees?.length === 0 ? (
                 <TableRow>
-                  <TableCell
-                    colSpan={7}
-                    className="text-center py-12 text-muted-foreground"
-                  >
-                    <UserCircle className="size-12 mx-auto mb-3 opacity-20" />
-                    No employee records found. Add a real employee to get started.
+                  <TableCell colSpan={7} className="py-12 text-center text-muted-foreground">
+                    <UserCircle className="mx-auto mb-3 size-12 opacity-20" />
+                    No employee records found. Add a real employee to start Python training.
                   </TableCell>
                 </TableRow>
               ) : (
-                employees?.map((emp) => (
-                  <TableRow key={emp.id} className="hover:bg-muted/30">
-                    <TableCell className="pl-6 font-medium text-foreground">
-                      {emp.name}
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">
-                      {emp.employeeCode}
-                    </TableCell>
-                    <TableCell>{emp.department}</TableCell>
-                    <TableCell>
-                      <Badge variant="outline" className="font-mono bg-background">
-                        {emp.rfidUid}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      {emp.faceDescriptor ? (
-                        typeof emp.faceDescriptor === "object" && emp.faceDescriptor && "version" in emp.faceDescriptor && emp.faceDescriptor.version === 3 ? (
-                          <Badge className="bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border-none">
-                            ML Enrolled
-                          </Badge>
+                employees?.map((employee) => {
+                  const pythonStatus = getPythonFaceStatus(employee.faceDescriptor);
+                  return (
+                    <TableRow key={employee.id} className="hover:bg-muted/30">
+                      <TableCell className="pl-6 font-medium text-foreground">{employee.name}</TableCell>
+                      <TableCell className="text-muted-foreground">{employee.employeeCode}</TableCell>
+                      <TableCell>{employee.department}</TableCell>
+                      <TableCell>
+                        <Badge variant="outline" className="font-mono bg-background">
+                          {employee.rfidUid}
+                        </Badge>
+                      </TableCell>
+                      <TableCell>
+                        {pythonStatus ? (
+                          <div className="space-y-1">
+                            <Badge
+                              variant="outline"
+                              className={
+                                pythonStatus.status === "trained"
+                                  ? "border-emerald-300 bg-emerald-50 text-emerald-700"
+                                  : pythonStatus.status === "training"
+                                    ? "border-sky-300 bg-sky-50 text-sky-700"
+                                    : "border-amber-300 bg-amber-50 text-amber-700"
+                              }
+                            >
+                              {pythonStatus.status === "trained"
+                                ? "Python Trained"
+                                : pythonStatus.status === "training"
+                                  ? "Training"
+                                  : "Needs Re-Capture"}
+                            </Badge>
+                            <p className="text-[11px] text-muted-foreground">
+                              {pythonStatus.datasetSampleCount} dataset photos
+                            </p>
+                          </div>
                         ) : (
-                          <Badge variant="outline" className="border-amber-300 bg-amber-50 text-amber-700">
-                            Legacy
-                          </Badge>
-                        )
-                      ) : (
-                        <span className="text-xs text-muted-foreground">Pending</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {emp.isActive ? (
-                        <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 rounded-full bg-emerald-500" />
-                          <span className="text-sm">Active</span>
+                          <span className="text-xs text-muted-foreground">Pending</span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        {employee.isActive ? (
+                          <div className="flex items-center gap-2">
+                            <div className="h-2 w-2 rounded-full bg-emerald-500" />
+                            <span className="text-sm">Active</span>
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2">
+                            <div className="h-2 w-2 rounded-full bg-muted-foreground" />
+                            <span className="text-sm text-muted-foreground">Inactive</span>
+                          </div>
+                        )}
+                      </TableCell>
+                      <TableCell className="pr-6">
+                        <div className="flex justify-end">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="text-destructive hover:text-destructive"
+                            disabled={deleteEmployee.isPending}
+                            onClick={() => handleDeleteEmployee(employee.id, employee.name)}
+                          >
+                            <Trash2 className="mr-2 size-4" />
+                            Delete
+                          </Button>
                         </div>
-                      ) : (
-                        <div className="flex items-center gap-2">
-                          <div className="w-2 h-2 rounded-full bg-muted-foreground" />
-                          <span className="text-sm text-muted-foreground">
-                            Inactive
-                          </span>
-                        </div>
-                      )}
-                    </TableCell>
-                    <TableCell className="pr-6">
-                      <div className="flex justify-end">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="text-destructive hover:text-destructive"
-                          disabled={deleteEmployee.isPending}
-                          onClick={() => handleDeleteEmployee(emp.id, emp.name)}
-                        >
-                          <Trash2 className="mr-2 size-4" />
-                          Delete
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))
+                      </TableCell>
+                    </TableRow>
+                  );
+                })
               )}
             </TableBody>
           </Table>

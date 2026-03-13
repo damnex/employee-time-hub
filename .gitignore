@@ -7,3 +7,8 @@ vite.config.ts.*
 .env
 .env.local
 .local/
+__pycache__/
+*.pyc
+python-ml/.venv/
+python-ml/dataset/
+python-ml/output/

@@ -1,0 +1,3 @@
+folder_name,employeeCode,name,department,rfidUid,email,phone,isActive
+EMP001,EMP001,Anita Sharma,Operations,04A1BC22,anita@example.com,+91-9000000001,true
+EMP002,EMP002,Rahul Kumar,Security,04A1BC23,rahul@example.com,+91-9000000002,true
