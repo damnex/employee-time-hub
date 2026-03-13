@@ -570,9 +570,16 @@ export default function Employees() {
                             </div>
                           </div>
                           {isCapturingDataset && (
-                            <div className="absolute inset-0 flex items-center justify-center bg-black/35 backdrop-blur-[2px]">
-                              <div className="rounded-2xl bg-black/70 px-4 py-3 text-center text-sm text-white">
+                            <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-black/40 backdrop-blur-[2px]">
+                              <div className="rounded-2xl bg-black/80 px-4 py-3 text-center text-sm font-medium text-white shadow-xl backdrop-blur-md">
                                 Capturing sample {captureProgress} / {datasetSamplesTarget}
+                              </div>
+                              <div className="rounded-2xl bg-primary/95 px-6 py-4 text-center text-xl font-bold text-primary-foreground shadow-2xl animate-in zoom-in duration-300">
+                                {captureProgress / datasetSamplesTarget < 0.2 && "Look straight at the camera"}
+                                {captureProgress / datasetSamplesTarget >= 0.2 && captureProgress / datasetSamplesTarget < 0.4 && "Turn head slightly left"}
+                                {captureProgress / datasetSamplesTarget >= 0.4 && captureProgress / datasetSamplesTarget < 0.6 && "Turn head slightly right"}
+                                {captureProgress / datasetSamplesTarget >= 0.6 && captureProgress / datasetSamplesTarget < 0.8 && "Tilt head slightly up"}
+                                {captureProgress / datasetSamplesTarget >= 0.8 && "Tilt head slightly down"}
                               </div>
                             </div>
                           )}
