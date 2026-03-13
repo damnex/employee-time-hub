@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { detectLiveTrackingFaces, isFaceDetectorAvailable } from "@/lib/biometrics";
 import { cn } from "@/lib/utils";
 import {
   AlertCircle,
@@ -35,22 +36,6 @@ import {
   WifiOff,
 } from "lucide-react";
 
-type BrowserDetectedFace = {
-  boundingBox: DOMRectReadOnly;
-};
-
-type BrowserFaceDetector = {
-  detect: (input: ImageBitmapSource) => Promise<BrowserDetectedFace[]>;
-};
-
-declare global {
-  interface Window {
-    FaceDetector?: new (options?: {
-      fastMode?: boolean;
-      maxDetectedFaces?: number;
-    }) => BrowserFaceDetector;
-  }
-}
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
 const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
@@ -58,6 +43,16 @@ const GATE_FRAME_COUNT = 4;
 const GATE_FRAME_DELAY_MS = 35;
 const GATE_MAX_FRAME_WIDTH = 640;
 const GATE_FRAME_JPEG_QUALITY = 0.68;
+const LIVE_TRACKING_INTERVAL_MS = 120;
+const LIVE_TRACKING_BUSY_INTERVAL_MS = 190;
+const LIVE_RECOGNITION_INTERVAL_MS = 650;
+const LIVE_RECOGNITION_IDLE_DELAY_MS = 260;
+const LIVE_RECOGNITION_MAX_FRAME_WIDTH = 480;
+const LIVE_RECOGNITION_JPEG_QUALITY = 0.56;
+const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.62;
+const LIVE_RECOGNITION_STABLE_HITS = 2;
+const LIVE_RECOGNITION_TTL_MS = 2200;
+const LIVE_RECOGNITION_MATCH_DISTANCE = 0.16;
 
 type PythonFaceStatus = "training" | "trained" | "failed";
 
@@ -107,6 +102,20 @@ type ProjectedLiveFace = {
 type LiveTrackedFace = ProjectedLiveFace & {
   trackId: number;
   movement: "LEFT" | "RIGHT" | "STEADY";
+  stableHits?: number;
+  lastSeenAt?: number;
+};
+
+type LiveRecognitionAssignment = {
+  trackId: number;
+  label: string;
+  employeeCode?: string;
+  department?: string;
+  rfidUid?: string;
+  confidence: number;
+  verified: true;
+  stableHits: number;
+  lastSeenAt: number;
 };
 
 type GateDisplayResult = {
@@ -188,14 +197,21 @@ function getPythonFaceMeta(faceDescriptor: unknown): PythonFaceMeta {
   };
 }
 
-function captureGateFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement) {
+function captureGateFrame(
+  video: HTMLVideoElement,
+  canvas: HTMLCanvasElement,
+  options: {
+    maxWidth?: number;
+    quality?: number;
+  } = {},
+) {
   const context = canvas.getContext("2d");
   if (!context || !video.videoWidth || !video.videoHeight) {
     return null;
   }
 
   const aspectRatio = video.videoHeight / video.videoWidth;
-  const targetWidth = Math.min(video.videoWidth, GATE_MAX_FRAME_WIDTH);
+  const targetWidth = Math.min(video.videoWidth, options.maxWidth ?? GATE_MAX_FRAME_WIDTH);
   const targetHeight = Math.round(targetWidth * aspectRatio);
 
   canvas.width = targetWidth;
@@ -204,7 +220,7 @@ function captureGateFrame(video: HTMLVideoElement, canvas: HTMLCanvasElement) {
   context.drawImage(video, 0, 0, targetWidth, targetHeight);
 
   return {
-    dataUrl: canvas.toDataURL("image/jpeg", GATE_FRAME_JPEG_QUALITY),
+    dataUrl: canvas.toDataURL("image/jpeg", options.quality ?? GATE_FRAME_JPEG_QUALITY),
     width: targetWidth,
     height: targetHeight,
   };
@@ -366,6 +382,70 @@ function buildTrackedFaces(
   return nextTrackedFaces;
 }
 
+function getProjectedFaceDistance(leftFace: ProjectedLiveFace, rightFace: ProjectedLiveFace) {
+  const dx = leftFace.centerX - rightFace.centerX;
+  const dy = leftFace.centerY - rightFace.centerY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function getProjectedFaceOverlap(leftFace: ProjectedLiveFace, rightFace: ProjectedLiveFace) {
+  const left = Math.max(leftFace.leftPct, rightFace.leftPct);
+  const top = Math.max(leftFace.topPct, rightFace.topPct);
+  const right = Math.min(leftFace.leftPct + leftFace.widthPct, rightFace.leftPct + rightFace.widthPct);
+  const bottom = Math.min(leftFace.topPct + leftFace.heightPct, rightFace.topPct + rightFace.heightPct);
+  const width = Math.max(0, right - left);
+  const height = Math.max(0, bottom - top);
+  const intersection = width * height;
+  const leftArea = leftFace.widthPct * leftFace.heightPct;
+  const rightArea = rightFace.widthPct * rightFace.heightPct;
+  return intersection / Math.max(1, Math.min(leftArea, rightArea));
+}
+
+function matchRecognizedFacesToTrackedFaces(
+  recognizedFaces: ProjectedLiveFace[],
+  trackedFaces: LiveTrackedFace[],
+) {
+  const usedTrackIds = new Set<number>();
+
+  return [...recognizedFaces]
+    .sort((left, right) => {
+      return (right.confidence ?? 0) - (left.confidence ?? 0);
+    })
+    .reduce<Array<{ trackId: number; face: ProjectedLiveFace }>>((matches, face) => {
+      let bestTrack: LiveTrackedFace | null = null;
+      let bestScore = Number.NEGATIVE_INFINITY;
+
+      for (const trackedFace of trackedFaces) {
+        if (usedTrackIds.has(trackedFace.trackId)) {
+          continue;
+        }
+
+        const overlap = getProjectedFaceOverlap(face, trackedFace);
+        const distance = getProjectedFaceDistance(face, trackedFace);
+        if (overlap < 0.12 && distance > LIVE_RECOGNITION_MATCH_DISTANCE) {
+          continue;
+        }
+
+        const score = overlap * 3 - distance;
+        if (score > bestScore) {
+          bestScore = score;
+          bestTrack = trackedFace;
+        }
+      }
+
+      if (!bestTrack) {
+        return matches;
+      }
+
+      usedTrackIds.add(bestTrack.trackId);
+      matches.push({
+        trackId: bestTrack.trackId,
+        face,
+      });
+      return matches;
+    }, []);
+}
+
 export default function GateTerminal() {
   const { data: employees } = useEmployees();
   const scanMutation = useScanRFID();
@@ -375,13 +455,13 @@ export default function GateTerminal() {
     clearResult,
   } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
   const cameraViewportRef = useRef<HTMLDivElement>(null);
-  const liveDetectorRef = useRef<BrowserFaceDetector | null>(null);
   const pythonPreviousLiveTracksRef = useRef<Array<{ trackId: number; centerX: number; centerY: number }>>([]);
   const pythonNextTrackIdRef = useRef(1);
   const pythonMissCountRef = useRef(0);
   const browserPreviousLiveTracksRef = useRef<Array<{ trackId: number; centerX: number; centerY: number }>>([]);
   const browserNextTrackIdRef = useRef(1);
   const browserMissCountRef = useRef(0);
+  const browserTrackedFacesRef = useRef<LiveTrackedFace[]>([]);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [rfidUid, setRfidUid] = useState("");
@@ -394,10 +474,10 @@ export default function GateTerminal() {
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [readerSourceDeviceId, setReaderSourceDeviceId] = useState<string | null>(null);
   const [liveTapUid, setLiveTapUid] = useState<string | null>(null);
-  const [liveNamedFaces, setLiveNamedFaces] = useState<LiveTrackedFace[]>([]);
+  const [pythonTrackedFaces, setPythonTrackedFaces] = useState<LiveTrackedFace[]>([]);
   const [browserTrackedFaces, setBrowserTrackedFaces] = useState<LiveTrackedFace[]>([]);
+  const [liveRecognitionAssignments, setLiveRecognitionAssignments] = useState<LiveRecognitionAssignment[]>([]);
   const [liveTrackerAvailable, setLiveTrackerAvailable] = useState<boolean | null>(null);
-  const [liveRecognitionMode, setLiveRecognitionMode] = useState<RecognitionSource | "none">("none");
   const [liveRecognitionMessage, setLiveRecognitionMessage] = useState<string | null>(null);
   const [pendingReaderScan, setPendingReaderScan] = useState<{
     rfidUid: string;
@@ -406,6 +486,7 @@ export default function GateTerminal() {
   const [lastResult, setLastResult] = useState<GateDisplayResult | null>(null);
 
   const busy = isCapturingFrames || scanMutation.isPending;
+  const busyRef = useRef(busy);
   const normalizedRfidUid = rfidUid.trim().toUpperCase();
   const selectedBadgeOwner = employees?.find((employee) => {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
@@ -420,28 +501,55 @@ export default function GateTerminal() {
   }).length;
   const lastTapDisplay = liveTapUid ?? (normalizedRfidUid || "--");
   const detectedFaceBoxStyle = getFaceBoxStyle(lastResult?.detectedFaceBox, lastResult?.previewFrameSize);
-  const liveTrackedFaces = liveRecognitionMode === "python" ? liveNamedFaces : browserTrackedFaces;
-  const liveMatchedCount = liveNamedFaces.filter((face) => face.verified).length;
+  const stableRecognitionAssignments = liveRecognitionAssignments.filter((assignment) => {
+    return Date.now() - assignment.lastSeenAt <= LIVE_RECOGNITION_TTL_MS
+      && assignment.stableHits >= LIVE_RECOGNITION_STABLE_HITS;
+  });
+  const recognitionByTrack = new Map<number, LiveRecognitionAssignment>(
+    stableRecognitionAssignments.map((assignment) => [assignment.trackId, assignment]),
+  );
+  const fusedBrowserTrackedFaces = browserTrackedFaces.map((face) => {
+    const recognition = recognitionByTrack.get(face.trackId);
+    if (!recognition) {
+      return face;
+    }
+
+    return {
+      ...face,
+      label: recognition.label,
+      verified: true,
+      confidence: recognition.confidence,
+      employeeCode: recognition.employeeCode,
+      department: recognition.department,
+      rfidUid: recognition.rfidUid,
+      source: "python" as const,
+      stableHits: recognition.stableHits,
+      lastSeenAt: recognition.lastSeenAt,
+    } satisfies LiveTrackedFace;
+  });
+  const liveTrackedFaces = liveTrackerAvailable === false ? pythonTrackedFaces : fusedBrowserTrackedFaces;
+  const liveMatchedCount = liveTrackerAvailable === false
+    ? pythonTrackedFaces.filter((face) => face.verified).length
+    : fusedBrowserTrackedFaces.filter((face) => face.verified || face.source === "python").length;
+  const liveRecognitionMode: RecognitionSource | "none" = liveTrackerAvailable === false
+    ? (pythonTrackedFaces.length ? "python" : "none")
+    : liveMatchedCount > 0
+      ? "python"
+      : browserTrackedFaces.length > 0
+        ? "browser"
+        : "none";
 
   useEffect(() => {
-    if (typeof window === "undefined" || !window.FaceDetector) {
-      liveDetectorRef.current = null;
-      setLiveTrackerAvailable(false);
-      return;
-    }
-
-    try {
-      liveDetectorRef.current = new window.FaceDetector({
-        fastMode: true,
-        maxDetectedFaces: 50,
-      });
-      setLiveTrackerAvailable(true);
-    } catch (error) {
-      console.warn("Live face tracker unavailable:", error);
-      liveDetectorRef.current = null;
-      setLiveTrackerAvailable(false);
-    }
+    setLiveTrackerAvailable(isFaceDetectorAvailable());
   }, []);
+
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
+    browserTrackedFacesRef.current = browserTrackedFaces;
+  }, [browserTrackedFaces]);
 
   useEffect(() => {
     let stream: MediaStream | null = null;
@@ -502,17 +610,19 @@ export default function GateTerminal() {
 
   useEffect(() => {
     if (!cameraActive || !videoRef.current || !canvasRef.current || !cameraViewportRef.current) {
-      setLiveNamedFaces([]);
+      setPythonTrackedFaces([]);
+      setLiveRecognitionAssignments([]);
       pythonPreviousLiveTracksRef.current = [];
       pythonMissCountRef.current = 0;
-      setLiveRecognitionMode(liveDetectorRef.current ? "browser" : "none");
       return;
     }
 
     let cancelled = false;
     let timerId: number | null = null;
 
-    const scheduleNext = (delayMs = busy ? 520 : 280) => {
+    const scheduleNext = (
+      delayMs = busyRef.current ? LIVE_RECOGNITION_INTERVAL_MS + 180 : LIVE_RECOGNITION_INTERVAL_MS,
+    ) => {
       if (cancelled) {
         return;
       }
@@ -522,10 +632,19 @@ export default function GateTerminal() {
       }, delayMs);
     };
 
+    const pruneAssignments = () => {
+      const now = Date.now();
+      setLiveRecognitionAssignments((previous) => {
+        return previous.filter((assignment) => now - assignment.lastSeenAt <= LIVE_RECOGNITION_TTL_MS);
+      });
+    };
+
     const recognizeFaces = async () => {
+      const hasBrowserTracker = liveTrackerAvailable !== false;
+      const trackedFacesBeforeRequest = hasBrowserTracker ? browserTrackedFacesRef.current : [];
+
       if (
         cancelled
-        || busy
         || !videoRef.current
         || !canvasRef.current
         || !cameraViewportRef.current
@@ -533,13 +652,27 @@ export default function GateTerminal() {
         || !videoRef.current.videoWidth
         || !videoRef.current.videoHeight
       ) {
-        scheduleNext(busy ? 420 : 180);
+        scheduleNext(LIVE_RECOGNITION_IDLE_DELAY_MS);
         return;
       }
 
-      const frame = captureGateFrame(videoRef.current, canvasRef.current);
+      if (busyRef.current) {
+        scheduleNext(LIVE_RECOGNITION_INTERVAL_MS + 180);
+        return;
+      }
+
+      if (hasBrowserTracker && !trackedFacesBeforeRequest.length) {
+        pruneAssignments();
+        scheduleNext(LIVE_RECOGNITION_IDLE_DELAY_MS);
+        return;
+      }
+
+      const frame = captureGateFrame(videoRef.current, canvasRef.current, {
+        maxWidth: LIVE_RECOGNITION_MAX_FRAME_WIDTH,
+        quality: LIVE_RECOGNITION_JPEG_QUALITY,
+      });
       if (!frame) {
-        scheduleNext(180);
+        scheduleNext(LIVE_RECOGNITION_IDLE_DELAY_MS);
         return;
       }
 
@@ -547,6 +680,9 @@ export default function GateTerminal() {
         const response = await fetchLiveFaceRecognition({
           deviceId: GATE_BROWSER_CLIENT_ID,
           frame: frame.dataUrl,
+          maxFaces: hasBrowserTracker
+            ? Math.min(Math.max(trackedFacesBeforeRequest.length + 2, 4), 50)
+            : 50,
         });
         if (cancelled || !cameraViewportRef.current) {
           return;
@@ -556,11 +692,11 @@ export default function GateTerminal() {
 
         if (!response.success) {
           pythonMissCountRef.current += 1;
-          if (pythonMissCountRef.current >= 3) {
-            setLiveNamedFaces([]);
+          pruneAssignments();
+          if (liveTrackerAvailable === false && pythonMissCountRef.current >= 3) {
+            setPythonTrackedFaces([]);
             pythonPreviousLiveTracksRef.current = [];
           }
-          setLiveRecognitionMode(liveDetectorRef.current ? "browser" : "none");
           scheduleNext(1200);
           return;
         }
@@ -570,6 +706,14 @@ export default function GateTerminal() {
           height: response.frameHeight ?? frame.height,
         };
         const projectedFaces = response.faces.reduce<ProjectedLiveFace[]>((result, face) => {
+          if (
+            !face.verified
+            || typeof face.confidence !== "number"
+            || face.confidence < LIVE_RECOGNITION_MIN_CONFIDENCE
+          ) {
+            return result;
+          }
+
           const projectedFace = mapFaceBoxToViewport(face.box, frameSize, cameraViewportRef.current!);
           if (!projectedFace) {
             return result;
@@ -577,8 +721,8 @@ export default function GateTerminal() {
 
           result.push({
             ...projectedFace,
-            label: face.verified ? face.label : "Unknown Face",
-            verified: face.verified,
+            label: face.label,
+            verified: true,
             confidence: face.confidence,
             employeeCode: face.employeeCode ?? undefined,
             department: face.department ?? undefined,
@@ -586,47 +730,82 @@ export default function GateTerminal() {
             source: "python",
           });
           return result;
-        }, []).sort((left, right) => left.centerX - right.centerX);
+        }, []).sort((left, right) => (right.confidence ?? 0) - (left.confidence ?? 0));
 
-        if (!projectedFaces.length) {
-          pythonMissCountRef.current += 1;
-          if (pythonMissCountRef.current >= 4) {
-            setLiveNamedFaces([]);
-            pythonPreviousLiveTracksRef.current = [];
+        if (!hasBrowserTracker) {
+          if (!projectedFaces.length) {
+            pythonMissCountRef.current += 1;
+            if (pythonMissCountRef.current >= 4) {
+              setPythonTrackedFaces([]);
+              pythonPreviousLiveTracksRef.current = [];
+            }
+            scheduleNext(LIVE_RECOGNITION_IDLE_DELAY_MS);
+            return;
           }
-          setLiveRecognitionMode(liveDetectorRef.current ? "browser" : "none");
-          scheduleNext(220);
+
+          pythonMissCountRef.current = 0;
+          setPythonTrackedFaces(
+            buildTrackedFaces(
+              projectedFaces,
+              pythonPreviousLiveTracksRef,
+              pythonNextTrackIdRef,
+            ),
+          );
+          scheduleNext();
           return;
         }
 
-        pythonMissCountRef.current = 0;
-        setLiveNamedFaces(
-          buildTrackedFaces(
-            projectedFaces,
-            pythonPreviousLiveTracksRef,
-            pythonNextTrackIdRef,
-          ),
-        );
-        setLiveRecognitionMode("python");
+        pythonMissCountRef.current = projectedFaces.length ? 0 : pythonMissCountRef.current + 1;
+
+        const trackedFacesForMatching = browserTrackedFacesRef.current;
+        setLiveRecognitionAssignments((previous) => {
+          const now = Date.now();
+          const previousByTrack = new Map(previous.map((assignment) => [assignment.trackId, assignment]));
+          const matchedFaces = matchRecognizedFacesToTrackedFaces(projectedFaces, trackedFacesForMatching);
+          const nextAssignments = matchedFaces.map((match) => {
+            const prior = previousByTrack.get(match.trackId);
+            const sameEmployee = prior?.label === match.face.label && prior?.employeeCode === match.face.employeeCode;
+            return {
+              trackId: match.trackId,
+              label: match.face.label,
+              employeeCode: match.face.employeeCode,
+              department: match.face.department,
+              rfidUid: match.face.rfidUid,
+              confidence: match.face.confidence ?? 0,
+              verified: true as const,
+              stableHits: sameEmployee ? Math.min((prior?.stableHits ?? 0) + 1, LIVE_RECOGNITION_STABLE_HITS + 4) : 1,
+              lastSeenAt: now,
+            } satisfies LiveRecognitionAssignment;
+          });
+          const matchedTrackIds = new Set(nextAssignments.map((assignment) => assignment.trackId));
+          const preservedAssignments = previous.filter((assignment) => {
+            return !matchedTrackIds.has(assignment.trackId)
+              && now - assignment.lastSeenAt <= LIVE_RECOGNITION_TTL_MS;
+          });
+          return [...nextAssignments, ...preservedAssignments];
+        });
+
+        scheduleNext(projectedFaces.length ? LIVE_RECOGNITION_INTERVAL_MS : LIVE_RECOGNITION_IDLE_DELAY_MS);
       } catch (error) {
         console.warn("Live Python recognition failed:", error);
         pythonMissCountRef.current += 1;
-        if (pythonMissCountRef.current >= 3) {
-          setLiveNamedFaces([]);
+        pruneAssignments();
+        if (liveTrackerAvailable === false && pythonMissCountRef.current >= 3) {
+          setPythonTrackedFaces([]);
           pythonPreviousLiveTracksRef.current = [];
         }
-        setLiveRecognitionMode(liveDetectorRef.current ? "browser" : "none");
         setLiveRecognitionMessage(
           error instanceof Error
             ? error.message
             : "Live recognition is temporarily unavailable.",
         );
-        scheduleNext(900);
-        return;
+        scheduleNext(1100);
       }
-
-      scheduleNext();
     };
+
+    if (liveTrackerAvailable !== false) {
+      setPythonTrackedFaces([]);
+    }
 
     void recognizeFaces();
 
@@ -635,36 +814,41 @@ export default function GateTerminal() {
       if (timerId !== null) {
         window.clearTimeout(timerId);
       }
-      setLiveNamedFaces([]);
-      pythonPreviousLiveTracksRef.current = [];
-      pythonMissCountRef.current = 0;
+      if (liveTrackerAvailable === false) {
+        setPythonTrackedFaces([]);
+        pythonPreviousLiveTracksRef.current = [];
+        pythonMissCountRef.current = 0;
+      }
     };
-  }, [busy, cameraActive]);
+  }, [cameraActive, liveTrackerAvailable]);
 
   useEffect(() => {
     if (
       !cameraActive
       || !videoRef.current
       || !cameraViewportRef.current
-      || !liveDetectorRef.current
-      || liveRecognitionMode === "python"
+      || liveTrackerAvailable === false
     ) {
       setBrowserTrackedFaces([]);
+      browserTrackedFacesRef.current = [];
       browserPreviousLiveTracksRef.current = [];
+      browserMissCountRef.current = 0;
       return;
     }
 
     let cancelled = false;
     let timerId: number | null = null;
 
-    const scheduleNext = () => {
+    const scheduleNext = (
+      delayMs = busyRef.current ? LIVE_TRACKING_BUSY_INTERVAL_MS : LIVE_TRACKING_INTERVAL_MS,
+    ) => {
       if (cancelled) {
         return;
       }
 
       timerId = window.setTimeout(() => {
         void detectFaces();
-      }, busy ? 220 : 140);
+      }, delayMs);
     };
 
     const detectFaces = async () => {
@@ -672,31 +856,32 @@ export default function GateTerminal() {
         cancelled
         || !videoRef.current
         || !cameraViewportRef.current
-        || !liveDetectorRef.current
         || videoRef.current.readyState < 2
         || !videoRef.current.videoWidth
         || !videoRef.current.videoHeight
       ) {
-        scheduleNext();
+        scheduleNext(LIVE_TRACKING_INTERVAL_MS);
         return;
       }
 
-      let detectionBitmap: ImageBitmap | null = null;
-
       try {
-        const detectionSource: ImageBitmapSource = typeof createImageBitmap === "function"
-          ? (detectionBitmap = await createImageBitmap(videoRef.current))
-          : videoRef.current;
-        const detections = await liveDetectorRef.current.detect(detectionSource);
-        detectionBitmap?.close();
-        detectionBitmap = null;
-
+        const detections = await detectLiveTrackingFaces(videoRef.current, {
+          maxDetected: Math.min(Math.max(browserTrackedFacesRef.current.length + 6, 12), 50),
+        });
         if (cancelled || !videoRef.current || !cameraViewportRef.current) {
           return;
         }
 
         const projectedFaces = detections.reduce<ProjectedLiveFace[]>((result, detection) => {
-          const projectedFace = mapBoundingBoxToViewport(detection.boundingBox, videoRef.current!, cameraViewportRef.current!);
+          const projectedFace = mapRectToViewport(
+            detection.bounds.x,
+            detection.bounds.y,
+            detection.bounds.width,
+            detection.bounds.height,
+            videoRef.current!.videoWidth,
+            videoRef.current!.videoHeight,
+            cameraViewportRef.current!,
+          );
           if (!projectedFace) {
             return result;
           }
@@ -705,6 +890,7 @@ export default function GateTerminal() {
             ...projectedFace,
             label: "Tracking Face",
             verified: false,
+            confidence: detection.faceScore,
             source: "browser",
           });
           return result;
@@ -714,6 +900,7 @@ export default function GateTerminal() {
           browserMissCountRef.current += 1;
           if (browserMissCountRef.current >= 6) {
             setBrowserTrackedFaces([]);
+            browserTrackedFacesRef.current = [];
             browserPreviousLiveTracksRef.current = [];
           }
           scheduleNext();
@@ -721,19 +908,19 @@ export default function GateTerminal() {
         }
 
         browserMissCountRef.current = 0;
-        setBrowserTrackedFaces(
-          buildTrackedFaces(
-            projectedFaces,
-            browserPreviousLiveTracksRef,
-            browserNextTrackIdRef,
-          ),
+        const nextTrackedFaces = buildTrackedFaces(
+          projectedFaces,
+          browserPreviousLiveTracksRef,
+          browserNextTrackIdRef,
         );
+        browserTrackedFacesRef.current = nextTrackedFaces;
+        setBrowserTrackedFaces(nextTrackedFaces);
       } catch (error) {
-        detectionBitmap?.close();
-        console.warn("Browser fallback face tracking failed:", error);
+        console.warn("Live motion tracker failed:", error);
         browserMissCountRef.current += 1;
         if (browserMissCountRef.current >= 4) {
           setBrowserTrackedFaces([]);
+          browserTrackedFacesRef.current = [];
           browserPreviousLiveTracksRef.current = [];
         }
       }
@@ -749,10 +936,11 @@ export default function GateTerminal() {
         window.clearTimeout(timerId);
       }
       setBrowserTrackedFaces([]);
+      browserTrackedFacesRef.current = [];
       browserPreviousLiveTracksRef.current = [];
       browserMissCountRef.current = 0;
     };
-  }, [busy, cameraActive, liveRecognitionMode]);
+  }, [cameraActive, liveTrackerAvailable]);
 
   const captureFrameBurst = useCallback(async () => {
     if (!videoRef.current || !canvasRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
@@ -1047,14 +1235,12 @@ export default function GateTerminal() {
                 )} />
                 {liveTrackedFaces.map((face) => (
                   <div
-                    key={`${face.source}-${face.trackId}`}
+                    key={`track-${face.trackId}`}
                     className={cn(
-                      "absolute rounded-[1.35rem] border-[3px] shadow-[0_0_0_1px_rgba(255,255,255,0.18),0_0_22px_rgba(15,23,42,0.14)]",
-                      face.source === "browser"
-                        ? "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.45),0_0_22px_rgba(34,211,238,0.18)]"
-                        : face.verified
-                          ? "border-emerald-300 shadow-[0_0_0_1px_rgba(110,231,183,0.45),0_0_22px_rgba(16,185,129,0.18)]"
-                          : "border-amber-300 shadow-[0_0_0_1px_rgba(252,211,77,0.45),0_0_22px_rgba(245,158,11,0.2)]",
+                      "absolute rounded-[1.35rem] border-[3px] shadow-[0_0_0_1px_rgba(255,255,255,0.18),0_0_22px_rgba(15,23,42,0.14)] transition-all duration-150",
+                      face.verified || face.source === "python"
+                        ? "border-emerald-300 shadow-[0_0_0_1px_rgba(110,231,183,0.5),0_0_24px_rgba(16,185,129,0.2)]"
+                        : "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.45),0_0_22px_rgba(34,211,238,0.18)]",
                     )}
                     style={{
                       left: `${face.leftPct}%`,
@@ -1063,15 +1249,19 @@ export default function GateTerminal() {
                       height: `${face.heightPct}%`,
                     }}
                   >
-                    <div className="absolute left-0 top-0 max-w-[calc(100%+5rem)] -translate-y-[calc(100%+0.42rem)] rounded-full bg-black/80 px-3 py-1 text-[10px] font-semibold tracking-[0.12em] text-white shadow-lg">
-                      {face.source === "python"
+                    <div className="absolute left-0 top-0 max-w-[calc(100%+7rem)] -translate-y-[calc(100%+0.42rem)] rounded-full bg-black/80 px-3 py-1 text-[10px] font-semibold tracking-[0.12em] text-white shadow-lg">
+                      {face.verified || face.source === "python"
                         ? `${face.label}${face.employeeCode ? ` ${face.employeeCode}` : ""} ${face.movement}${typeof face.confidence === "number" ? ` ${formatPercent(face.confidence)}` : ""}`
                         : `TRACK ${String(face.trackId).padStart(2, "0")} ${face.movement}`}
                     </div>
                   </div>
                 ))}
                 <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
-                  {liveRecognitionMode === "python" ? "PYTHON LIVE RECOGNITION" : "LIVE FACE TRACKER"}
+                  {liveRecognitionMode === "python"
+                    ? "FAST TRACKER + PYTHON NAMES"
+                    : liveTrackerAvailable === false
+                      ? "PYTHON LIVE RECOGNITION"
+                      : "FAST LIVE FACE TRACKER"}
                 </div>
                 <div className="absolute inset-x-[28%] top-1/2 h-px -translate-y-1/2 bg-gradient-to-r from-transparent via-cyan-200/80 to-transparent" />
                 <div className="absolute left-1/2 inset-y-[16%] w-px -translate-x-1/2 bg-gradient-to-b from-transparent via-white/35 to-transparent" />
@@ -1103,11 +1293,11 @@ export default function GateTerminal() {
               </div>
               <Progress value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0} />
               <p className="text-xs text-muted-foreground">
-                {liveRecognitionMode === "python"
-                  ? `${liveRecognitionMessage ?? "Python live recognition ready."} Visible faces: ${liveTrackedFaces.length}. Matched employees: ${liveMatchedCount}.`
-                  : liveTrackerAvailable === false
-                    ? (liveRecognitionMessage ?? "Live multi-face tracker is not available in this browser. The Python scan still works on badge tap.")
-                    : `${liveRecognitionMessage ?? "Python live recognition is warming up. Browser fallback tracking is active."} Visible tracks: ${liveTrackedFaces.length}.`}
+                {liveTrackerAvailable === false
+                  ? `${liveRecognitionMessage ?? "Python live recognition is active."} Visible faces: ${liveTrackedFaces.length}. Stable name tags: ${liveMatchedCount}.`
+                  : liveRecognitionMode === "python"
+                    ? `${liveRecognitionMessage ?? "Fast local tracking and Python naming are both active."} Visible tracks: ${browserTrackedFaces.length}. Stable name tags: ${liveMatchedCount}.`
+                    : `${liveRecognitionMessage ?? "Fast local tracking is active while Python samples lower-resolution frames for stable names."} Visible tracks: ${browserTrackedFaces.length}. Stable name tags: ${liveMatchedCount}.`}
               </p>
             </div>
 
@@ -1441,10 +1631,4 @@ export default function GateTerminal() {
     </div>
   );
 }
-
-
-
-
-
-
 

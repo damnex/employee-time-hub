@@ -1755,7 +1755,7 @@ export async function registerRoutes(
         });
       }
 
-      const recognition = await recognizeLiveFrameWithPython(input.frame);
+      const recognition = await recognizeLiveFrameWithPython(input.frame, input.maxFaces ?? 50);
       const faces = recognition.faces.map((face) => ({
         label: face.verified ? face.label : "Unknown Face",
         employeeCode: face.verified ? face.employeeCode ?? undefined : undefined,
@@ -1814,4 +1814,5 @@ export async function registerRoutes(
 
   return httpServer;
 }
+
 

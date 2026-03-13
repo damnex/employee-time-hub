@@ -548,12 +548,13 @@ export async function verifyGateFramesWithPython(faceFrames: string[]) {
   return await pythonFaceWorker.verifyBurst(faceFrames);
 }
 
-export async function recognizeLiveFrameWithPython(frame: string) {
+export async function recognizeLiveFrameWithPython(frame: string, maxFaces = 50) {
   if (!frame.trim()) {
     throw new Error("Live recognition frame was not captured.");
   }
 
-  return await pythonFaceWorker.recognizeFrame(frame, 50);
+  return await pythonFaceWorker.recognizeFrame(frame, maxFaces);
 }
+
 
 

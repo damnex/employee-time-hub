@@ -197,6 +197,7 @@ export const api = {
       input: z.object({
         deviceId: z.string().trim().min(1),
         frame: z.string().trim().min(1),
+        maxFaces: z.number().int().min(1).max(50).optional(),
       }),
       responses: {
         200: z.object({
@@ -233,5 +234,4 @@ export function buildUrl(path: string, params?: Record<string, string | number>)
   }
   return url;
 }
-
 

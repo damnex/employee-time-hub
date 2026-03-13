@@ -331,7 +331,7 @@ const MULTI_FACE_TRACKING_CONFIG: Partial<Config> = {
       skipTime: 0,
     },
     mesh: {
-      enabled: true,
+      enabled: false,
       skipFrames: 0,
       skipTime: 0,
       keepInvalid: false,
