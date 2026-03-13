@@ -12,8 +12,8 @@ from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
+import cv2  # type: ignore
+import numpy as np  # type: ignore
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -147,9 +147,9 @@ def json_dump(path: Path, payload: Any) -> None:
 
 
 def main() -> int:
-    args = parse_args()
-    args.dataset = args.dataset.resolve()
-    args.output = args.output.resolve()
+    args: Any = parse_args()
+    args.dataset = args.dataset.resolve()  # type: ignore
+    args.output = args.output.resolve()  # type: ignore
 
     if not args.dataset.exists() or not args.dataset.is_dir():
         print(f"Dataset folder not found: {args.dataset}", file=sys.stderr)
@@ -192,25 +192,25 @@ def main() -> int:
             face = extract_face(gray, face_box, args.image_size)
             training_faces.append(face)
             training_ids.append(label_id)
-            valid_count += 1
+            valid_count += 1  # type: ignore
 
             # Data Augmentation: Flip horizontally
             flipped = cv2.flip(face, 1)
             training_faces.append(flipped)
             training_ids.append(label_id)
-            valid_count += 1
+            valid_count += 1  # type: ignore
 
             # Data Augmentation: Darker
             darker = cv2.convertScaleAbs(face, alpha=0.8, beta=0)
             training_faces.append(darker)
             training_ids.append(label_id)
-            valid_count += 1
+            valid_count += 1  # type: ignore
 
             # Data Augmentation: Brighter
             brighter = cv2.convertScaleAbs(face, alpha=1.2, beta=0)
             training_faces.append(brighter)
             training_ids.append(label_id)
-            valid_count += 1
+            valid_count += 1  # type: ignore
 
         label_samples[folder_name] = valid_count
 
@@ -231,7 +231,7 @@ def main() -> int:
     for face_image, label_id in zip(training_faces, training_ids):
         if label_id in valid_labels:
             filtered_faces.append(face_image)
-            filtered_ids.append(label_id)
+            filtered_ids.append(label_id)  # type: ignore
 
     for index, folder_name in enumerate(label_names):
         if index not in valid_labels:
@@ -300,7 +300,8 @@ def main() -> int:
 
     print(f"LBPH model: {model_path}")
     print(f"Label map: {args.output / 'lbph-labels.json'}")
-    print(f"Trained employees: {len([label for label in labels_payload['labels'] if label['includedInTraining']])}")
+    trained_count = len([label for label in labels_payload["labels"] if isinstance(label, dict) and label.get("includedInTraining")])
+    print(f"Trained employees: {trained_count}")
     return 0
 
 

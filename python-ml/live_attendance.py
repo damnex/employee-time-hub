@@ -409,7 +409,7 @@ def update_session_attendance(
         return
 
     existing.last_seen_at = timestamp_iso
-    existing.times_marked += 1
+    existing.times_marked = existing.times_marked + 1
 
 
 def save_snapshot(frame: np.ndarray, snapshot_dir: Path, timestamp_token: str, label: str) -> None:
@@ -503,7 +503,7 @@ def write_session_summary(
 
 
 def main() -> int:
-    args: Any = parse_args()
+    args = parse_args()
     profiles = load_profiles(args.profiles)
     if not profiles:
         print("No valid profiles were loaded. Train first and check output/profiles.json.", file=sys.stderr)
@@ -526,12 +526,12 @@ def main() -> int:
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.camera_width)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.camera_height)
 
-    frame_counter: int = 0
-    consecutive_hits: dict[str, int] = {}
-    logged_once: set[str] = set()
-    last_logged_at: dict[str, float] = {}
-    session_attendance: dict[str, SessionAttendance] = {}
-    latest_detections: list[DetectionResult] = []
+    frame_counter = 0
+    consecutive_hits = {}
+    logged_once = set()
+    last_logged_at = {}
+    session_attendance = {}
+    latest_detections = []
     status_message = "Show your face to the laptop webcam. Press Q to quit."
     session_started_at = datetime.now(UTC).isoformat()
 
@@ -540,13 +540,13 @@ def main() -> int:
             ok, frame = capture.read()
             if not ok:
                 status_message = "Frame read failed. Check the webcam or RTSP source."
-            if getattr(args, "no_display", False):
-                print(status_message, file=sys.stderr)
-                break
+                if getattr(args, "no_display", False):
+                    print(status_message, file=sys.stderr)
+                    break
                 time.sleep(0.1)
                 continue
 
-            frame_counter += 1
+            frame_counter += 1  # type: ignore
             if frame_counter % max(1, getattr(args, "process_every_nth_frame", 3)) == 0:
                 latest_detections = recognize_frame(frame, profiles, args)
                 current_labels = {
@@ -568,7 +568,7 @@ def main() -> int:
                     label = match.profile.folder_name
                     consecutive_hits[label] = consecutive_hits.get(label, 0) + 1
                     min_req = max(1, int(getattr(args, "min_consecutive_detections", 2)))
-                    if consecutive_hits[label] < min_req:
+                    if consecutive_hits.get(label, 0) < min_req:
                         continue
                     if not should_mark_attendance(
                         label,

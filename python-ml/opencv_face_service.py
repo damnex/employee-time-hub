@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import cv2
-import numpy as np
+import cv2  # type: ignore
+import numpy as np  # type: ignore
 
 DATA_URL_PATTERN = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$")
 
@@ -66,7 +66,7 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
 
 
 def round_float(value: float, digits: int = 4) -> float:
-    return round(float(value), digits)
+    return float(np.round(value, digits))
 
 
 def create_detector() -> cv2.CascadeClassifier:
@@ -252,8 +252,8 @@ def infer_direction(
         return "UNKNOWN", "none", 0.0
 
     window_size = min(2, len(movement_points) // 2)
-    start_points = movement_points[:window_size]
-    end_points = movement_points[-window_size:]
+    start_points = movement_points[:window_size]  # type: ignore
+    end_points = movement_points[-window_size:]  # type: ignore
     start_center_x = float(np.mean([point.center_x for point in start_points]))
     end_center_x = float(np.mean([point.center_x for point in end_points]))
     start_area = float(np.mean([point.area_ratio for point in start_points]))
@@ -262,11 +262,11 @@ def infer_direction(
     depth_delta = end_area - start_area
 
     horizontal_steps = [
-        movement_points[index + 1].center_x - movement_points[index].center_x
+        (movement_points[index + 1].center_x or 0.0) - (movement_points[index].center_x or 0.0)
         for index in range(len(movement_points) - 1)
     ]
     depth_steps = [
-        movement_points[index + 1].area_ratio - movement_points[index].area_ratio
+        (movement_points[index + 1].area_ratio or 0.0) - (movement_points[index].area_ratio or 0.0)
         for index in range(len(movement_points) - 1)
     ]
     horizontal_consistency = (
@@ -334,24 +334,27 @@ def build_response(
             "bestBox": None,
         }
 
-    vote_counts = Counter(prediction.label.folder_name for prediction in verified_predictions if prediction.label is not None)
+    vote_counts = Counter(prediction.label.folder_name for prediction in verified_predictions if prediction.label is not None)  # type: ignore
     best_folder_name = vote_counts.most_common(1)[0][0]
     chosen_predictions = [
-        prediction for prediction in verified_predictions if prediction.label and prediction.label.folder_name == best_folder_name
+        prediction for prediction in verified_predictions if prediction.label and prediction.label.folder_name == best_folder_name  # type: ignore
     ]
     best_prediction = min(chosen_predictions, key=lambda prediction: prediction.distance or float("inf"))
     average_distance = float(np.mean([prediction.distance for prediction in chosen_predictions if prediction.distance is not None]))
     match_confidence = clamp(1.0 - (average_distance / max(distance_threshold, 1.0)), 0.0, 1.0)
 
+    best_employee = best_prediction.label
+    best_box = best_prediction.box
+
     return {
         "verified": True,
         "employee": {
-            "folderName": best_prediction.label.folder_name,
-            "displayName": best_prediction.label.display_name,
-            "employeeCode": best_prediction.label.employee_code,
-            "department": best_prediction.label.department,
-            "rfidUid": best_prediction.label.rfid_uid,
-            "sampleCount": best_prediction.label.sample_count,
+            "folderName": best_employee.folder_name,  # type: ignore
+            "displayName": best_employee.display_name,  # type: ignore
+            "employeeCode": best_employee.employee_code,  # type: ignore
+            "department": best_employee.department,  # type: ignore
+            "rfidUid": best_employee.rfid_uid,  # type: ignore
+            "sampleCount": best_employee.sample_count,  # type: ignore
         },
         "matchConfidence": round_float(match_confidence),
         "bestDistance": round_float(best_prediction.distance or average_distance, 3),
@@ -362,11 +365,11 @@ def build_response(
         "framesProcessed": len(predictions),
         "framesWithFace": len([prediction for prediction in predictions if prediction.box is not None]),
         "bestBox": {
-            "top": best_prediction.box[0],
-            "right": best_prediction.box[1],
-            "bottom": best_prediction.box[2],
-            "left": best_prediction.box[3],
-        } if best_prediction.box is not None else None,
+            "top": best_box[0],
+            "right": best_box[1],
+            "bottom": best_box[2],
+            "left": best_box[3],
+        } if best_box is not None else None,
     }
 
 
@@ -409,7 +412,7 @@ def handle_recognize_frame(
     if not isinstance(frame_payload, str) or not frame_payload.strip():
         raise ValueError("No frame was provided for live recognition.")
 
-    image = decode_frame(frame_payload)
+    image = decode_frame(str(frame_payload))
     frame_height, frame_width = image.shape[:2]
     working_frame, scale_factor = resize_frame(image, args.resize_width)
     gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
@@ -418,7 +421,7 @@ def handle_recognize_frame(
     max_faces = int(request.get("maxFaces", 50) or 50)
 
     recognized_faces: list[LiveRecognitionFace] = []
-    for face_box in detected_faces[: max(1, min(max_faces, 50))]:
+    for face_box in detected_faces[: max(1, min(max_faces, 50))]:  # type: ignore
         scaled_box = scale_box(face_box, scale_factor)
         prediction = predict_face_box(
             gray_frame,
@@ -431,7 +434,7 @@ def handle_recognize_frame(
         if prediction.box is None:
             continue
 
-        distance = float(prediction.distance) if prediction.distance is not None else None
+        distance: float | None = float(prediction.distance) if prediction.distance is not None else None  # type: ignore
         confidence = (
             clamp(1.0 - (distance / max(distance_threshold, 1.0)), 0.0, 1.0)
             if distance is not None
@@ -441,7 +444,7 @@ def handle_recognize_frame(
             LiveRecognitionFace(
                 label=prediction.label,
                 distance=distance,
-                box=prediction.box,
+                box=prediction.box,  # type: ignore
                 confidence=confidence,
                 verified=prediction.label is not None,
             )
@@ -450,13 +453,13 @@ def handle_recognize_frame(
     return {
         "faces": [
             {
-                "label": face.label.display_name if face.label is not None else "Unknown Face",
-                "employeeCode": face.label.employee_code if face.label is not None else None,
-                "department": face.label.department if face.label is not None else None,
-                "rfidUid": face.label.rfid_uid if face.label is not None else None,
+                "label": face.label.display_name if face.label is not None else "Unknown Face",  # type: ignore
+                "employeeCode": face.label.employee_code if face.label is not None else None,  # type: ignore
+                "department": face.label.department if face.label is not None else None,  # type: ignore
+                "rfidUid": face.label.rfid_uid if face.label is not None else None,  # type: ignore
                 "verified": face.verified,
                 "confidence": round_float(face.confidence),
-                "distance": round_float(face.distance, 3) if face.distance is not None else None,
+                "distance": round_float(face.distance, 3) if face.distance is not None else None,  # type: ignore
                 "box": {
                     "top": face.box[0],
                     "right": face.box[1],
