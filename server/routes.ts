@@ -1632,6 +1632,34 @@ export async function registerRoutes(
     }
   });
 
+  app.get("/api/employees/:id/photo/meta", async (req, res) => {
+    const employeeId = Number(req.params.id);
+    if (!Number.isFinite(employeeId)) {
+      return res.status(400).json({ message: "Invalid employee id" });
+    }
+
+    const employee = await storage.getEmployee(employeeId);
+    if (!employee) {
+      return res.status(404).json({ message: "Employee not found" });
+    }
+
+    const pythonMeta = readPythonFaceDescriptorMeta(employee.faceDescriptor);
+    const folderName = pythonMeta?.folderName;
+    if (!folderName) {
+      return res.json({ hasProfilePhoto: false });
+    }
+
+    const datasetDir = path.join(PYTHON_DATASET_ROOT, folderName);
+    try {
+      const entries = await fs.readdir(datasetDir, { withFileTypes: true });
+      const profile = entries.find((entry) => entry.isFile() && /^profile\.(jpe?g|png)$/i.test(entry.name));
+      return res.json({ hasProfilePhoto: Boolean(profile) });
+    } catch (error) {
+      console.warn("[employee-photo-meta] Unable to read dataset folder:", error);
+      return res.json({ hasProfilePhoto: false });
+    }
+  });
+
   app.post(api.employees.enrollPython.path, async (req, res) => {
     try {
       const input = api.employees.enrollPython.input.parse(req.body);

@@ -493,8 +493,10 @@ export default function GateTerminal() {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const latestEmployee = lastResult?.employee ?? lastResult?.badgeOwner ?? selectedBadgeOwner;
-  const latestProfileImage = lastResult?.previewImage
-    ?? (latestEmployee ? `/api/employees/${latestEmployee.id}/photo` : null);
+  const [hasProfilePhoto, setHasProfilePhoto] = useState<boolean | null>(null);
+  const latestProfileImage = hasProfilePhoto
+    ? (latestEmployee ? `/api/employees/${latestEmployee.id}/photo` : null)
+    : (lastResult?.previewImage ?? (latestEmployee ? `/api/employees/${latestEmployee.id}/photo` : null));
   const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
   const pythonRosterCount = (employees ?? []).filter((employee) => {
     return Boolean(getPythonFaceMeta(employee.faceDescriptor));
@@ -545,6 +547,37 @@ export default function GateTerminal() {
   useEffect(() => {
     setLiveTrackerAvailable(isFaceDetectorAvailable());
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!latestEmployee?.id) {
+      setHasProfilePhoto(null);
+      return;
+    }
+
+    const loadMeta = async () => {
+      try {
+        const res = await fetch(`/api/employees/${latestEmployee.id}/photo/meta`, { credentials: "include" });
+        if (!res.ok) {
+          throw new Error("meta fetch failed");
+        }
+        const data = await res.json();
+        if (!cancelled) {
+          setHasProfilePhoto(Boolean(data?.hasProfilePhoto));
+        }
+      } catch {
+        if (!cancelled) {
+          setHasProfilePhoto(false);
+        }
+      }
+    };
+
+    void loadMeta();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [latestEmployee?.id]);
 
   useEffect(() => {
     busyRef.current = busy;
