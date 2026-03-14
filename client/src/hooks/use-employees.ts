@@ -100,6 +100,47 @@ export function usePythonEnrollEmployee() {
   });
 }
 
+export function useUpdateEmployee() {
+  const queryClient = useQueryClient();
+  const { toast } = useToast();
+
+  return useMutation({
+    mutationFn: async (args: { id: number; data: Partial<InsertEmployee> & { profilePhoto?: string } }) => {
+      const validated = api.employees.update.input.parse(args.data);
+      const res = await fetch(buildUrl(api.employees.update.path, { id: args.id }), {
+        method: api.employees.update.method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(validated),
+        credentials: "include",
+      });
+
+      const resData = await res.json();
+
+      if (!res.ok) {
+        if (res.status === 400) {
+          const error = api.employees.update.responses[400].parse(resData);
+          throw new Error(error.message || "Validation failed");
+        }
+        if (res.status === 404) {
+          const error = api.employees.update.responses[404].parse(resData);
+          throw new Error(error.message || "Employee not found");
+        }
+        throw new Error("Failed to update employee");
+      }
+
+      return api.employees.update.responses[200].parse(resData);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: [api.employees.list.path] });
+      queryClient.invalidateQueries({ queryKey: [api.stats.dashboard.path] });
+      toast({ title: "Updated", description: "Employee details saved." });
+    },
+    onError: (error: Error) => {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    },
+  });
+}
+
 export function useDeleteEmployee() {
   const queryClient = useQueryClient();
   const { toast } = useToast();

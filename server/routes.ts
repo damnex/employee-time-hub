@@ -660,6 +660,30 @@ async function processPythonRfidScan(args: {
 }) {
   const { input, employee, now, todayDate, logAndReturn } = args;
 
+  async function salvageBadgeOwnerFromFrames(faceFrames: string[], targetEmployee: Employee) {
+    let bestFace: Awaited<ReturnType<typeof recognizeLiveFrameWithPython>>["faces"][number] | null = null;
+    let bestFrameSize: { width: number; height: number } | null = null;
+    for (const frame of faceFrames) {
+      try {
+        const recognition = await recognizeLiveFrameWithPython(frame, 12);
+        recognition.faces.forEach((face) => {
+          const code = face.employeeCode?.trim();
+          if (!face.verified || !code || code !== targetEmployee.employeeCode) return;
+          if (!bestFace || (face.confidence ?? 0) > (bestFace.confidence ?? 0)) {
+            bestFace = face;
+            bestFrameSize = { width: recognition.frameWidth, height: recognition.frameHeight };
+          }
+        });
+        if (bestFace && (bestFace.confidence ?? 0) >= 0.65) {
+          break;
+        }
+      } catch (err) {
+        console.warn("Salvage frame recognition failed:", err);
+      }
+    }
+    return { face: bestFace, frameSize: bestFrameSize };
+  }
+
   if (!input.faceFrames?.length) {
     const attendance = await createFailureAttendance(
       employee.id,
@@ -712,12 +736,65 @@ async function processPythonRfidScan(args: {
       ?? (verification.framesWithFace ? "Unknown Face" : undefined);
     const detectedFaceBox = verification.bestBox ?? null;
 
+    let matchedEmployeeCode = verification.employee?.employeeCode?.trim();
+    let matchedRfidUid = verification.employee?.rfidUid?.trim().toUpperCase();
+    let matchesBadgeOwner = Boolean(
+      (matchedEmployeeCode && matchedEmployeeCode === employee.employeeCode)
+      || (matchedRfidUid && matchedRfidUid === employee.rfidUid.toUpperCase()),
+    );
+
+    // Salvage multi-face scenes: re-run recognition across all frames and prefer the badge owner.
+    if (!matchesBadgeOwner && input.faceFrames.length) {
+      const { face: salvageFace, frameSize } = await salvageBadgeOwnerFromFrames(input.faceFrames, employee);
+      if (salvageFace) {
+        const goodConfidence = (salvageFace.confidence ?? 0) >= 0.42;
+        const goodDistance = salvageFace.distance !== null && verification.distanceThreshold
+          ? salvageFace.distance <= verification.distanceThreshold * 1.15
+          : false;
+        if (goodConfidence || goodDistance) {
+        matchesBadgeOwner = true;
+        matchedEmployeeCode = employee.employeeCode;
+        matchedRfidUid = employee.rfidUid.toUpperCase();
+        verification.verified = true;
+        verification.employee = {
+          folderName: salvageFace.label,
+          displayName: employee.name,
+          employeeCode: employee.employeeCode,
+          department: employee.department,
+          rfidUid: employee.rfidUid,
+          sampleCount: verification.employee?.sampleCount ?? undefined,
+        };
+        verification.matchConfidence = salvageFace.confidence;
+        verification.bestDistance = salvageFace.distance ?? verification.bestDistance;
+        verification.bestBox = {
+          top: salvageFace.box.top,
+          right: salvageFace.box.right,
+          bottom: salvageFace.box.bottom,
+          left: salvageFace.box.left,
+        };
+          verification.framesWithFace = Math.max(verification.framesWithFace, 1);
+          verification.framesProcessed = Math.max(verification.framesProcessed, input.faceFrames.length);
+          if (frameSize) {
+            verification.previewFrameSize = { width: frameSize.width, height: frameSize.height };
+          }
+        }
+      } else {
+        // prevent mis-assignment to another person
+        verification.verified = false;
+      }
+    }
+
+    // enforce confidence floor to avoid weak false matches
+    if (verification.verified && verification.matchConfidence < 0.45) {
+      verification.verified = false;
+    }
+
     if (!verification.verified || !verification.employee) {
       const attendance = await createFailureAttendance(
         employee.id,
         todayDate,
-        now,
-        input.deviceId,
+          now,
+          input.deviceId,
         "FAILED_FACE",
       );
 
@@ -738,20 +815,13 @@ async function processPythonRfidScan(args: {
         verificationStatus: "FAILED_FACE",
         decision: "REJECTED",
       });
-    }
+      }
 
-    const matchedEmployeeCode = verification.employee.employeeCode?.trim();
-    const matchedRfidUid = verification.employee.rfidUid?.trim().toUpperCase();
-    const matchesBadgeOwner = Boolean(
-      (matchedEmployeeCode && matchedEmployeeCode === employee.employeeCode)
-      || (matchedRfidUid && matchedRfidUid === employee.rfidUid.toUpperCase()),
-    );
-
-    if (!matchesBadgeOwner) {
-      const attendance = await createFailureAttendance(
-        employee.id,
-        todayDate,
-        now,
+      if (!matchesBadgeOwner) {
+        const attendance = await createFailureAttendance(
+          employee.id,
+          todayDate,
+          now,
         input.deviceId,
         "FAILED_FACE",
       );
@@ -1605,7 +1675,7 @@ export async function registerRoutes(
     }
 
     const pythonMeta = readPythonFaceDescriptorMeta(employee.faceDescriptor);
-    const folderName = pythonMeta?.folderName;
+    const folderName = pythonMeta?.folderName || employee.employeeCode;
     if (!folderName) {
       return res.status(404).json({ message: "No face dataset available for this employee." });
     }
@@ -1644,7 +1714,7 @@ export async function registerRoutes(
     }
 
     const pythonMeta = readPythonFaceDescriptorMeta(employee.faceDescriptor);
-    const folderName = pythonMeta?.folderName;
+    const folderName = pythonMeta?.folderName || employee.employeeCode;
     if (!folderName) {
       return res.json({ hasProfilePhoto: false });
     }
@@ -1745,20 +1815,34 @@ export async function registerRoutes(
   app.patch(api.employees.update.path, async (req, res) => {
     try {
       const input = api.employees.update.input.parse(req.body);
-      if (input.rfidUid) {
-        input.rfidUid = input.rfidUid.trim().toUpperCase();
+      const { profilePhoto, ...updatePayload } = input;
+      if (updatePayload.rfidUid) {
+        updatePayload.rfidUid = updatePayload.rfidUid.trim().toUpperCase();
       }
 
       const employeeId = Number(req.params.id);
-      const conflict = await validateEmployeeIdentityConflicts(input, employeeId);
+      const conflict = await validateEmployeeIdentityConflicts(updatePayload, employeeId);
       if (conflict) {
         return res.status(400).json(conflict);
       }
 
-      const employee = await storage.updateEmployee(employeeId, input);
+      const employee = await storage.updateEmployee(employeeId, updatePayload);
       if (!employee) {
         return res.status(404).json({ message: "Employee not found" });
       }
+
+      if (profilePhoto) {
+        const pythonMeta = readPythonFaceDescriptorMeta(employee.faceDescriptor);
+        const folderName = pythonMeta?.folderName || employee.employeeCode;
+        if (!folderName) {
+          return res.status(400).json({ message: "No Python dataset exists for this employee. Re-enroll before adding a profile photo." });
+        }
+        const datasetDir = path.join(PYTHON_DATASET_ROOT, folderName);
+        await fs.mkdir(datasetDir, { recursive: true });
+        const profilePath = path.join(datasetDir, "profile.jpg");
+        await fs.writeFile(profilePath, parseDataUrl(profilePhoto));
+      }
+
       res.json(employee);
     } catch (err) {
       if (err instanceof z.ZodError) {

@@ -494,9 +494,10 @@ export default function GateTerminal() {
   });
   const latestEmployee = lastResult?.employee ?? lastResult?.badgeOwner ?? selectedBadgeOwner;
   const [hasProfilePhoto, setHasProfilePhoto] = useState<boolean | null>(null);
-  const latestProfileImage = hasProfilePhoto
-    ? (latestEmployee ? `/api/employees/${latestEmployee.id}/photo` : null)
-    : (lastResult?.previewImage ?? (latestEmployee ? `/api/employees/${latestEmployee.id}/photo` : null));
+  const [profileNonce, setProfileNonce] = useState<number>(0);
+  const latestProfileImage = latestEmployee
+    ? `/api/employees/${latestEmployee.id}/photo${profileNonce ? `?t=${profileNonce}` : ""}`
+    : lastResult?.previewImage ?? null;
   const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
   const pythonRosterCount = (employees ?? []).filter((employee) => {
     return Boolean(getPythonFaceMeta(employee.faceDescriptor));
@@ -564,10 +565,12 @@ export default function GateTerminal() {
         const data = await res.json();
         if (!cancelled) {
           setHasProfilePhoto(Boolean(data?.hasProfilePhoto));
+          setProfileNonce(Date.now());
         }
       } catch {
         if (!cancelled) {
           setHasProfilePhoto(false);
+          setProfileNonce(Date.now());
         }
       }
     };

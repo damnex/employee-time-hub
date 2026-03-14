@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
-import { useDeleteEmployee, useEmployees, usePythonEnrollEmployee } from "@/hooks/use-employees";
+import { useDeleteEmployee, useEmployees, usePythonEnrollEmployee, useUpdateEmployee } from "@/hooks/use-employees";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -29,6 +30,7 @@ import {
   Database,
   Loader2,
   Plus,
+  Pencil,
   RefreshCcw,
   ScanLine,
   ShieldCheck,
@@ -47,7 +49,7 @@ import {
   FormLabel,
   FormMessage,
 } from "@/components/ui/form";
-import { insertEmployeeSchema } from "@shared/schema";
+import { insertEmployeeSchema, type Employee } from "@shared/schema";
 import { useDeviceWS } from "@/hooks/use-device-ws";
 
 const ENROLLMENT_CAMERA_ID = "ENROLLMENT-CONSOLE-01";
@@ -150,6 +152,7 @@ export default function Employees() {
   const { data: employees, isLoading } = useEmployees();
   const deleteEmployee = useDeleteEmployee();
   const pythonEnrollEmployee = usePythonEnrollEmployee();
+  const updateEmployee = useUpdateEmployee();
   const {
     isConnected: enrollmentSocketConnected,
     deviceOnline: enrollmentDeviceOnline,
@@ -158,21 +161,30 @@ export default function Employees() {
   } = useDeviceWS(ENROLLMENT_CAMERA_ID, { clientType: "browser" });
   const enrollmentReaderOnline = enrollmentDeviceOnline;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
+  const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
+  const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryToken, setCameraRetryToken] = useState(0);
-const [datasetSamplesTarget, setDatasetSamplesTarget] = useState(DEFAULT_DATASET_SAMPLES);
-const [datasetPhotos, setDatasetPhotos] = useState<string[]>([]);
-const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
-const [isCapturingDataset, setIsCapturingDataset] = useState(false);
-const [captureProgress, setCaptureProgress] = useState(0);
-const [datasetError, setDatasetError] = useState<string | null>(null);
+  const [datasetSamplesTarget, setDatasetSamplesTarget] = useState(DEFAULT_DATASET_SAMPLES);
+  const [datasetPhotos, setDatasetPhotos] = useState<string[]>([]);
+  const [profilePhoto, setProfilePhoto] = useState<string | null>(null);
+  const [isCapturingDataset, setIsCapturingDataset] = useState(false);
+  const [captureProgress, setCaptureProgress] = useState(0);
+  const [datasetError, setDatasetError] = useState<string | null>(null);
   const [rfidReaderMessage, setRfidReaderMessage] = useState<string | null>(null);
   const [rfidSourceDeviceId, setRfidSourceDeviceId] = useState<string | null>(null);
+  const [editProfilePreview, setEditProfilePreview] = useState<string | null>(null);
+  const [editProfilePhoto, setEditProfilePhoto] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const form = useForm<FormValues>({
+    resolver: zodResolver(formSchema),
+    defaultValues: defaultFormValues,
+  });
+
+  const editForm = useForm<FormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: defaultFormValues,
   });
@@ -407,6 +419,68 @@ const [datasetError, setDatasetError] = useState<string | null>(null);
     }
 
     deleteEmployee.mutate(employeeId);
+  };
+
+  const handleEditDialogChange = (open: boolean) => {
+    setIsEditDialogOpen(open);
+    if (!open) {
+      setEditingEmployee(null);
+      editForm.reset(defaultFormValues);
+      setEditProfilePreview(null);
+      setEditProfilePhoto(null);
+    }
+  };
+
+  const handleEditEmployee = (employee: Employee) => {
+    setEditingEmployee(employee);
+    editForm.reset({
+      employeeCode: employee.employeeCode,
+      name: employee.name,
+      department: employee.department,
+      phone: employee.phone ?? "",
+      email: employee.email ?? "",
+      rfidUid: employee.rfidUid,
+      isActive: employee.isActive,
+    });
+    setIsEditDialogOpen(true);
+    setEditProfilePhoto(null);
+    setEditProfilePreview(null);
+    void (async () => {
+      try {
+        const metaRes = await fetch(`/api/employees/${employee.id}/photo/meta`, { credentials: "include" });
+        const meta = await metaRes.json();
+        if (meta?.hasProfilePhoto) {
+          setEditProfilePreview(`/api/employees/${employee.id}/photo?t=${Date.now()}`);
+        }
+      } catch {
+        // ignore preview fetch failures
+      }
+    })();
+  };
+
+  const handleEditSubmit = (values: FormValues) => {
+    if (!editingEmployee) {
+      return;
+    }
+
+    updateEmployee.mutate(
+      {
+        id: editingEmployee.id,
+        data: {
+          ...values,
+          rfidUid: values.rfidUid.trim().toUpperCase(),
+          ...(editProfilePhoto ? { profilePhoto: editProfilePhoto } : {}),
+        },
+      },
+      {
+        onSuccess: () => {
+          setIsEditDialogOpen(false);
+          setEditingEmployee(null);
+          setEditProfilePhoto(null);
+          setEditProfilePreview(null);
+        },
+      },
+    );
   };
 
   return (
@@ -742,6 +816,190 @@ const [datasetError, setDatasetError] = useState<string | null>(null);
         </Dialog>
       </div>
 
+      <Dialog open={isEditDialogOpen} onOpenChange={handleEditDialogChange}>
+        <DialogContent className="sm:max-w-[540px]">
+          <DialogHeader>
+            <DialogTitle>Edit Employee</DialogTitle>
+            <DialogDescription>Update badge details without re-capturing the dataset.</DialogDescription>
+          </DialogHeader>
+          <Form {...editForm}>
+            <form onSubmit={editForm.handleSubmit(handleEditSubmit)} className="space-y-4">
+              <div className="flex items-center gap-4 rounded-lg border border-border/70 bg-muted/30 p-3">
+                <div className="h-16 w-16 overflow-hidden rounded-full border border-border/70 bg-background shadow-sm">
+                  {editProfilePreview ? (
+                    <img src={editProfilePreview} alt="Profile" className="h-full w-full object-cover" />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">No photo</div>
+                  )}
+                </div>
+                <div className="flex flex-col gap-2">
+                  <Input
+                    type="file"
+                    accept="image/*"
+                    onChange={(event) => {
+                      const file = event.target.files?.[0];
+                      if (!file) {
+                        return;
+                      }
+                      const reader = new FileReader();
+                      reader.onload = () => {
+                        const result = reader.result;
+                        if (typeof result === "string") {
+                          setEditProfilePhoto(result);
+                          setEditProfilePreview(result);
+                        }
+                      };
+                      reader.readAsDataURL(file);
+                    }}
+                  />
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setEditProfilePhoto(null);
+                        if (editingEmployee) {
+                          setEditProfilePreview(`/api/employees/${editingEmployee.id}/photo?t=${Date.now()}`);
+                        } else {
+                          setEditProfilePreview(null);
+                        }
+                      }}
+                    >
+                      Reset
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setEditProfilePhoto(null);
+                        setEditProfilePreview(null);
+                      }}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">Profile photo shows on badges and dashboards.</p>
+                </div>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <FormField
+                  control={editForm.control}
+                  name="name"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Name</FormLabel>
+                      <FormControl>
+                        <Input placeholder="Employee name" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="employeeCode"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Employee Code</FormLabel>
+                      <FormControl>
+                        <Input placeholder="EMP001" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <FormField
+                  control={editForm.control}
+                  name="department"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Department</FormLabel>
+                      <FormControl>
+                        <Input placeholder="Department" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="rfidUid"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>RFID Badge</FormLabel>
+                      <FormControl>
+                        <Input placeholder="A2BE752A" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
+                <FormField
+                  control={editForm.control}
+                  name="phone"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Phone</FormLabel>
+                      <FormControl>
+                        <Input placeholder="Phone (optional)" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+                <FormField
+                  control={editForm.control}
+                  name="email"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Email</FormLabel>
+                      <FormControl>
+                        <Input placeholder="Email (optional)" {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
+              <FormField
+                control={editForm.control}
+                name="isActive"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between rounded-lg border border-border/60 px-4 py-3">
+                    <div>
+                      <FormLabel className="text-sm">Active status</FormLabel>
+                      <p className="text-xs text-muted-foreground">Controls whether this profile is usable at the gate.</p>
+                    </div>
+                    <FormControl>
+                      <Switch checked={field.value} onCheckedChange={field.onChange} />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+
+              <DialogFooter>
+                <Button type="button" variant="ghost" onClick={() => handleEditDialogChange(false)}>
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={updateEmployee.isPending || !editingEmployee}>
+                  {updateEmployee.isPending ? "Saving..." : "Save Changes"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
+
       <Card className="border-border/50 shadow-sm overflow-hidden">
         <CardContent className="p-0">
           <Table>
@@ -830,7 +1088,17 @@ const [datasetError, setDatasetError] = useState<string | null>(null);
                         )}
                       </TableCell>
                       <TableCell className="pr-6">
-                        <div className="flex justify-end">
+                        <div className="flex justify-end gap-2">
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={updateEmployee.isPending}
+                            onClick={() => handleEditEmployee(employee)}
+                          >
+                            <Pencil className="mr-2 size-4" />
+                            Edit
+                          </Button>
                           <Button
                             type="button"
                             variant="outline"

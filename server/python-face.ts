@@ -279,7 +279,13 @@ class PythonFaceWorker {
     return await new Promise<T>((resolve, reject) => {
       const timeoutId = setTimeout(() => {
         this.pending.delete(request.requestId);
-        reject(new Error("Python face worker timed out."));
+        // Kill the worker to avoid stuck state and force restart on next call.
+        if (this.child) {
+          this.child.kill();
+          this.child = null;
+          this.startPromise = null;
+        }
+        reject(new Error("Python face worker timed out. Restarting worker."));
       }, timeoutMs);
 
       this.pending.set(request.requestId, {
@@ -320,9 +326,13 @@ class PythonFaceWorker {
         "--labels",
         PYTHON_LBPH_LABELS_PATH,
         "--resize-width",
-        "480",
+        "0",
+        "--scale-factor",
+        "1.04",
         "--min-face-size",
-        "52",
+        "24",
+        "--distance-threshold",
+        "120",
       ], {
         cwd: process.cwd(),
         windowsHide: true,
@@ -396,7 +406,7 @@ class PythonFaceWorker {
       entryDepthDirection: "approaching",
     };
 
-    return await this.sendRequest<PythonGateVerificationResult>(request, 12000);
+    return await this.sendRequest<PythonGateVerificationResult>(request, 30000);
   }
 
   async recognizeFrame(frame: string, maxFaces = 50) {
@@ -408,7 +418,7 @@ class PythonFaceWorker {
       maxFaces,
     };
 
-    return await this.sendRequest<PythonLiveRecognitionResult>(request, 8000);
+    return await this.sendRequest<PythonLiveRecognitionResult>(request, 15000);
   }
 }
 
@@ -573,8 +583,18 @@ export async function verifyGateFramesWithPython(faceFrames: string[]) {
   if (!faceFrames.length) {
     throw new Error("Live gate frames were not captured.");
   }
-
-  return await pythonFaceWorker.verifyBurst(faceFrames);
+  let attempt = 0;
+  let lastError: unknown;
+  while (attempt < 2) {
+    try {
+      return await pythonFaceWorker.verifyBurst(faceFrames);
+    } catch (err) {
+      lastError = err;
+      await pythonFaceWorker.restart();
+      attempt += 1;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Python verification failed after retry.");
 }
 
 export async function recognizeLiveFrameWithPython(frame: string, maxFaces = 50) {
@@ -582,7 +602,18 @@ export async function recognizeLiveFrameWithPython(frame: string, maxFaces = 50)
     throw new Error("Live recognition frame was not captured.");
   }
 
-  return await pythonFaceWorker.recognizeFrame(frame, maxFaces);
+  let attempt = 0;
+  let lastError: unknown;
+  while (attempt < 2) {
+    try {
+      return await pythonFaceWorker.recognizeFrame(frame, maxFaces);
+    } catch (err) {
+      lastError = err;
+      await pythonFaceWorker.restart();
+      attempt += 1;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Python live recognition failed after retry.");
 }
 
 

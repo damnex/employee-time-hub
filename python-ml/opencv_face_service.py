@@ -78,6 +78,52 @@ def create_detector() -> cv2.CascadeClassifier:
     return detector
 
 
+
+def create_eye_detector() -> cv2.CascadeClassifier:
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_eye_tree_eyeglasses.xml"
+    detector = cv2.CascadeClassifier(str(cascade_path))
+    if detector.empty():
+        raise RuntimeError(f"Unable to load eye cascade: {cascade_path}")
+    return detector
+
+
+def is_probable_face(
+    gray_frame: np.ndarray,
+    face_box: tuple[int, int, int, int],
+    eye_detector: cv2.CascadeClassifier,
+) -> bool:
+    x, y, width, height = face_box
+    if width <= 0 or height <= 0:
+        return False
+
+    frame_area = float(gray_frame.shape[0] * gray_frame.shape[1])
+    area_ratio = (width * height) / max(frame_area, 1.0)
+    if area_ratio < 0.01 or area_ratio > 0.45:
+        return False
+
+    aspect_ratio = width / float(height)
+    if aspect_ratio < 0.6 or aspect_ratio > 1.6:
+        return False
+
+    roi = gray_frame[y : y + height, x : x + width]
+    min_eye_size = max(12, int(min(width, height) * 0.18))
+    eyes = (
+        eye_detector.detectMultiScale(
+            roi,
+            scaleFactor=1.05,
+            minNeighbors=3,
+            minSize=(min_eye_size, min_eye_size),
+        )
+        if not eye_detector.empty()
+        else []
+    )
+    if len(eyes) >= 1:
+        return True
+
+    laplacian_var = cv2.Laplacian(roi, cv2.CV_64F).var()
+    return 0.82 <= aspect_ratio <= 1.32 and 0.02 <= area_ratio <= 0.32 and laplacian_var >= 42.0
+
+
 def load_labels(path: Path) -> tuple[dict[int, LabelRecord], dict[str, Any]]:
     payload = json.loads(path.resolve().read_text(encoding="utf-8"))
     labels = {
@@ -139,6 +185,7 @@ def resize_frame(frame: np.ndarray, resize_width: int) -> tuple[np.ndarray, floa
 def detect_faces(
     gray_frame: np.ndarray,
     detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
     args: argparse.Namespace,
 ) -> list[tuple[int, int, int, int]]:
     def run(scale_factor: float, min_face: int) -> list[tuple[int, int, int, int]]:
@@ -148,7 +195,7 @@ def detect_faces(
             minNeighbors=args.min_neighbors,
             minSize=(min_face, min_face),
         )
-        return sorted(
+        sorted_faces = sorted(
             [
                 (int(x), int(y), int(width), int(height))
                 for x, y, width, height in faces
@@ -156,6 +203,15 @@ def detect_faces(
             key=lambda item: item[2] * item[3],
             reverse=True,
         )
+        if sorted_faces and not eye_detector.empty():
+            plausible = [
+                face_box
+                for face_box in sorted_faces
+                if is_probable_face(gray_frame, face_box, eye_detector)
+            ]
+            if plausible:
+                return plausible
+        return sorted_faces
 
     primary = run(args.scale_factor, args.min_face_size)
     if primary:
@@ -164,6 +220,7 @@ def detect_faces(
     fallback_size = max(24, int(args.min_face_size * 0.7))
     fallback_scale = max(1.02, min(args.scale_factor - 0.02, 1.12))
     return run(fallback_scale, fallback_size)
+
 
 
 def prepare_face_crop(
@@ -236,6 +293,7 @@ def predict_frame(
     frame_payload: str,
     recognizer: Any,
     detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
     labels: dict[int, LabelRecord],
     image_size: int,
     distance_threshold: float,
@@ -244,20 +302,34 @@ def predict_frame(
     image = normalize_lighting(decode_frame(frame_payload))
     working_frame, scale_factor = resize_frame(image, args.resize_width)
     gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
-    detected_faces = detect_faces(gray_working, detector, args)
+    detected_faces = detect_faces(gray_working, detector, eye_detector, args)
     if not detected_faces:
         return FramePrediction(label=None, distance=None, box=None, center_x=None, area_ratio=None)
 
-    scaled_box = scale_box(detected_faces[0], scale_factor)
     gray_frame = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    return predict_face_box(
-        gray_frame,
-        scaled_box,
-        recognizer,
-        labels,
-        image_size,
-        distance_threshold,
-    )
+    best_prediction: FramePrediction | None = None
+    for face_box in detected_faces[:5]:
+        scaled_box = scale_box(face_box, scale_factor)
+        prediction = predict_face_box(
+            gray_frame,
+            scaled_box,
+            recognizer,
+            labels,
+            image_size,
+            distance_threshold,
+        )
+        if prediction.box is None:
+            continue
+        if best_prediction is None:
+            best_prediction = prediction
+            continue
+        if prediction.label is not None and best_prediction.label is None:
+            best_prediction = prediction
+            continue
+        if (prediction.distance or float("inf")) < (best_prediction.distance or float("inf")):
+            best_prediction = prediction
+
+    return best_prediction or FramePrediction(label=None, distance=None, box=None, center_x=None, area_ratio=None)
 
 
 def infer_direction(
@@ -399,6 +471,7 @@ def handle_verify_burst(
     request: dict[str, Any],
     recognizer: Any,
     detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
@@ -409,7 +482,7 @@ def handle_verify_burst(
         raise ValueError("No frames were provided for verification.")
 
     predictions = [
-        predict_frame(str(frame_payload), recognizer, detector, labels, image_size, distance_threshold, args)
+        predict_frame(str(frame_payload), recognizer, detector, eye_detector, labels, image_size, distance_threshold, args)
         for frame_payload in frames
     ]
 
@@ -425,6 +498,7 @@ def handle_recognize_frame(
     request: dict[str, Any],
     recognizer: Any,
     detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
@@ -439,7 +513,7 @@ def handle_recognize_frame(
     working_frame, scale_factor = resize_frame(image, args.resize_width)
     gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
     gray_frame = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    detected_faces = detect_faces(gray_working, detector, args)
+    detected_faces = detect_faces(gray_working, detector, eye_detector, args)
     max_faces = int(request.get("maxFaces", 50) or 50)
 
     recognized_faces: list[LiveRecognitionFace] = []
@@ -517,6 +591,7 @@ def main() -> int:
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.read(str(args.model.resolve()))
     detector = create_detector()
+    eye_detector = create_eye_detector()
 
     for raw_line in sys.stdin:
         line = raw_line.strip()
@@ -533,6 +608,7 @@ def main() -> int:
                     request,
                     recognizer,
                     detector,
+                    eye_detector,
                     labels,
                     distance_threshold,
                     image_size,
@@ -543,6 +619,7 @@ def main() -> int:
                     request,
                     recognizer,
                     detector,
+                    eye_detector,
                     labels,
                     distance_threshold,
                     image_size,

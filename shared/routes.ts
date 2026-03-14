@@ -125,7 +125,9 @@ export const api = {
     update: {
       method: 'PATCH' as const,
       path: '/api/employees/:id' as const,
-      input: insertEmployeeSchema.partial(),
+      input: insertEmployeeSchema.partial().extend({
+        profilePhoto: z.string().trim().optional(),
+      }),
       responses: { 200: z.custom<typeof employees.$inferSelect>(), 400: errorSchemas.validation, 404: errorSchemas.notFound },
     },
     delete: {
