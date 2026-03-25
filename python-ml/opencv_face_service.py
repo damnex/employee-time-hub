@@ -9,6 +9,8 @@ import json
 import re
 import sys
 import math
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +50,15 @@ class LiveRecognitionFace:
     box: tuple[int, int, int, int]
     confidence: float
     verified: bool
+    area_ratio: float
+    center_offset: float
+
+
+@dataclass
+class CapturedCameraFrame:
+    frame: np.ndarray
+    timestamp_ms: int
+    sequence: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +70,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scale-factor", type=float, default=1.08, help="Haar cascade scale factor.")
     parser.add_argument("--min-neighbors", type=int, default=6, help="Haar cascade minNeighbors.")
     parser.add_argument("--min-face-size", type=int, default=52, help="Minimum face size in pixels.")
+    parser.add_argument("--camera-source", default="0", help="OpenCV camera source. Use 0 for default webcam or RTSP URL.")
+    parser.add_argument("--camera-width", type=int, default=640, help="Requested camera width for live capture.")
+    parser.add_argument("--camera-height", type=int, default=480, help="Requested camera height for live capture.")
+    parser.add_argument("--camera-fps", type=float, default=20.0, help="Requested camera FPS for live capture.")
+    parser.add_argument("--camera-ready-timeout-ms", type=int, default=2500, help="How long to wait for the first live frame.")
+    parser.add_argument("--camera-reconnect-delay-ms", type=int, default=500, help="Delay before reconnecting a dropped capture.")
+    parser.add_argument("--frame-freshness-ms", type=int, default=1500, help="Maximum acceptable age for a live frame.")
     return parser.parse_args()
 
 
@@ -102,6 +120,183 @@ def create_eye_detector() -> cv2.CascadeClassifier:
     if detector.empty():
         raise RuntimeError(f"Unable to load eye cascade: {cascade_path}")
     return detector
+
+
+def parse_camera_source(source: str) -> int | str:
+    candidate = source.strip()
+    if re.fullmatch(r"-?\d+", candidate):
+        return int(candidate)
+    return candidate
+
+
+def open_camera_capture(source: int | str) -> cv2.VideoCapture:
+    if isinstance(source, int):
+        capture = cv2.VideoCapture(source, cv2.CAP_DSHOW)
+        if capture.isOpened():
+            return capture
+        capture.release()
+        return cv2.VideoCapture(source)
+    return cv2.VideoCapture(source)
+
+
+class LatestFrameCamera:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self._source = parse_camera_source(str(args.camera_source))
+        self._camera_width = int(args.camera_width)
+        self._camera_height = int(args.camera_height)
+        self._camera_fps = float(args.camera_fps)
+        self._ready_timeout_ms = int(args.camera_ready_timeout_ms)
+        self._reconnect_delay_ms = int(args.camera_reconnect_delay_ms)
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+        self._ready = threading.Event()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._capture: cv2.VideoCapture | None = None
+        self._latest_frame: np.ndarray | None = None
+        self._latest_timestamp_ms = 0
+        self._latest_sequence = 0
+        self._last_error: str | None = None
+
+    def _configure_capture(self, capture: cv2.VideoCapture) -> None:
+        if self._camera_width > 0:
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._camera_width)
+        if self._camera_height > 0:
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self._camera_height)
+        if self._camera_fps > 0:
+            capture.set(cv2.CAP_PROP_FPS, self._camera_fps)
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+
+        self._stop_event.clear()
+        self._ready.clear()
+        self._thread = threading.Thread(target=self._reader_loop, name="opencv-face-camera", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(self._ready_timeout_ms / 1000):
+            raise RuntimeError(self._last_error or "Timed out waiting for the camera to provide a live frame.")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        with self._condition:
+            self._condition.notify_all()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.5)
+        self._thread = None
+        self._release_capture()
+
+    def _release_capture(self) -> None:
+        capture = self._capture
+        self._capture = None
+        if capture is not None:
+            capture.release()
+
+    def _reader_loop(self) -> None:
+        while not self._stop_event.is_set():
+            capture = open_camera_capture(self._source)
+            self._configure_capture(capture)
+            if not capture.isOpened():
+                self._last_error = f"Unable to open OpenCV camera source {self._source!r}."
+                capture.release()
+                self._ready.clear()
+                self._stop_event.wait(self._reconnect_delay_ms / 1000)
+                continue
+
+            self._capture = capture
+            while not self._stop_event.is_set():
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    self._last_error = f"Camera source {self._source!r} stopped delivering frames."
+                    self._ready.clear()
+                    break
+
+                timestamp_ms = int(time.time() * 1000)
+                with self._condition:
+                    self._latest_frame = frame.copy()
+                    self._latest_timestamp_ms = timestamp_ms
+                    self._latest_sequence += 1
+                    self._last_error = None
+                    self._ready.set()
+                    self._condition.notify_all()
+
+            capture.release()
+            self._capture = None
+            if not self._stop_event.is_set():
+                self._stop_event.wait(self._reconnect_delay_ms / 1000)
+
+    def _snapshot_latest_locked(self) -> CapturedCameraFrame | None:
+        if self._latest_frame is None or self._latest_sequence <= 0:
+            return None
+        return CapturedCameraFrame(
+            frame=self._latest_frame.copy(),
+            timestamp_ms=self._latest_timestamp_ms,
+            sequence=self._latest_sequence,
+        )
+
+    def snapshot_latest(self) -> CapturedCameraFrame | None:
+        with self._condition:
+            return self._snapshot_latest_locked()
+
+    def wait_for_next_frame(self, after_sequence: int, timeout_ms: int) -> CapturedCameraFrame | None:
+        timeout_seconds = max(timeout_ms, 1) / 1000
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while not self._stop_event.is_set():
+                snapshot = self._snapshot_latest_locked()
+                if snapshot is not None and snapshot.sequence > after_sequence:
+                    return snapshot
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+        return None
+
+    def capture_sequence(
+        self,
+        trigger_timestamp_ms: int,
+        frame_count: int,
+        capture_spacing_ms: int,
+        freshness_ms: int,
+        timeout_ms: int,
+    ) -> list[CapturedCameraFrame]:
+        self.start()
+
+        accepted_frames: list[CapturedCameraFrame] = []
+        latest = self.snapshot_latest()
+        last_sequence = latest.sequence if latest is not None else 0
+        now_ms = int(time.time() * 1000)
+        if (
+            latest is not None
+            and latest.timestamp_ms >= trigger_timestamp_ms - freshness_ms
+            and now_ms - latest.timestamp_ms <= freshness_ms
+        ):
+            accepted_frames.append(latest)
+
+        deadline = time.monotonic() + max(timeout_ms, 1) / 1000
+        while len(accepted_frames) < frame_count:
+            remaining_ms = int(max(0.0, (deadline - time.monotonic()) * 1000))
+            if remaining_ms <= 0:
+                break
+
+            next_frame = self.wait_for_next_frame(last_sequence, remaining_ms)
+            if next_frame is None:
+                break
+
+            last_sequence = next_frame.sequence
+            if next_frame.timestamp_ms < trigger_timestamp_ms - freshness_ms:
+                continue
+
+            if accepted_frames and capture_spacing_ms > 0:
+                frame_delta_ms = next_frame.timestamp_ms - accepted_frames[-1].timestamp_ms
+                if frame_delta_ms < capture_spacing_ms:
+                    continue
+
+            accepted_frames.append(next_frame)
+
+        return accepted_frames
 
 
 def is_probable_face(
@@ -496,6 +691,79 @@ def build_response(
     }
 
 
+def recognize_faces_in_image(
+    image: np.ndarray,
+    recognizer: Any,
+    detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
+    labels: dict[int, LabelRecord],
+    distance_threshold: float,
+    image_size: int,
+    args: argparse.Namespace,
+    max_faces: int,
+) -> tuple[list[LiveRecognitionFace], int, int]:
+    normalized = normalize_lighting(image)
+    frame_height, frame_width = normalized.shape[:2]
+    working_frame, scale_factor = resize_frame(normalized, args.resize_width)
+    gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
+    gray_frame = cv2.cvtColor(normalized, cv2.COLOR_BGR2GRAY)
+    detected_faces = detect_faces(gray_working, detector, eye_detector, args)
+
+    recognized_faces: list[LiveRecognitionFace] = []
+    for face_box in detected_faces[: max(1, min(max_faces, 50))]:
+        scaled_box = scale_box(face_box, scale_factor)
+        prediction = predict_face_box(
+            gray_frame,
+            scaled_box,
+            recognizer,
+            labels,
+            image_size,
+            distance_threshold,
+        )
+        if prediction.box is None:
+            continue
+
+        raw_distance: float | None = (
+            float(prediction.distance) if prediction.distance is not None else None
+        )
+        distance: float | None = raw_distance if raw_distance is not None and math.isfinite(raw_distance) else None
+        confidence = (
+            clamp(1.0 - (distance / max(distance_threshold, 1.0)), 0.0, 1.0)
+            if distance is not None
+            else 0.0
+        )
+        center_x = float(prediction.center_x) if prediction.center_x is not None else 0.5
+        area_ratio = float(prediction.area_ratio) if prediction.area_ratio is not None else 0.0
+        recognized_faces.append(
+            LiveRecognitionFace(
+                label=prediction.label,
+                distance=distance,
+                box=prediction.box,
+                confidence=confidence,
+                verified=prediction.label is not None,
+                area_ratio=area_ratio,
+                center_offset=abs(center_x - 0.5),
+            )
+        )
+
+    return recognized_faces, int(frame_width), int(frame_height)
+
+
+def choose_best_live_face(faces: list[LiveRecognitionFace]) -> LiveRecognitionFace | None:
+    if not faces:
+        return None
+
+    return max(
+        faces,
+        key=lambda face: (
+            1 if face.verified else 0,
+            face.confidence,
+            face.area_ratio,
+            -face.center_offset,
+        ),
+    )
+
+
 def handle_verify_burst(
     request: dict[str, Any],
     recognizer: Any,
@@ -537,46 +805,18 @@ def handle_recognize_frame(
     if not isinstance(frame_payload, str) or not frame_payload.strip():
         raise ValueError("No frame was provided for live recognition.")
 
-    image = normalize_lighting(decode_frame(str(frame_payload)))
-    frame_height, frame_width = image.shape[:2]
-    working_frame, scale_factor = resize_frame(image, args.resize_width)
-    gray_working = cv2.cvtColor(working_frame, cv2.COLOR_BGR2GRAY)
-    gray_frame = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    detected_faces = detect_faces(gray_working, detector, eye_detector, args)
     max_faces = int(request.get("maxFaces", 50) or 50)
-
-    recognized_faces: list[LiveRecognitionFace] = []
-    for face_box in detected_faces[: max(1, min(max_faces, 50))]:  # type: ignore
-        scaled_box = scale_box(face_box, scale_factor)
-        prediction = predict_face_box(
-            gray_frame,
-            scaled_box,
-            recognizer,
-            labels,
-            image_size,
-            distance_threshold,
-        )
-        if prediction.box is None:
-            continue
-
-        raw_distance: float | None = (
-            float(prediction.distance) if prediction.distance is not None else None
-        )
-        distance: float | None = raw_distance if raw_distance is not None and math.isfinite(raw_distance) else None
-        confidence = (
-            clamp(1.0 - (distance / max(distance_threshold, 1.0)), 0.0, 1.0)
-            if distance is not None
-            else 0.0
-        )
-        recognized_faces.append(
-            LiveRecognitionFace(
-                label=prediction.label,
-                distance=distance,
-                box=prediction.box,  # type: ignore
-                confidence=confidence,
-                verified=prediction.label is not None,
-            )
-        )
+    recognized_faces, frame_width, frame_height = recognize_faces_in_image(
+        decode_frame(str(frame_payload)),
+        recognizer,
+        detector,
+        eye_detector,
+        labels,
+        distance_threshold,
+        image_size,
+        args,
+        max_faces,
+    )
 
     return {
         "faces": [
@@ -599,6 +839,114 @@ def handle_recognize_frame(
         ],
         "frameWidth": int(frame_width),
         "frameHeight": int(frame_height),
+    }
+
+
+def handle_recognize_live_camera(
+    request: dict[str, Any],
+    camera: LatestFrameCamera,
+    recognizer: Any,
+    detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
+    labels: dict[int, LabelRecord],
+    distance_threshold: float,
+    image_size: int,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    trigger_timestamp_ms = int(request.get("timestamp") or 0)
+    if trigger_timestamp_ms <= 0:
+        raise ValueError("RFID trigger timestamp is required for live camera recognition.")
+
+    frame_count = max(1, min(int(request.get("frameCount") or 3), 3))
+    max_faces = max(1, min(int(request.get("maxFaces") or 5), 10))
+    capture_spacing_ms = max(0, int(request.get("captureSpacingMs") or 80))
+    freshness_ms = max(200, int(request.get("freshnessMs") or args.frame_freshness_ms))
+
+    captured_frames = camera.capture_sequence(
+        trigger_timestamp_ms=trigger_timestamp_ms,
+        frame_count=frame_count,
+        capture_spacing_ms=capture_spacing_ms,
+        freshness_ms=freshness_ms,
+        timeout_ms=max(args.camera_ready_timeout_ms, freshness_ms * frame_count),
+    )
+    if not captured_frames:
+        raise RuntimeError("No fresh live camera frame was available after the RFID trigger.")
+
+    best_face: LiveRecognitionFace | None = None
+    best_face_timestamp_ms: int | None = None
+    faces_detected = 0
+    frame_width = 0
+    frame_height = 0
+
+    for captured in captured_frames:
+        faces, frame_width, frame_height = recognize_faces_in_image(
+            captured.frame,
+            recognizer,
+            detector,
+            eye_detector,
+            labels,
+            distance_threshold,
+            image_size,
+            args,
+            max_faces,
+        )
+        faces_detected = max(faces_detected, len(faces))
+        frame_best_face = choose_best_live_face(faces)
+        if frame_best_face is None:
+            continue
+        if best_face is None:
+            best_face = frame_best_face
+            best_face_timestamp_ms = captured.timestamp_ms
+            continue
+        contender = choose_best_live_face([best_face, frame_best_face])
+        if contender is not None and contender is frame_best_face:
+            best_face = frame_best_face
+            best_face_timestamp_ms = captured.timestamp_ms
+
+    if best_face is None:
+        return {
+            "name": None,
+            "confidence": 0.0,
+            "timestamp": captured_frames[-1].timestamp_ms,
+            "status": "NO_FACE",
+            "employeeCode": None,
+            "department": None,
+            "rfidUid": None,
+            "facesDetected": faces_detected,
+            "multipleFaces": faces_detected > 1,
+            "frameCount": len(captured_frames),
+            "frameLatencyMs": captured_frames[-1].timestamp_ms - trigger_timestamp_ms,
+            "bestBox": None,
+            "frameWidth": frame_width,
+            "frameHeight": frame_height,
+        }
+
+    recognized_name = best_face.label.display_name if best_face.label is not None else None  # type: ignore
+    recognized_employee_code = best_face.label.employee_code if best_face.label is not None else None  # type: ignore
+    recognized_department = best_face.label.department if best_face.label is not None else None  # type: ignore
+    recognized_rfid_uid = best_face.label.rfid_uid if best_face.label is not None else None  # type: ignore
+    is_unknown = not best_face.verified or recognized_name is None or best_face.confidence < 0.45
+
+    return {
+        "name": "UNKNOWN" if is_unknown else recognized_name,
+        "confidence": round_float(best_face.confidence),
+        "timestamp": best_face_timestamp_ms or captured_frames[-1].timestamp_ms,
+        "status": "UNKNOWN" if is_unknown else "MATCH",
+        "employeeCode": None if is_unknown else recognized_employee_code,
+        "department": None if is_unknown else recognized_department,
+        "rfidUid": None if is_unknown else recognized_rfid_uid,
+        "facesDetected": faces_detected,
+        "multipleFaces": faces_detected > 1,
+        "frameCount": len(captured_frames),
+        "frameLatencyMs": (best_face_timestamp_ms or captured_frames[-1].timestamp_ms) - trigger_timestamp_ms,
+        "bestBox": {
+            "top": best_face.box[0],
+            "right": best_face.box[1],
+            "bottom": best_face.box[2],
+            "left": best_face.box[3],
+        },
+        "frameWidth": frame_width,
+        "frameHeight": frame_height,
     }
 
 
@@ -625,52 +973,71 @@ def main() -> int:
     recognizer.read(str(args.model.resolve()))
     detector = create_detector()
     eye_detector = create_eye_detector()
+    camera: LatestFrameCamera | None = None
 
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
+    try:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
 
-        request_id: str | None = None
-        try:
-            request = json.loads(line)
-            request_id = request.get("requestId")
-            action = request.get("action", "verify_burst")
-            if action == "verify_burst":
-                result = handle_verify_burst(
-                    request,
-                    recognizer,
-                    detector,
-                    eye_detector,
-                    labels,
-                    distance_threshold,
-                    image_size,
-                    args,
-                )
-            elif action == "recognize_frame":
-                result = handle_recognize_frame(
-                    request,
-                    recognizer,
-                    detector,
-                    eye_detector,
-                    labels,
-                    distance_threshold,
-                    image_size,
-                    args,
-                )
-            else:
-                raise ValueError(f"Unsupported worker action: {action}")
-            emit_response({
-                "requestId": request_id,
-                "ok": True,
-                "result": result,
-            })
-        except Exception as error:  # noqa: BLE001
-            emit_response({
-                "requestId": request_id,
-                "ok": False,
-                "error": str(error),
-            })
+            request_id: str | None = None
+            try:
+                request = json.loads(line)
+                request_id = request.get("requestId")
+                action = request.get("action", "verify_burst")
+                if action == "verify_burst":
+                    result = handle_verify_burst(
+                        request,
+                        recognizer,
+                        detector,
+                        eye_detector,
+                        labels,
+                        distance_threshold,
+                        image_size,
+                        args,
+                    )
+                elif action == "recognize_frame":
+                    result = handle_recognize_frame(
+                        request,
+                        recognizer,
+                        detector,
+                        eye_detector,
+                        labels,
+                        distance_threshold,
+                        image_size,
+                        args,
+                    )
+                elif action == "recognize_live_camera":
+                    if camera is None:
+                        camera = LatestFrameCamera(args)
+                    result = handle_recognize_live_camera(
+                        request,
+                        camera,
+                        recognizer,
+                        detector,
+                        eye_detector,
+                        labels,
+                        distance_threshold,
+                        image_size,
+                        args,
+                    )
+                else:
+                    raise ValueError(f"Unsupported worker action: {action}")
+                emit_response({
+                    "requestId": request_id,
+                    "ok": True,
+                    "result": result,
+                })
+            except Exception as error:  # noqa: BLE001
+                emit_response({
+                    "requestId": request_id,
+                    "ok": False,
+                    "error": str(error),
+                })
+    finally:
+        if camera is not None:
+            camera.stop()
 
     return 0
 

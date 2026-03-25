@@ -67,6 +67,25 @@ const liveRecognizedFaceSchema = z.object({
   verified: z.boolean(),
   box: faceBoxSchema,
 });
+const triggeredCameraFaceResponseSchema = z.object({
+  success: z.boolean(),
+  message: z.string(),
+  processedAt: z.string(),
+  name: z.string().nullish(),
+  confidence: z.number().optional(),
+  timestamp: z.number().optional(),
+  status: z.enum(["MATCH", "UNKNOWN", "NO_FACE"]),
+  employeeCode: z.string().nullish(),
+  department: z.string().nullish(),
+  rfidUid: z.string().nullish(),
+  facesDetected: z.number(),
+  multipleFaces: z.boolean(),
+  frameCount: z.number(),
+  frameLatencyMs: z.number().nullish(),
+  bestBox: faceBoxSchema.nullish(),
+  frameWidth: z.number().optional(),
+  frameHeight: z.number().optional(),
+});
 
 export const errorSchemas = {
   validation: z.object({ message: z.string(), field: z.string().optional() }),
@@ -212,6 +231,23 @@ export const api = {
           frameHeight: z.number().optional(),
           faces: z.array(liveRecognizedFaceSchema),
         }),
+        400: errorSchemas.validation,
+      }
+    },
+    cameraFace: {
+      method: 'POST' as const,
+      path: '/api/scan/camera-face' as const,
+      input: z.object({
+        deviceId: z.string().trim().min(1),
+        rfidTag: z.string().trim().min(1),
+        timestamp: z.number().int().positive(),
+        frameCount: z.number().int().min(1).max(3).optional(),
+        maxFaces: z.number().int().min(1).max(10).optional(),
+        freshnessMs: z.number().int().min(200).max(5000).optional(),
+        captureSpacingMs: z.number().int().min(0).max(500).optional(),
+      }),
+      responses: {
+        200: triggeredCameraFaceResponseSchema,
         400: errorSchemas.validation,
       }
     }

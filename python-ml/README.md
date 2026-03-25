@@ -5,6 +5,7 @@ This folder now has three Python paths:
 1. `face_recognition` embeddings for stronger matching when Python 3.11 plus dlib prerequisites are available.
 2. OpenCV LBPH fallback for the laptop webcam right now on machines where dlib is hard to install.
 3. A new MediaPipe + threaded realtime tracker for low-latency CCTV/webcam streaming with RFID matching.
+4. An event-triggered OpenCV camera worker for `RFID -> latest live frame -> face recognition`.
 
 For your current laptop-first goal, start with the OpenCV LBPH path. Later, when you move to the real CCTV camera, you can keep the same live script and only change `--source` to the RTSP URL.
 
@@ -152,6 +153,45 @@ Notes:
 
 - This path is optimized for low latency on CPU, but true 200-300ms recognition for 50 visible faces usually needs stronger hardware or a GPU-ready embedding backend.
 - `face_recognition` still depends on `dlib`, so use Python 3.11 for the smoothest install.
+
+## Path D: Event-triggered OpenCV camera service
+
+Use this when Node.js should trigger face recognition only after an RFID event.
+The Python worker keeps `cv2.VideoCapture` running in the background, always updates the latest frame, and returns the best match from 2-3 fresh frames captured right after the trigger.
+
+### Environment knobs
+
+Set these in `.env.local` if the default webcam source `0` is not correct:
+
+```env
+PYTHON_FACE_CAMERA_SOURCE=0
+PYTHON_FACE_CAMERA_WIDTH=640
+PYTHON_FACE_CAMERA_HEIGHT=480
+PYTHON_FACE_CAMERA_FPS=20
+PYTHON_FACE_FRAME_FRESHNESS_MS=1500
+```
+
+### Node trigger route
+
+The backend exposes:
+
+```text
+POST /api/scan/camera-face
+```
+
+Request body:
+
+```json
+{
+  "deviceId": "GATE-TERMINAL-01",
+  "rfidTag": "A1079E00",
+  "timestamp": 1719300123456,
+  "frameCount": 3,
+  "maxFaces": 5
+}
+```
+
+This returns the freshest live face result near the RFID timestamp, ready to pass into the matching engine.
 ## Metadata CSV
 
 `metadata.example.csv` is still the format for both paths:

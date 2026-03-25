@@ -23,6 +23,7 @@ import {
   PYTHON_LBPH_LABELS_PATH,
   PYTHON_LBPH_MODEL_PATH,
   readPythonFaceDescriptorMeta,
+  recognizeRfidTriggeredFaceWithPython,
   recognizeLiveFrameWithPython,
   removeEmployeeDataset,
   retrainPythonFaceModel,
@@ -533,6 +534,33 @@ function rememberSessionOutcome(
   });
 }
 
+function logGateDecisionPipeline(args: {
+  correlation: GateCorrelationMatch | null;
+  employee: Employee;
+  validation: ReturnType<typeof gateMatchingEngine.validateEvent>;
+  confidence: ReturnType<typeof gateMatchingEngine.calculateConfidence>;
+  decision: ReturnType<typeof gateMatchingEngine.decideAction>;
+}) {
+  const { correlation, employee, validation, confidence, decision } = args;
+  const matchedSummary = {
+    correlationId: correlation?.correlationId ?? null,
+    deviceId: correlation?.rfid.deviceId ?? null,
+    rfidUid: correlation?.rfid.rfidUid ?? null,
+    faceRfidUidHint: correlation?.face?.rfidUidHint ?? null,
+    movementDirection: correlation?.direction?.movementDirection ?? "UNKNOWN",
+    movementConfidence: correlation?.direction?.movementConfidence ?? null,
+    sessionState: correlation?.session.state ?? null,
+  };
+
+  console.info(
+    `[gate-engine] ${employee.employeeCode} ${employee.name} `
+    + `matched=${JSON.stringify(matchedSummary)} `
+    + `validation=${JSON.stringify(validation)} `
+    + `confidence=${JSON.stringify(confidence)} `
+    + `decision=${JSON.stringify(decision)}`,
+  );
+}
+
 async function resolveAttendanceDecision(
   employee: Employee,
   now: Date,
@@ -555,6 +583,20 @@ async function resolveAttendanceDecision(
     : null;
 
   if (duplicateReason) {
+    console.info(
+      `[gate-engine] ${employee.employeeCode} ${employee.name} `
+      + `duplicate=${JSON.stringify({
+        correlationId: correlation?.correlationId ?? null,
+        deviceId: correlation?.rfid.deviceId ?? null,
+        rfidUid: correlation?.rfid.rfidUid ?? null,
+        movementDirection: movementDirection ?? "UNKNOWN",
+        sessionState: correlation?.session.state ?? null,
+      })} decision=${JSON.stringify({
+        action: "IGNORE",
+        tier: "IGNORE",
+        reason: duplicateReason,
+      })}`,
+    );
     rememberSessionOutcome(correlation, now, "IGNORED");
     return {
       success: true,
@@ -586,6 +628,13 @@ async function resolveAttendanceDecision(
     hasOpenAttendance: Boolean(openEntry),
     movementDirection: directionIsConfident ? movementDirection : undefined,
   });
+  logGateDecisionPipeline({
+    correlation,
+    employee,
+    validation,
+    confidence,
+    decision,
+  });
 
   if (decision.action === "IGNORE") {
     if (correlation && openEntry && !directionIsConfident) {
@@ -594,7 +643,11 @@ async function resolveAttendanceDecision(
         occurredAt: now,
       });
     }
-    rememberSessionOutcome(correlation, now, "IGNORED");
+    rememberSessionOutcome(
+      correlation,
+      now,
+      decision.tier === "LOW_CONFIDENCE" ? "LOW_CONFIDENCE" : "IGNORED",
+    );
     return {
       success: true,
       ignored: true,
@@ -811,23 +864,26 @@ async function processPythonRfidScan(args: {
   }
 
   if (!input.faceFrames?.length) {
-    const attendance = await createFailureAttendance(
-      employee.id,
-      todayDate,
+    const result = await resolveAttendanceDecision(
+      employee,
       now,
+      todayDate,
       input.deviceId,
-      "FAILED_FACE",
+      0,
+      correlation,
+      false,
+      false,
+      null,
+      input.movementDirection,
+      input.movementConfidence,
     );
 
     return logAndReturn({
-      success: false,
-      message: "Live gate frames were not captured. Retry the scan.",
-      employee,
-      attendance,
-      matchConfidence: 0,
+      ...result,
+      message: "Live gate frames were not captured, so face confidence stayed low.",
     }, {
       verificationStatus: "FAILED_FACE",
-      decision: "REJECTED",
+      decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
     });
   }
 
@@ -916,58 +972,57 @@ async function processPythonRfidScan(args: {
     }
 
     if (!verification.verified || !verification.employee) {
-      const attendance = await createFailureAttendance(
-        employee.id,
+      const result = await resolveAttendanceDecision(
+        employee,
+        now,
         todayDate,
-          now,
-          input.deviceId,
-        "FAILED_FACE",
+        input.deviceId,
+        matchConfidence,
+        correlation,
+        verification.framesWithFace > 0,
+        false,
+        verification.employee?.rfidUid ?? null,
+        verification.movementDirection,
+        verification.movementConfidence,
       );
 
       return logAndReturn({
-        success: false,
+        ...result,
         message: verification.framesWithFace
-          ? "Python face verification failed. Access denied."
-          : "No face was detected clearly in the gate camera frames. Retry the scan.",
-        employee,
-        attendance,
-        matchConfidence,
+          ? result.message
+          : "No face was detected clearly in the gate camera frames, so the event stayed low confidence.",
         matchDetails,
-        movementDirection: verification.movementDirection,
-        movementConfidence: verification.movementConfidence,
         detectedFaceLabel,
         detectedFaceBox,
       }, {
         verificationStatus: "FAILED_FACE",
-        decision: "REJECTED",
+        decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
       });
       }
 
       if (!matchesBadgeOwner) {
-        const attendance = await createFailureAttendance(
-          employee.id,
-          todayDate,
+        const result = await resolveAttendanceDecision(
+          employee,
           now,
-        input.deviceId,
-        "FAILED_FACE",
-      );
+          todayDate,
+          input.deviceId,
+          matchConfidence,
+          correlation,
+          true,
+          false,
+          matchedRfidUid ?? verification.employee.rfidUid ?? null,
+          verification.movementDirection,
+          verification.movementConfidence,
+        );
 
       return logAndReturn({
-        success: false,
-        message: verification.employee.displayName
-          ? `ID-face mismatch. Badge ${employee.rfidUid} belongs to ${employee.name}, but Python verification matched ${verification.employee.displayName}.`
-          : "Python face verification matched an unknown roster profile. Re-enroll the employee dataset and retry.",
-        employee,
-        attendance,
-        matchConfidence,
+        ...result,
         matchDetails,
-        movementDirection: verification.movementDirection,
-        movementConfidence: verification.movementConfidence,
         detectedFaceLabel,
         detectedFaceBox,
       }, {
         verificationStatus: "FAILED_FACE",
-        decision: "REJECTED",
+        decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
       });
     }
 
@@ -1115,25 +1170,28 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   }
 
   if (!liveFaceProfile) {
-    const attendance = await createFailureAttendance(
-      employee.id,
-      todayDate,
+    const result = await resolveAttendanceDecision(
+      employee,
       now,
+      todayDate,
       input.deviceId,
-      "FAILED_FACE",
+      matchConfidence,
+      correlation,
+      false,
+      false,
+      null,
+      input.movementDirection,
+      input.movementConfidence,
     );
 
     return logAndReturn({
-      success: false,
-      message: "Live face verification data was not captured. Retry the scan.",
-      employee,
-      attendance,
-      matchConfidence,
+      ...result,
+      message: "Live face verification data was not captured, so the scan stayed low confidence.",
       movementDirection: input.movementDirection,
       movementConfidence: input.movementConfidence,
     }, {
       verificationStatus: "FAILED_FACE",
-      decision: "REJECTED",
+      decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
       liveFaceProfile,
     });
   }
@@ -1427,28 +1485,31 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       );
     }
 
-    const attendance = await createFailureAttendance(
-      employee.id,
-      todayDate,
+    const result = await resolveAttendanceDecision(
+      employee,
       now,
+      todayDate,
       input.deviceId,
-      "FAILED_FACE",
+      matchConfidence,
+      correlation,
+      true,
+      false,
+      null,
+      input.movementDirection,
+      input.movementConfidence,
     );
 
     return logAndReturn({
-      success: false,
+      ...result,
       message: storedFaceProfile?.legacy
         ? "Face verification failed. Access denied. Re-enroll this employee for stricter biometric matching."
-        : "Face verification failed. Access denied.",
-      employee,
-      attendance,
-      matchConfidence,
+        : result.message,
       matchDetails,
       movementDirection: input.movementDirection,
       movementConfidence: input.movementConfidence,
     }, {
       verificationStatus: "FAILED_FACE",
-      decision: "REJECTED",
+      decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
       liveFaceProfile,
     });
   }
@@ -2165,6 +2226,83 @@ export async function registerRoutes(
         message: err instanceof Error ? err.message : "Live recognition failed unexpectedly.",
         processedAt: new Date().toISOString(),
         faces: [],
+      });
+    }
+  });
+
+  app.post(api.scan.cameraFace.path, async (req, res) => {
+    try {
+      const input = api.scan.cameraFace.input.parse(req.body);
+      const processedAt = new Date().toISOString();
+
+      try {
+        await ensurePythonFaceModelExists();
+      } catch {
+        return res.json({
+          success: false,
+          message: "Python face model is not trained yet. Enroll employees and refresh Python training first.",
+          processedAt,
+          status: "NO_FACE" as const,
+          facesDetected: 0,
+          multipleFaces: false,
+          frameCount: 0,
+          frameLatencyMs: null,
+          bestBox: null,
+        });
+      }
+
+      const recognition = await recognizeRfidTriggeredFaceWithPython({
+        rfidTag: input.rfidTag,
+        timestamp: input.timestamp,
+        frameCount: input.frameCount ?? 3,
+        maxFaces: input.maxFaces ?? 5,
+        freshnessMs: input.freshnessMs ?? 1500,
+        captureSpacingMs: input.captureSpacingMs ?? 80,
+      });
+
+      const message = recognition.status === "MATCH"
+        ? `Live face match captured for ${recognition.name ?? "employee"} after RFID trigger.`
+        : recognition.status === "UNKNOWN"
+          ? recognition.multipleFaces
+            ? "Multiple faces were visible after the RFID trigger, and the best live match stayed unknown."
+            : "A live face was captured after the RFID trigger, but confidence stayed below the known-employee threshold."
+          : "No face was detected in the live camera window after the RFID trigger.";
+
+      return res.json({
+        success: recognition.status === "MATCH",
+        message,
+        processedAt,
+        name: recognition.name ?? null,
+        confidence: recognition.confidence,
+        timestamp: recognition.timestamp,
+        status: recognition.status,
+        employeeCode: recognition.employeeCode ?? null,
+        department: recognition.department ?? null,
+        rfidUid: recognition.rfidUid ?? null,
+        facesDetected: recognition.facesDetected,
+        multipleFaces: recognition.multipleFaces,
+        frameCount: recognition.frameCount,
+        frameLatencyMs: recognition.frameLatencyMs,
+        bestBox: recognition.bestBox ?? null,
+        frameWidth: recognition.frameWidth,
+        frameHeight: recognition.frameHeight,
+      });
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({ message: err.errors[0].message, field: err.errors[0].path.join('.') });
+      }
+
+      console.error("Triggered live camera recognition error:", err);
+      return res.json({
+        success: false,
+        message: err instanceof Error ? err.message : "Triggered live camera recognition failed unexpectedly.",
+        processedAt: new Date().toISOString(),
+        status: "NO_FACE" as const,
+        facesDetected: 0,
+        multipleFaces: false,
+        frameCount: 0,
+        frameLatencyMs: null,
+        bestBox: null,
       });
     }
   });

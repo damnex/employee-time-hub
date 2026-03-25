@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
 import { promises as fs } from "fs";
 import path from "path";
 import type { Employee } from "@shared/schema";
+import { loadEnvironment } from "./env";
 
 const PYTHON_ML_ROOT = path.resolve(process.cwd(), "python-ml");
 const DATASET_ROOT = path.join(PYTHON_ML_ROOT, "dataset");
@@ -95,6 +96,37 @@ export interface PythonLiveRecognitionResult {
   frameHeight: number;
 }
 
+export interface PythonTriggeredFaceRecognitionRequest {
+  rfidTag: string;
+  timestamp: number;
+  frameCount?: number;
+  maxFaces?: number;
+  freshnessMs?: number;
+  captureSpacingMs?: number;
+}
+
+export interface PythonTriggeredFaceRecognitionResult {
+  name?: string | null;
+  confidence: number;
+  timestamp: number;
+  status: "MATCH" | "UNKNOWN" | "NO_FACE";
+  employeeCode?: string | null;
+  department?: string | null;
+  rfidUid?: string | null;
+  facesDetected: number;
+  multipleFaces: boolean;
+  frameCount: number;
+  frameLatencyMs: number | null;
+  bestBox?: {
+    top: number;
+    right: number;
+    bottom: number;
+    left: number;
+  } | null;
+  frameWidth?: number;
+  frameHeight?: number;
+}
+
 interface PythonVerifyBurstRequest {
   requestId: string;
   action: "verify_burst";
@@ -110,7 +142,21 @@ interface PythonRecognizeFrameRequest {
   maxFaces?: number;
 }
 
-type PythonFaceWorkerRequest = PythonVerifyBurstRequest | PythonRecognizeFrameRequest;
+interface PythonRecognizeLiveCameraRequest {
+  requestId: string;
+  action: "recognize_live_camera";
+  rfidTag: string;
+  timestamp: number;
+  frameCount?: number;
+  maxFaces?: number;
+  freshnessMs?: number;
+  captureSpacingMs?: number;
+}
+
+type PythonFaceWorkerRequest =
+  | PythonVerifyBurstRequest
+  | PythonRecognizeFrameRequest
+  | PythonRecognizeLiveCameraRequest;
 
 interface PythonFaceWorkerResponse<T> {
   requestId?: string;
@@ -138,6 +184,35 @@ export function parseDataUrl(dataUrl: string) {
 
 async function ensureDirectory(targetPath: string) {
   await fs.mkdir(targetPath, { recursive: true });
+}
+
+function getPythonFaceWorkerCameraArgs() {
+  loadEnvironment();
+
+  const cameraSource = process.env.PYTHON_FACE_CAMERA_SOURCE?.trim() || "0";
+  const cameraWidth = process.env.PYTHON_FACE_CAMERA_WIDTH?.trim() || "640";
+  const cameraHeight = process.env.PYTHON_FACE_CAMERA_HEIGHT?.trim() || "480";
+  const cameraFps = process.env.PYTHON_FACE_CAMERA_FPS?.trim() || "20";
+  const cameraReadyTimeoutMs = process.env.PYTHON_FACE_CAMERA_READY_TIMEOUT_MS?.trim() || "2500";
+  const cameraReconnectDelayMs = process.env.PYTHON_FACE_CAMERA_RECONNECT_DELAY_MS?.trim() || "500";
+  const frameFreshnessMs = process.env.PYTHON_FACE_FRAME_FRESHNESS_MS?.trim() || "1500";
+
+  return [
+    "--camera-source",
+    cameraSource,
+    "--camera-width",
+    cameraWidth,
+    "--camera-height",
+    cameraHeight,
+    "--camera-fps",
+    cameraFps,
+    "--camera-ready-timeout-ms",
+    cameraReadyTimeoutMs,
+    "--camera-reconnect-delay-ms",
+    cameraReconnectDelayMs,
+    "--frame-freshness-ms",
+    frameFreshnessMs,
+  ];
 }
 
 export async function appendEmployeeDatasetFrames(args: { folderName: string; frames: string[] }) {
@@ -337,6 +412,7 @@ class PythonFaceWorker {
         "24",
         "--distance-threshold",
         "120",
+        ...getPythonFaceWorkerCameraArgs(),
       ], {
         cwd: process.cwd(),
         windowsHide: true,
@@ -423,6 +499,22 @@ class PythonFaceWorker {
     };
 
     return await this.sendRequest<PythonLiveRecognitionResult>(request, 15000);
+  }
+
+  async recognizeLiveCamera(input: PythonTriggeredFaceRecognitionRequest) {
+    const requestId = randomUUID();
+    const request: PythonRecognizeLiveCameraRequest = {
+      requestId,
+      action: "recognize_live_camera",
+      rfidTag: input.rfidTag.trim().toUpperCase(),
+      timestamp: input.timestamp,
+      frameCount: input.frameCount,
+      maxFaces: input.maxFaces,
+      freshnessMs: input.freshnessMs,
+      captureSpacingMs: input.captureSpacingMs,
+    };
+
+    return await this.sendRequest<PythonTriggeredFaceRecognitionResult>(request, 15000);
   }
 }
 
@@ -618,6 +710,33 @@ export async function recognizeLiveFrameWithPython(frame: string, maxFaces = 50)
     }
   }
   throw lastError instanceof Error ? lastError : new Error("Python live recognition failed after retry.");
+}
+
+export async function recognizeRfidTriggeredFaceWithPython(input: PythonTriggeredFaceRecognitionRequest) {
+  const normalizedTag = input.rfidTag.trim().toUpperCase();
+  if (!normalizedTag) {
+    throw new Error("RFID tag is required for triggered face recognition.");
+  }
+
+  if (!Number.isFinite(input.timestamp) || input.timestamp <= 0) {
+    throw new Error("RFID trigger timestamp must be a valid Unix millisecond value.");
+  }
+
+  let attempt = 0;
+  let lastError: unknown;
+  while (attempt < 2) {
+    try {
+      return await pythonFaceWorker.recognizeLiveCamera({
+        ...input,
+        rfidTag: normalizedTag,
+      });
+    } catch (err) {
+      lastError = err;
+      await pythonFaceWorker.restart();
+      attempt += 1;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("Python camera-triggered recognition failed after retry.");
 }
 
 export async function warmPythonFaceWorker() {

@@ -165,6 +165,12 @@ export interface GateTimeoutExitCandidate {
   session: GateSessionSnapshot;
 }
 
+export interface CollectedGateEvents {
+  occurredAtMs: number;
+  face?: GateFaceEvent | null;
+  direction?: GateDirectionEvent | null;
+}
+
 function toOccurredAtMs(occurredAt?: Date) {
   return occurredAt?.getTime() ?? Date.now();
 }
@@ -470,12 +476,22 @@ export class GateMatchingEngine {
     return event;
   }
 
-  matchEvents(signal: GateSignalInput): GateCorrelationMatch | null {
+  collectEvents(signal: GateSignalInput): CollectedGateEvents {
     const occurredAtMs = toOccurredAtMs(signal.occurredAt);
     this.cleanup(occurredAtMs);
 
-    let face = this.recordFaceSignal(signal);
-    let direction = this.recordDirectionSignal(signal);
+    return {
+      occurredAtMs,
+      face: this.recordFaceSignal(signal),
+      direction: this.recordDirectionSignal(signal),
+    };
+  }
+
+  matchEvents(signal: GateSignalInput): GateCorrelationMatch | null {
+    const collected = this.collectEvents(signal);
+    const occurredAtMs = collected.occurredAtMs;
+    let face = collected.face ?? undefined;
+    let direction = collected.direction ?? undefined;
     let rfid = signal.rfidUid
       ? this.findBestRfidEvent({
           deviceId: signal.deviceId,
@@ -562,7 +578,6 @@ export class GateMatchingEngine {
 
     if (!rfidPresent || !rfidUid) {
       reasons.push("RFID event is required before a gate decision can be made.");
-      hardRejected = true;
     }
 
     if (rfidUid && faceRfidUidHint && faceRfidUidHint !== rfidUid) {
@@ -580,6 +595,10 @@ export class GateMatchingEngine {
       if (input.strictFaceRequired ?? true) {
         tier = "LOW_CONFIDENCE";
       }
+    }
+
+    if (!directionPresent) {
+      reasons.push("Direction evidence is missing for this gate window.");
     }
 
     if (hardRejected) {
@@ -628,12 +647,21 @@ export class GateMatchingEngine {
     const hasExitDirection = movementDirection === "EXIT";
     const hasEntryDirection = movementDirection === "ENTRY";
 
-    if (input.timedOut && input.hasOpenAttendance && input.validation.rfidPresent) {
+    if (input.timedOut && input.hasOpenAttendance) {
       return {
         action: "EXIT",
         tier: "LOW_CONFIDENCE",
         reason: `Automatic timeout EXIT after ${SESSION_EXIT_TIMEOUT_MS / 1000} seconds without RFID or face activity.`,
         timeoutFallback: true,
+      };
+    }
+
+    if (!input.validation.rfidPresent) {
+      return {
+        action: "IGNORE",
+        tier: "IGNORE",
+        reason: "Ignoring event because RFID is missing from the matched window.",
+        timeoutFallback: false,
       };
     }
 
@@ -646,9 +674,18 @@ export class GateMatchingEngine {
       };
     }
 
+    if (!input.validation.directionPresent) {
+      return {
+        action: "IGNORE",
+        tier: "IGNORE",
+        reason: "Ignoring event because direction is missing from the matched window.",
+        timeoutFallback: false,
+      };
+    }
+
     if (input.confidence.tier === "LOW_CONFIDENCE") {
       return {
-        action: "REJECT",
+        action: "IGNORE",
         tier: "LOW_CONFIDENCE",
         reason: input.validation.reasons[0] ?? "Confidence is below the required threshold for a strict gate decision.",
         timeoutFallback: false,
