@@ -67,6 +67,10 @@ export interface PythonGateVerificationResult {
     bottom: number;
     left: number;
   } | null;
+  previewFrameSize?: {
+    width: number;
+    height: number;
+  } | null;
 }
 
 export interface PythonLiveRecognitionFace {

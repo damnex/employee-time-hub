@@ -1,0 +1,3 @@
+9:56:04 PM [db] connected to PostgreSQL database
+9:56:05 PM [express] serving on port 5000
+[WebSocket] browser connected: ENROLLMENT-CONSOLE-01 from localhost

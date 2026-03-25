@@ -19,6 +19,7 @@ import { z } from "zod";
 import {
   buildPythonFaceDescriptorMeta,
   PYTHON_DATASET_ROOT,
+  type PythonLiveRecognitionFace,
   PYTHON_LBPH_LABELS_PATH,
   PYTHON_LBPH_MODEL_PATH,
   readPythonFaceDescriptorMeta,
@@ -660,20 +661,29 @@ async function processPythonRfidScan(args: {
 }) {
   const { input, employee, now, todayDate, logAndReturn } = args;
 
-  async function salvageBadgeOwnerFromFrames(faceFrames: string[], targetEmployee: Employee) {
-    let bestFace: Awaited<ReturnType<typeof recognizeLiveFrameWithPython>>["faces"][number] | null = null;
+  async function salvageBadgeOwnerFromFrames(
+    faceFrames: string[],
+    targetEmployee: Employee,
+  ): Promise<{
+    face: PythonLiveRecognitionFace | null;
+    frameSize: { width: number; height: number } | null;
+  }> {
+    let bestFace: PythonLiveRecognitionFace | null = null;
     let bestFrameSize: { width: number; height: number } | null = null;
     for (const frame of faceFrames) {
       try {
         const recognition = await recognizeLiveFrameWithPython(frame, 12);
-        recognition.faces.forEach((face) => {
+        for (const face of recognition.faces) {
           const code = face.employeeCode?.trim();
-          if (!face.verified || !code || code !== targetEmployee.employeeCode) return;
-          if (!bestFace || (face.confidence ?? 0) > (bestFace.confidence ?? 0)) {
+          if (!face.verified || !code || code !== targetEmployee.employeeCode) {
+            continue;
+          }
+
+          if (!bestFace || face.confidence > bestFace.confidence) {
             bestFace = face;
             bestFrameSize = { width: recognition.frameWidth, height: recognition.frameHeight };
           }
-        });
+        }
         if (bestFace && (bestFace.confidence ?? 0) >= 0.65) {
           break;
         }
@@ -1366,6 +1376,17 @@ function getConnectionIp(req: IncomingMessage) {
     .replace(/^::ffff:/, "");
 }
 
+function formatConnectionIp(clientType: ClientType, connectionIp: string) {
+  if (
+    clientType === "browser"
+    && (connectionIp === "127.0.0.1" || connectionIp === "::1" || connectionIp === "localhost")
+  ) {
+    return "localhost";
+  }
+
+  return connectionIp;
+}
+
 function broadcastMessage(
   payload: Record<string, unknown>,
   predicate?: (connection: ClientConnection) => boolean,
@@ -1447,7 +1468,7 @@ export async function registerRoutes(
     const clientType = (searchParams.get("clientType") === "device"
       ? "device"
       : "browser") as ClientType;
-    const connectionIp = getConnectionIp(req);
+    const connectionIp = formatConnectionIp(clientType, getConnectionIp(req));
     const connection: ClientConnection = { ws, deviceId, clientType };
 
     replaceExistingConnection(deviceId, clientType);

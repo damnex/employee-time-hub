@@ -66,8 +66,25 @@ def clamp(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, value))
 
 
-def round_float(value: float, digits: int = 4) -> float:
-    return float(np.round(value, digits))
+def round_float(value: float | None, digits: int = 4) -> float | None:
+    if value is None:
+        return None
+
+    rounded = float(np.round(value, digits))
+    return rounded if math.isfinite(rounded) else None
+
+
+def sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+
+    if isinstance(value, dict):
+        return {key: sanitize_json_value(item) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [sanitize_json_value(item) for item in value]
+
+    return value
 
 
 def create_detector() -> cv2.CascadeClassifier:
@@ -326,7 +343,13 @@ def predict_frame(
         if prediction.label is not None and best_prediction.label is None:
             best_prediction = prediction
             continue
-        if (prediction.distance or float("inf")) < (best_prediction.distance or float("inf")):
+        prediction_distance = (
+            prediction.distance if prediction.distance is not None else float("inf")
+        )
+        best_distance = (
+            best_prediction.distance if best_prediction.distance is not None else float("inf")
+        )
+        if prediction_distance < best_distance:
             best_prediction = prediction
 
     return best_prediction or FramePrediction(label=None, distance=None, box=None, center_x=None, area_ratio=None)
@@ -433,7 +456,10 @@ def build_response(
     chosen_predictions = [
         prediction for prediction in verified_predictions if prediction.label and prediction.label.folder_name == best_folder_name  # type: ignore
     ]
-    best_prediction = min(chosen_predictions, key=lambda prediction: prediction.distance or float("inf"))
+    best_prediction = min(
+        chosen_predictions,
+        key=lambda prediction: prediction.distance if prediction.distance is not None else float("inf"),
+    )
     average_distance = float(np.mean([prediction.distance for prediction in chosen_predictions if prediction.distance is not None]))
     match_confidence = clamp(1.0 - (average_distance / max(distance_threshold, 1.0)), 0.0, 1.0)
 
@@ -451,7 +477,10 @@ def build_response(
             "sampleCount": best_employee.sample_count,  # type: ignore
         },
         "matchConfidence": round_float(match_confidence),
-        "bestDistance": round_float(best_prediction.distance or average_distance, 3),
+        "bestDistance": round_float(
+            best_prediction.distance if best_prediction.distance is not None else average_distance,
+            3,
+        ),
         "distanceThreshold": distance_threshold,
         "movementDirection": direction,
         "movementAxis": axis,
@@ -530,7 +559,10 @@ def handle_recognize_frame(
         if prediction.box is None:
             continue
 
-        distance: float | None = float(prediction.distance) if prediction.distance is not None else None  # type: ignore
+        raw_distance: float | None = (
+            float(prediction.distance) if prediction.distance is not None else None
+        )
+        distance: float | None = raw_distance if raw_distance is not None and math.isfinite(raw_distance) else None
         confidence = (
             clamp(1.0 - (distance / max(distance_threshold, 1.0)), 0.0, 1.0)
             if distance is not None
@@ -571,7 +603,8 @@ def handle_recognize_frame(
 
 
 def emit_response(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
+    safe_payload = sanitize_json_value(payload)
+    sys.stdout.write(json.dumps(safe_payload, allow_nan=False) + "\n")
     sys.stdout.flush()
 
 

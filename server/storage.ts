@@ -1,4 +1,4 @@
-import { db, pool } from "./db";
+import { db, pool, shouldUseDatabaseStorage, verifyDatabaseConnection } from "./db";
 import { eq, and, desc, gte, ilike, lte, or, sql } from "drizzle-orm";
 import {
   employees,
@@ -706,8 +706,130 @@ export class MemoryStorage implements IStorage {
   }
 }
 
+class RuntimeStorage implements IStorage {
+  private readonly memoryStorage = new MemoryStorage();
+  private readonly databaseStorage = db ? new DatabaseStorage() : null;
+
+  private getActiveStorage(): IStorage {
+    if (this.databaseStorage && shouldUseDatabaseStorage()) {
+      return this.databaseStorage;
+    }
+
+    return this.memoryStorage;
+  }
+
+  private isTransientDatabaseError(error: unknown) {
+    if (!error || typeof error !== "object") {
+      return false;
+    }
+
+    const errorWithCode = error as { code?: string; message?: string; cause?: { message?: string } };
+    const message = [
+      errorWithCode.message,
+      errorWithCode.cause?.message,
+    ]
+      .filter((value): value is string => typeof value === "string")
+      .join(" ")
+      .toLowerCase();
+
+    return (
+      errorWithCode.code === "ECONNRESET"
+      || errorWithCode.code === "EPIPE"
+      || errorWithCode.code === "57P01"
+      || message.includes("connection terminated due to connection timeout")
+      || message.includes("connection terminated unexpectedly")
+      || message.includes("terminating connection")
+      || message.includes("connection timeout")
+    );
+  }
+
+  private async runWithRetry<T>(operation: (storage: IStorage) => Promise<T>) {
+    const activeStorage = this.getActiveStorage();
+
+    try {
+      return await operation(activeStorage);
+    } catch (error) {
+      if (
+        activeStorage !== this.databaseStorage
+        || !this.databaseStorage
+        || !this.isTransientDatabaseError(error)
+      ) {
+        throw error;
+      }
+
+      console.warn("[storage] Retrying transient PostgreSQL error:", error);
+      const recovered = await verifyDatabaseConnection();
+      if (!recovered) {
+        throw error;
+      }
+
+      return await operation(this.databaseStorage);
+    }
+  }
+
+  getEmployees() {
+    return this.runWithRetry((storage) => storage.getEmployees());
+  }
+
+  getEmployee(id: number) {
+    return this.runWithRetry((storage) => storage.getEmployee(id));
+  }
+
+  getEmployeeByRfid(rfidUid: string) {
+    return this.runWithRetry((storage) => storage.getEmployeeByRfid(rfidUid));
+  }
+
+  createEmployee(employee: InsertEmployee) {
+    return this.runWithRetry((storage) => storage.createEmployee(employee));
+  }
+
+  updateEmployee(id: number, updates: Partial<InsertEmployee>) {
+    return this.runWithRetry((storage) => storage.updateEmployee(id, updates));
+  }
+
+  deleteEmployee(id: number) {
+    return this.runWithRetry((storage) => storage.deleteEmployee(id));
+  }
+
+  getDevice(deviceId: string) {
+    return this.runWithRetry((storage) => storage.getDevice(deviceId));
+  }
+
+  createDevice(device: InsertDevice) {
+    return this.runWithRetry((storage) => storage.createDevice(device));
+  }
+
+  getAttendances(filters?: AttendanceFilters) {
+    return this.runWithRetry((storage) => storage.getAttendances(filters));
+  }
+
+  getOpenAttendance(employeeId: number, date: string) {
+    return this.runWithRetry((storage) => storage.getOpenAttendance(employeeId, date));
+  }
+
+  createAttendance(attendance: InsertAttendance) {
+    return this.runWithRetry((storage) => storage.createAttendance(attendance));
+  }
+
+  updateAttendance(id: number, updates: Partial<InsertAttendance>) {
+    return this.runWithRetry((storage) => storage.updateAttendance(id, updates));
+  }
+
+  getGateEvents(filters?: GateEventFilters) {
+    return this.runWithRetry((storage) => storage.getGateEvents(filters));
+  }
+
+  createGateEvent(event: InsertGateEvent) {
+    return this.runWithRetry((storage) => storage.createGateEvent(event));
+  }
+
+  getDashboardStats() {
+    return this.runWithRetry((storage) => storage.getDashboardStats());
+  }
+}
+
 if (!db) {
   console.warn("[storage] DATABASE_URL not set. Using in-memory storage.");
 }
 
-export const storage: IStorage = db ? new DatabaseStorage() : new MemoryStorage();
+export const storage: IStorage = new RuntimeStorage();

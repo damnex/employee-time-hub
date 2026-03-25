@@ -981,7 +981,7 @@ export default function Employees() {
                       <p className="text-xs text-muted-foreground">Controls whether this profile is usable at the gate.</p>
                     </div>
                     <FormControl>
-                      <Switch checked={field.value} onCheckedChange={field.onChange} />
+                      <Switch checked={Boolean(field.value)} onCheckedChange={field.onChange} />
                     </FormControl>
                   </FormItem>
                 )}

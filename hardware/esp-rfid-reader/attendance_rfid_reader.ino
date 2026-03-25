@@ -28,13 +28,16 @@
 #include <MFRC522.h>
 #include <WebSocketsClient.h>
 
-// Hotspot credentials for the presentation setup.
-const char* WIFI_SSID = "One Plus";
-const char* WIFI_PASSWORD = "20022007";
+// Recommended debug path: use the laptop's Windows Mobile Hotspot so the ESP
+// connects directly to the laptop running the app. Replace these with the
+// hotspot name/password shown in Windows Settings > Mobile hotspot.
+const char* WIFI_SSID = "YOUR-LAPTOP-HOTSPOT";
+const char* WIFI_PASSWORD = "YOUR-HOTSPOT-PASSWORD";
 
-// Replace this with the laptop IPv4 address after the laptop joins the hotspot.
-// Example: 192.168.191.120
-const char* WS_HOST = "192.168.0.100";
+// For Windows Mobile Hotspot, the laptop adapter is commonly 192.168.137.1.
+// Verify with `ipconfig` and update this value if your hotspot uses a
+// different IPv4 address.
+const char* WS_HOST = "192.168.137.1";
 const uint16_t WS_PORT = 5000;
 const char* WS_PATH = "/ws/device?deviceId=GATE-TERMINAL-01&clientType=device";
 
@@ -74,6 +77,64 @@ unsigned long lastRfidInitAt = 0;
 
 bool isReaderVersionValid(byte version) {
   return version != 0x00 && version != 0xFF;
+}
+
+const __FlashStringHelper* wifiStatusLabel(wl_status_t status) {
+  switch (status) {
+    case WL_CONNECTED:
+      return F("CONNECTED");
+    case WL_NO_SSID_AVAIL:
+      return F("SSID_NOT_FOUND");
+    case WL_CONNECT_FAILED:
+      return F("CONNECT_FAILED");
+    case WL_CONNECTION_LOST:
+      return F("CONNECTION_LOST");
+    case WL_DISCONNECTED:
+      return F("DISCONNECTED");
+#if defined(ESP8266)
+    case WL_WRONG_PASSWORD:
+      return F("WRONG_PASSWORD");
+    case WL_IDLE_STATUS:
+      return F("IDLE");
+    case WL_SCAN_COMPLETED:
+      return F("SCAN_COMPLETED");
+#elif defined(ESP32)
+    case WL_IDLE_STATUS:
+      return F("IDLE");
+    case WL_SCAN_COMPLETED:
+      return F("SCAN_COMPLETED");
+#endif
+    default:
+      return F("UNKNOWN");
+  }
+}
+
+void printServerEndpoint() {
+  Serial.print(F("ws://"));
+  Serial.print(WS_HOST);
+  Serial.print(':');
+  Serial.print(WS_PORT);
+  Serial.println(WS_PATH);
+}
+
+void logNetworkSnapshot(const __FlashStringHelper* context) {
+  Serial.print(F("[NET] "));
+  Serial.println(context);
+  Serial.print(F("[NET] Wi-Fi status: "));
+  Serial.println(wifiStatusLabel(WiFi.status()));
+  Serial.print(F("[NET] SSID: "));
+  Serial.println(WIFI_SSID);
+  Serial.print(F("[NET] Local IP: "));
+  Serial.println(WiFi.localIP());
+  Serial.print(F("[NET] Gateway: "));
+  Serial.println(WiFi.gatewayIP());
+  Serial.print(F("[NET] Subnet mask: "));
+  Serial.println(WiFi.subnetMask());
+  Serial.print(F("[NET] RSSI: "));
+  Serial.print(WiFi.RSSI());
+  Serial.println(F(" dBm"));
+  Serial.print(F("[NET] Server endpoint: "));
+  printServerEndpoint();
 }
 
 String formatHexByte(byte value) {
@@ -192,13 +253,17 @@ void connectToWifi() {
     Serial.println(F("Wi-Fi connected."));
     Serial.print(F("Device IP: "));
     Serial.println(WiFi.localIP());
-    Serial.print(F("Target server: ws://"));
-    Serial.print(WS_HOST);
-    Serial.print(':');
-    Serial.print(WS_PORT);
-    Serial.println(WS_PATH);
+    Serial.print(F("Target server: "));
+    printServerEndpoint();
+    Serial.print(F("Gateway: "));
+    Serial.println(WiFi.gatewayIP());
+    Serial.print(F("Signal strength: "));
+    Serial.print(WiFi.RSSI());
+    Serial.println(F(" dBm"));
   } else {
     Serial.println(F("Wi-Fi connect timeout. Will retry automatically."));
+    Serial.print(F("Wi-Fi status after timeout: "));
+    Serial.println(wifiStatusLabel(WiFi.status()));
     readerReadyAnnounced = false;
   }
 }
@@ -209,6 +274,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       socketConnected = false;
       readerReadyAnnounced = false;
       Serial.println(F("[WS] Disconnected from server."));
+      logNetworkSnapshot(F("Connection closed before handshake or after a drop."));
+      Serial.println(F("[WS] If this repeats, check Windows Firewall on TCP 5000 and verify both devices are on the same hotspot."));
       break;
 
     case WStype_CONNECTED:
@@ -229,7 +296,25 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_ERROR:
       socketConnected = false;
       readerReadyAnnounced = false;
-      Serial.println(F("[WS] Error."));
+      Serial.println(F("[WS] Error event received."));
+      if (payload != nullptr && length > 0) {
+        Serial.print(F("[WS] Error payload: "));
+        for (size_t i = 0; i < length; i++) {
+          Serial.print(static_cast<char>(payload[i]));
+        }
+        Serial.println();
+      } else {
+        Serial.println(F("[WS] No error payload provided by the library."));
+      }
+      logNetworkSnapshot(F("WebSocket error details"));
+      break;
+
+    case WStype_PING:
+      Serial.println(F("[WS] Ping received from server."));
+      break;
+
+    case WStype_PONG:
+      Serial.println(F("[WS] Pong received from server."));
       break;
 
     default:
@@ -238,6 +323,8 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 void connectWebSocket() {
+  Serial.print(F("[WS] Starting WebSocket client -> "));
+  printServerEndpoint();
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(WS_RECONNECT_MS);
@@ -310,6 +397,8 @@ void ensureWifi() {
 
   lastWifiRetryAt = millis();
   Serial.println(F("[Wi-Fi] Connection lost. Retrying..."));
+  Serial.print(F("[Wi-Fi] Current status: "));
+  Serial.println(wifiStatusLabel(WiFi.status()));
   WiFi.disconnect();
   connectToWifi();
 }
@@ -320,7 +409,9 @@ void setup() {
 
   printDivider();
   Serial.println(F("Attendance RFID Reader starting..."));
-  Serial.println(F("Before use, set WS_HOST to the laptop hotspot IPv4 address."));
+  Serial.println(F("Recommended debug setup: enable Windows Mobile Hotspot on the laptop."));
+  Serial.println(F("Update WIFI_SSID/WIFI_PASSWORD to the hotspot name and password."));
+  Serial.println(F("Set WS_HOST to the laptop hotspot IPv4 (commonly 192.168.137.1)."));
   printDivider();
 
   connectToWifi();
@@ -354,3 +445,4 @@ void loop() {
   sendRfidDetected(uid);
   delay(RFID_LOOP_SETTLE_MS);
 }
+

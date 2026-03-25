@@ -80,7 +80,7 @@ app.use((req, res, next) => {
   log(
     databaseReady
       ? "connected to PostgreSQL database"
-      : "DATABASE_URL not set. Running with in-memory storage.",
+      : "PostgreSQL unavailable. Running with in-memory storage.",
     "db",
   );
 
