@@ -164,6 +164,7 @@ The Python worker keeps `cv2.VideoCapture` running in the background, always upd
 Set these in `.env.local` if the default webcam source `0` is not correct:
 
 ```env
+ENABLE_TRIGGERED_CAMERA_FACE_RECOGNITION=true
 PYTHON_FACE_CAMERA_SOURCE=0
 PYTHON_FACE_CAMERA_WIDTH=640
 PYTHON_FACE_CAMERA_HEIGHT=480

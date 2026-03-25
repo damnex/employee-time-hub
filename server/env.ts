@@ -117,3 +117,11 @@ export function allowInsecureFaceFallback() {
     ?? null,
   );
 }
+
+export function useTriggeredCameraFaceRecognition() {
+  loadEnvironment();
+  return isTruthyEnvValue(
+    process.env.ENABLE_TRIGGERED_CAMERA_FACE_RECOGNITION
+    ?? null,
+  );
+}
