@@ -9,7 +9,7 @@
   - Connects the reader to your Wi-Fi / phone hotspot
   - Connects to the app WebSocket endpoint at /ws/device
   - Reads MFRC522 RFID cards
-  - Sends {"type":"rfid_detected","rfidUid":"..."} to the server
+  - Sends {"type":"rfid_detected","rfidUid":"...","scanTechnology":"HF_RFID"} to the server
 
   Important:
   This project's gate flow expects the browser to do face verification.
@@ -34,19 +34,21 @@
 const char* WIFI_SSID = "YOUR-LAPTOP-HOTSPOT";
 const char* WIFI_PASSWORD = "YOUR-HOTSPOT-PASSWORD";
 
-// For Windows Mobile Hotspot, the laptop adapter is commonly 192.168.137.1.
-// Verify with `ipconfig` and update this value if your hotspot uses a
-// different IPv4 address.
-const char* WS_HOST = "192.168.137.1";
+// Update this to the laptop IPv4 address on the same network as the ESP.
+// Current Wi-Fi adapter IPv4 on this machine: 10.161.159.9
+const char* WS_HOST = "10.161.159.9";
 const uint16_t WS_PORT = 5000;
 const char* WS_PATH = "/ws/device?deviceId=GATE-TERMINAL-01&clientType=device";
+const char* SCAN_TECHNOLOGY = "HF_RFID";
 
 const unsigned long WIFI_RETRY_MS = 2000;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
 const unsigned long CARD_DEBOUNCE_MS = 500;
 const unsigned long RFID_LOOP_SETTLE_MS = 35;
 const unsigned long WS_RECONNECT_MS = 1000;
 const unsigned long WS_HEARTBEAT_INTERVAL_MS = 15000;
 const unsigned long WS_HEARTBEAT_TIMEOUT_MS = 4000;
+const unsigned long WS_RECOVERY_CHECK_MS = 3000;
 const unsigned long RFID_HEALTHCHECK_MS = 2500;
 const unsigned long RFID_REINIT_COOLDOWN_MS = 1200;
 const uint8_t RFID_SERIAL_READ_RETRIES = 3;
@@ -74,6 +76,9 @@ bool readerReadyAnnounced = false;
 byte readerVersion = 0;
 unsigned long lastRfidHealthcheckAt = 0;
 unsigned long lastRfidInitAt = 0;
+unsigned long lastWsRecoveryCheckAt = 0;
+unsigned long lastWsConnectAttemptAt = 0;
+bool webSocketStarted = false;
 
 bool isReaderVersionValid(byte version) {
   return version != 0x00 && version != 0xFF;
@@ -237,13 +242,27 @@ void announceReaderReadyIfAvailable() {
   readerReadyAnnounced = true;
 }
 
+void configureWifiStation() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+
+#if defined(ESP8266)
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#elif defined(ESP32)
+  WiFi.setSleep(false);
+#endif
+}
+
 void connectToWifi() {
   Serial.printf("Connecting to Wi-Fi SSID \"%s\"", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
+  configureWifiStation();
+  WiFi.disconnect();
+  delay(100);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long startedAt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < 20000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startedAt < WIFI_CONNECT_TIMEOUT_MS) {
     delay(500);
     Serial.print('.');
   }
@@ -280,6 +299,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
     case WStype_CONNECTED:
       socketConnected = true;
+      lastWsConnectAttemptAt = millis();
       Serial.print(F("[WS] Connected to: "));
       Serial.println(reinterpret_cast<const char*>(payload));
       announceReaderReadyIfAvailable();
@@ -323,12 +343,46 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 void connectWebSocket() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (webSocketStarted) {
+    webSocket.disconnect();
+    delay(20);
+  }
+
   Serial.print(F("[WS] Starting WebSocket client -> "));
   printServerEndpoint();
   webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(WS_RECONNECT_MS);
   webSocket.enableHeartbeat(WS_HEARTBEAT_INTERVAL_MS, WS_HEARTBEAT_TIMEOUT_MS, 2);
+  lastWsConnectAttemptAt = millis();
+  webSocketStarted = true;
+}
+
+void ensureWebSocketConnected() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (socketConnected) {
+    return;
+  }
+
+  const unsigned long now = millis();
+  if ((now - lastWsRecoveryCheckAt) < WS_RECOVERY_CHECK_MS) {
+    return;
+  }
+
+  lastWsRecoveryCheckAt = now;
+  if (webSocketStarted && (now - lastWsConnectAttemptAt) < WS_RECOVERY_CHECK_MS) {
+    return;
+  }
+
+  Serial.println(F("[WS] Socket offline. Restarting WebSocket client."));
+  connectWebSocket();
 }
 
 String readCardUid() {
@@ -376,8 +430,9 @@ void sendRfidDetected(const String& uid) {
     return;
   }
 
-  const String payload =
-    "{\"type\":\"rfid_detected\",\"rfidUid\":\"" + uid + "\"}";
+  String payload =
+    "{\"type\":\"rfid_detected\",\"rfidUid\":\"" + uid
+    + "\",\"scanTechnology\":\"" + String(SCAN_TECHNOLOGY) + "\"}";
 
   Serial.print(F("[RFID] Sending UID: "));
   Serial.println(uid);
@@ -390,6 +445,7 @@ void ensureWifi() {
   }
 
   readerReadyAnnounced = false;
+  socketConnected = false;
 
   if (millis() - lastWifiRetryAt < WIFI_RETRY_MS) {
     return;
@@ -401,6 +457,9 @@ void ensureWifi() {
   Serial.println(wifiStatusLabel(WiFi.status()));
   WiFi.disconnect();
   connectToWifi();
+  if (WiFi.status() == WL_CONNECTED) {
+    connectWebSocket();
+  }
 }
 
 void setup() {
@@ -425,6 +484,7 @@ void setup() {
 void loop() {
   ensureWifi();
   webSocket.loop();
+  ensureWebSocketConnected();
   ensureRfidReaderReady();
   announceReaderReadyIfAvailable();
 

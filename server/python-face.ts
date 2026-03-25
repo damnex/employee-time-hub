@@ -620,5 +620,18 @@ export async function recognizeLiveFrameWithPython(frame: string, maxFaces = 50)
   throw lastError instanceof Error ? lastError : new Error("Python live recognition failed after retry.");
 }
 
+export async function warmPythonFaceWorker() {
+  try {
+    await Promise.all([
+      fs.access(PYTHON_LBPH_MODEL_PATH),
+      fs.access(PYTHON_LBPH_LABELS_PATH),
+    ]);
+  } catch {
+    return;
+  }
+
+  await pythonFaceWorker.start();
+}
+
 
 

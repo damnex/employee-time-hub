@@ -179,6 +179,7 @@ export const api = {
       responses: {
         200: z.object({
           success: z.boolean(),
+          ignored: z.boolean().optional(),
           message: z.string(),
           employee: z.custom<typeof employees.$inferSelect>().optional(),
           attendance: z.custom<typeof attendances.$inferSelect>().optional(),

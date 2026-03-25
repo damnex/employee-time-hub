@@ -68,7 +68,13 @@ export function useScanRFID() {
       queryClient.invalidateQueries({ queryKey: [api.gateEvents.list.path] });
       queryClient.invalidateQueries({ queryKey: [api.stats.dashboard.path] });
 
-      if (data.success) {
+      if (data.ignored) {
+        toast({
+          title: "Duplicate Ignored",
+          description: data.message,
+          className: "bg-amber-50 text-amber-900 border-amber-200",
+        });
+      } else if (data.success) {
         toast({
           title: "Access Granted",
           description: data.message,

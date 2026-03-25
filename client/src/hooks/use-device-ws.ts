@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 export interface DeviceScanResult {
   type: 'scan_result' | 'connected' | 'error' | 'rfid_detected' | 'device_presence';
   success?: boolean;
+  ignored?: boolean;
   message: string;
   employee?: { id: number; name: string };
   action?: 'ENTRY' | 'EXIT';
@@ -43,6 +44,20 @@ export function useDeviceWS(
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+    };
+
+    const setKnownDeviceOnline = (targetDeviceId: string, online: boolean) => {
+      if (!targetDeviceId || targetDeviceId === resolvedDeviceId) {
+        return;
+      }
+
+      if (online) {
+        onlineDevicesRef.current.add(targetDeviceId);
+      } else {
+        onlineDevicesRef.current.delete(targetDeviceId);
+      }
+
+      setDeviceOnline(onlineDevicesRef.current.size > 0);
     };
 
     const scheduleReconnect = () => {
@@ -93,12 +108,15 @@ export function useDeviceWS(
             if (message.type === "device_presence") {
               const online = Boolean((message as any).online);
               const id = (message as any).deviceId || "unknown";
-              if (online) {
-                onlineDevicesRef.current.add(id);
-              } else {
-                onlineDevicesRef.current.delete(id);
-              }
-              setDeviceOnline(onlineDevicesRef.current.size > 0);
+              setKnownDeviceOnline(id, online);
+            } else if (
+              clientType === "browser"
+              && message.deviceId
+              && (message.type === "rfid_detected" || message.type === "scan_result")
+            ) {
+              // Any real-time device event proves the reader is online even if the
+              // presence event arrived late or was missed during a reconnect.
+              setKnownDeviceOnline(message.deviceId, true);
             }
             console.log('[DeviceWS] Received:', message);
           } catch (error) {

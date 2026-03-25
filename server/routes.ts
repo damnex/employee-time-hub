@@ -30,8 +30,13 @@ import {
   parseDataUrl,
   saveEmployeeDatasetPhotos,
   verifyGateFramesWithPython,
+  warmPythonFaceWorker,
 } from "./python-face";
 import path from "path";
+import {
+  gateMatchingEngine,
+  type GateCorrelationMatch,
+} from "./gate-matching-engine";
 
 type ClientType = "browser" | "device";
 
@@ -68,6 +73,7 @@ interface ProcessScanInput {
 
 interface ProcessedScanResult {
   success: boolean;
+  ignored?: boolean;
   message: string;
   employee?: Employee;
   attendance?: Attendance;
@@ -444,15 +450,55 @@ async function closeOpenAttendance(openEntry: Attendance, now: Date) {
   });
 }
 
+function rememberSessionOutcome(
+  correlation: GateCorrelationMatch | null | undefined,
+  now: Date,
+  outcome: "ENTRY" | "EXIT" | "REJECTED" | "IGNORED",
+  action?: AttendanceAction,
+) {
+  if (!correlation) {
+    return;
+  }
+
+  gateMatchingEngine.recordSessionOutcome({
+    session: correlation.session,
+    occurredAt: now,
+    outcome,
+    action,
+  });
+}
+
 async function resolveAttendanceDecision(
   employee: Employee,
   now: Date,
   todayDate: string,
   deviceId: string,
   matchConfidence: number,
+  correlation?: GateCorrelationMatch | null,
   movementDirection?: MovementDirection,
   movementConfidence?: number,
 ): Promise<ProcessedScanResult> {
+  const duplicateReason = correlation
+    ? gateMatchingEngine.getDuplicateReason({
+        session: correlation.session,
+        occurredAt: now,
+        movementDirection,
+      })
+    : null;
+
+  if (duplicateReason) {
+    rememberSessionOutcome(correlation, now, "IGNORED");
+    return {
+      success: true,
+      ignored: true,
+      message: duplicateReason,
+      employee,
+      matchConfidence,
+      movementDirection,
+      movementConfidence,
+    };
+  }
+
   const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
   const hasDirectionSignal = movementDirection !== undefined;
   const directionIsConfident =
@@ -462,19 +508,12 @@ async function resolveAttendanceDecision(
   if (hasDirectionSignal && directionIsConfident) {
     if (movementDirection === "ENTRY") {
       if (openEntry) {
-        const attendance = await createFailureAttendance(
-          employee.id,
-          todayDate,
-          now,
-          deviceId,
-          "FAILED_DIRECTION",
-        );
-
+        rememberSessionOutcome(correlation, now, "IGNORED");
         return {
-          success: false,
-          message: "An entry is already open. Show the exit-side face before marking another scan.",
+          success: true,
+          ignored: true,
+          message: "Tag is already inside the gate session. Duplicate entry ignored.",
           employee,
-          attendance,
           matchConfidence,
           movementDirection,
           movementConfidence,
@@ -482,6 +521,7 @@ async function resolveAttendanceDecision(
       }
 
       const attendance = await createEntryAttendance(employee.id, todayDate, now, deviceId);
+      rememberSessionOutcome(correlation, now, "ENTRY", "ENTRY");
 
       return {
         success: true,
@@ -503,6 +543,7 @@ async function resolveAttendanceDecision(
         deviceId,
         "FAILED_DIRECTION",
       );
+      rememberSessionOutcome(correlation, now, "REJECTED");
 
       return {
         success: false,
@@ -517,6 +558,7 @@ async function resolveAttendanceDecision(
 
     const attendance = await closeOpenAttendance(openEntry, now);
     if (!attendance) {
+      rememberSessionOutcome(correlation, now, "REJECTED");
       return {
         success: false,
         message: "Exit could not be recorded. Please retry the scan.",
@@ -526,6 +568,7 @@ async function resolveAttendanceDecision(
         movementConfidence,
       };
     }
+    rememberSessionOutcome(correlation, now, "EXIT", "EXIT");
 
     return {
       success: true,
@@ -542,6 +585,7 @@ async function resolveAttendanceDecision(
   if (openEntry) {
     const attendance = await closeOpenAttendance(openEntry, now);
     if (!attendance) {
+      rememberSessionOutcome(correlation, now, "REJECTED");
       return {
         success: false,
         message: "Exit could not be recorded. Please retry the scan.",
@@ -549,6 +593,7 @@ async function resolveAttendanceDecision(
         matchConfidence,
       };
     }
+    rememberSessionOutcome(correlation, now, "EXIT", "EXIT");
 
     return {
       success: true,
@@ -561,6 +606,7 @@ async function resolveAttendanceDecision(
   }
 
   const attendance = await createEntryAttendance(employee.id, todayDate, now, deviceId);
+  rememberSessionOutcome(correlation, now, "ENTRY", "ENTRY");
 
   return {
     success: true,
@@ -657,9 +703,10 @@ async function processPythonRfidScan(args: {
   employee: Employee;
   now: Date;
   todayDate: string;
+  correlation: GateCorrelationMatch | null;
   logAndReturn: LogAndReturnFn;
 }) {
-  const { input, employee, now, todayDate, logAndReturn } = args;
+  const { input, employee, now, todayDate, correlation, logAndReturn } = args;
 
   async function salvageBadgeOwnerFromFrames(
     faceFrames: string[],
@@ -871,6 +918,7 @@ async function processPythonRfidScan(args: {
       todayDate,
       input.deviceId,
       matchConfidence,
+      correlation,
       verification.movementDirection,
       verification.movementConfidence,
     );
@@ -916,6 +964,10 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   input.rfidUid = normalizedRfidUid;
   const now = new Date();
   const todayDate = now.toISOString().split("T")[0];
+  const correlation = gateMatchingEngine.ingestCompositeSignal({
+    ...input,
+    occurredAt: now,
+  });
   const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
   const logAndReturn = async (
     result: ProcessedScanResult,
@@ -940,6 +992,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   };
 
   if (!employee) {
+    rememberSessionOutcome(correlation, now, "REJECTED");
     return logAndReturn({
       success: false,
       message: "Unknown RFID card rejected.",
@@ -955,6 +1008,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
       employee,
       now,
       todayDate,
+      correlation,
       logAndReturn,
     });
   }
@@ -1333,6 +1387,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     todayDate,
     input.deviceId,
     matchConfidence,
+    correlation,
     input.movementDirection,
     input.movementConfidence,
   );
@@ -1351,6 +1406,7 @@ function toSocketScanResult(result: ProcessedScanResult, rfidUid: string) {
   return {
     type: "scan_result",
     success: result.success,
+    ignored: result.ignored,
     message: result.message,
     employee: result.employee
       ? { id: result.employee.id, name: result.employee.name }
@@ -1446,6 +1502,9 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express
 ): Promise<Server> {
+  void warmPythonFaceWorker().catch((error) => {
+    console.warn("[python-face] Warm-up skipped:", error);
+  });
   
   // Setup WebSocket server for real ESP8266 device communication
   const wss = new WebSocketServer({
@@ -1512,6 +1571,14 @@ export async function registerRoutes(
             }));
             return;
           }
+
+          gateMatchingEngine.recordRfidDetection({
+            deviceId,
+            rfidUid,
+            scanTechnology:
+              message.scanTechnology === "UHF_RFID" ? "UHF_RFID" : "HF_RFID",
+            source: "reader_detected",
+          });
 
           const mappedEmployee = await storage.getEmployeeByRfid(rfidUid);
           const payload = {

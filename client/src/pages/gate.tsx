@@ -53,6 +53,7 @@ const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.68;
 const LIVE_RECOGNITION_STABLE_HITS = 3;
 const LIVE_RECOGNITION_TTL_MS = 2200;
 const LIVE_RECOGNITION_MATCH_DISTANCE = 0.12;
+const SENSOR_ACTIVE_WINDOW_MS = 4500;
 
 type PythonFaceStatus = "training" | "trained" | "failed";
 
@@ -120,6 +121,7 @@ type LiveRecognitionAssignment = {
 
 type GateDisplayResult = {
   success: boolean;
+  ignored?: boolean;
   message: string;
   employee?: Employee;
   badgeOwner?: Employee;
@@ -463,6 +465,7 @@ export default function GateTerminal() {
   const browserNextTrackIdRef = useRef(1);
   const browserMissCountRef = useRef(0);
   const browserTrackedFacesRef = useRef<LiveTrackedFace[]>([]);
+  const sensorWindowTimerRef = useRef<number | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [rfidUid, setRfidUid] = useState("");
@@ -480,6 +483,7 @@ export default function GateTerminal() {
   const [liveRecognitionAssignments, setLiveRecognitionAssignments] = useState<LiveRecognitionAssignment[]>([]);
   const [liveTrackerAvailable, setLiveTrackerAvailable] = useState<boolean | null>(null);
   const [liveRecognitionMessage, setLiveRecognitionMessage] = useState<string | null>(null);
+  const [sensorWindowOpen, setSensorWindowOpen] = useState(false);
   const [pendingReaderScan, setPendingReaderScan] = useState<{
     rfidUid: string;
     sourceDeviceId: string;
@@ -487,6 +491,7 @@ export default function GateTerminal() {
   const [lastResult, setLastResult] = useState<GateDisplayResult | null>(null);
 
   const busy = isCapturingFrames || scanMutation.isPending;
+  const sensorWindowActive = sensorWindowOpen || busy;
   const busyRef = useRef(busy);
   const normalizedRfidUid = rfidUid.trim().toUpperCase();
   const selectedBadgeOwner = employees?.find((employee) => {
@@ -590,6 +595,27 @@ export default function GateTerminal() {
     browserTrackedFacesRef.current = browserTrackedFaces;
   }, [browserTrackedFaces]);
 
+  const armSensorWindow = useCallback((durationMs = SENSOR_ACTIVE_WINDOW_MS) => {
+    setSensorWindowOpen(true);
+
+    if (sensorWindowTimerRef.current !== null) {
+      window.clearTimeout(sensorWindowTimerRef.current);
+    }
+
+    sensorWindowTimerRef.current = window.setTimeout(() => {
+      sensorWindowTimerRef.current = null;
+      setSensorWindowOpen(false);
+    }, durationMs);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (sensorWindowTimerRef.current !== null) {
+        window.clearTimeout(sensorWindowTimerRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     let stream: MediaStream | null = null;
     let cancelled = false;
@@ -648,11 +674,20 @@ export default function GateTerminal() {
   }, [cameraRetryToken]);
 
   useEffect(() => {
-    if (!cameraActive || !videoRef.current || !canvasRef.current || !cameraViewportRef.current) {
+    if (
+      !cameraActive
+      || !videoRef.current
+      || !canvasRef.current
+      || !cameraViewportRef.current
+      || !sensorWindowActive
+    ) {
       setPythonTrackedFaces([]);
       setLiveRecognitionAssignments([]);
       pythonPreviousLiveTracksRef.current = [];
       pythonMissCountRef.current = 0;
+      setLiveRecognitionMessage(
+        cameraActive ? "Waiting for an RFID trigger before running face recognition." : null,
+      );
       return;
     }
 
@@ -859,7 +894,7 @@ export default function GateTerminal() {
         pythonMissCountRef.current = 0;
       }
     };
-  }, [cameraActive, liveTrackerAvailable]);
+  }, [cameraActive, liveTrackerAvailable, sensorWindowActive]);
 
   useEffect(() => {
     if (
@@ -867,6 +902,7 @@ export default function GateTerminal() {
       || !videoRef.current
       || !cameraViewportRef.current
       || liveTrackerAvailable === false
+      || !sensorWindowActive
     ) {
       setBrowserTrackedFaces([]);
       browserTrackedFacesRef.current = [];
@@ -979,7 +1015,7 @@ export default function GateTerminal() {
       browserPreviousLiveTracksRef.current = [];
       browserMissCountRef.current = 0;
     };
-  }, [cameraActive, liveTrackerAvailable]);
+  }, [cameraActive, liveTrackerAvailable, sensorWindowActive]);
 
   const captureFrameBurst = useCallback(async () => {
     if (!videoRef.current || !canvasRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
@@ -1028,6 +1064,7 @@ export default function GateTerminal() {
       return;
     }
 
+    armSensorWindow();
     setRfidUid(normalizedUid);
     setLiveTapUid(normalizedUid);
 
@@ -1036,11 +1073,29 @@ export default function GateTerminal() {
     });
     const requestDeviceId = sourceDeviceId ?? readerSourceDeviceId ?? GATE_DEVICE_ID;
     const scanStartedAt = performance.now();
+    const visibleFaceCount = liveTrackerAvailable === false
+      ? pythonTrackedFaces.length
+      : browserTrackedFacesRef.current.length;
 
     if (!cameraActive) {
       setLastResult({
         success: false,
         message: cameraError ?? "Camera is not ready. Retry the webcam before scanning.",
+        employee: badgeOwner,
+        badgeOwner,
+        verifiedAt: new Date().toLocaleTimeString(),
+        latencyMs: Math.round(performance.now() - scanStartedAt),
+        previewImage: null,
+        source,
+        previewFrameSize: null,
+      });
+      return;
+    }
+
+    if (visibleFaceCount > 1) {
+      setLastResult({
+        success: false,
+        message: "Multiple people are in view. Keep only one face visible before scanning again.",
         employee: badgeOwner,
         badgeOwner,
         verifiedAt: new Date().toLocaleTimeString(),
@@ -1096,11 +1151,14 @@ export default function GateTerminal() {
       setCaptureProgress(0);
     }
   }, [
+    armSensorWindow,
     busy,
     cameraActive,
     cameraError,
     captureFrameBurst,
     employees,
+    liveTrackerAvailable,
+    pythonTrackedFaces,
     readerSourceDeviceId,
     scanMutation,
     scanTechnology,
@@ -1114,6 +1172,7 @@ export default function GateTerminal() {
     const tappedUid = lastScanResult.rfidUid.trim().toUpperCase();
     const sourceDeviceId = lastScanResult.deviceId ?? GATE_DEVICE_ID;
 
+    armSensorWindow();
     setRfidUid(tappedUid);
     setLiveTapUid(tappedUid);
     setReaderMessage(lastScanResult.message);
@@ -1129,7 +1188,7 @@ export default function GateTerminal() {
     }
 
     void handleScan(tappedUid, "reader", sourceDeviceId);
-  }, [busy, clearResult, handleScan, lastScanResult]);
+  }, [armSensorWindow, busy, clearResult, handleScan, lastScanResult]);
 
   useEffect(() => {
     if (!pendingReaderScan || busy) {
@@ -1148,6 +1207,8 @@ export default function GateTerminal() {
 
   const cameraFrameTone = !cameraActive
     ? "border-slate-300 shadow-none"
+    : lastResult?.ignored
+      ? "border-amber-300 shadow-[0_0_0_1px_rgba(253,224,71,0.82),0_0_28px_rgba(253,224,71,0.24)]"
     : lastResult?.success
       ? "border-emerald-400 shadow-[0_0_0_1px_rgba(74,222,128,0.82),0_0_28px_rgba(74,222,128,0.28)]"
       : lastResult
@@ -1157,6 +1218,8 @@ export default function GateTerminal() {
           : "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.78),0_0_24px_rgba(34,211,238,0.22)]";
   const lastResultTone = !lastResult
     ? "border-slate-200 bg-white/90"
+    : lastResult.ignored
+      ? "border-amber-200 bg-amber-50/90"
     : lastResult.success
       ? "border-emerald-200 bg-emerald-50/90"
       : "border-rose-200 bg-rose-50/90";
@@ -1352,13 +1415,17 @@ export default function GateTerminal() {
                         "shrink-0",
                         !lastResult
                           ? "border-slate-300 text-slate-600"
+                          : lastResult.ignored
+                            ? "border-amber-300 bg-amber-100 text-amber-700"
                           : lastResult.success
                             ? "border-emerald-300 bg-emerald-100 text-emerald-700"
                             : "border-rose-300 bg-rose-100 text-rose-700",
                       )}
                     >
                       {lastResult
-                        ? lastResult.success
+                        ? lastResult.ignored
+                          ? "IGNORED"
+                          : lastResult.success
                           ? lastResult.action ?? "MATCHED"
                           : "REJECTED"
                         : "IDLE"}
@@ -1403,12 +1470,16 @@ export default function GateTerminal() {
               <Alert className={cn(
                 !lastResult
                   ? "border-slate-200 bg-white/75"
+                  : lastResult.ignored
+                    ? "border-amber-200 bg-amber-50"
                   : lastResult.success
                     ? "border-emerald-200 bg-emerald-50"
                     : "border-rose-200 bg-rose-50",
               )}>
                 {lastResult ? (
-                  lastResult.success ? (
+                  lastResult.ignored ? (
+                    <AlertCircle className="size-4 text-amber-700" />
+                  ) : lastResult.success ? (
                     <CheckCircle2 className="size-4 text-emerald-600" />
                   ) : (
                     <AlertCircle className="size-4 text-rose-600" />
@@ -1416,7 +1487,15 @@ export default function GateTerminal() {
                 ) : (
                   <ShieldCheck className="size-4 text-slate-500" />
                 )}
-                <AlertTitle>{lastResult?.success ? "Access granted" : lastResult ? "Access denied" : "Ready for next employee"}</AlertTitle>
+                <AlertTitle>
+                  {lastResult?.ignored
+                    ? "Duplicate ignored"
+                    : lastResult?.success
+                      ? "Access granted"
+                      : lastResult
+                        ? "Access denied"
+                        : "Ready for next employee"}
+                </AlertTitle>
                 {lastResult?.message && (
                   <AlertDescription>{lastResult.message}</AlertDescription>
                 )}
