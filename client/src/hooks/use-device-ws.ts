@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 
+const DEVICE_ONLINE_TTL_MS = 9000;
+const DEVICE_ONLINE_SWEEP_MS = 3000;
+
 export interface DeviceScanResult {
   type: 'scan_result' | 'connected' | 'error' | 'rfid_detected' | 'device_presence';
   success?: boolean;
@@ -32,7 +35,7 @@ export function useDeviceWS(
   const [lastScanResult, setLastScanResult] = useState<DeviceScanResult | null>(null);
   const clientType = options.clientType ?? 'browser';
   const resolvedDeviceId = deviceId ?? generatedDeviceIdRef.current;
-  const onlineDevicesRef = useRef<Set<string>>(new Set());
+  const onlineDevicesRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -46,13 +49,24 @@ export function useDeviceWS(
       }
     };
 
+    const pruneStaleDevices = () => {
+      const now = Date.now();
+      Array.from(onlineDevicesRef.current.entries()).forEach(([targetDeviceId, lastSeenAt]) => {
+        if (now - lastSeenAt > DEVICE_ONLINE_TTL_MS) {
+          onlineDevicesRef.current.delete(targetDeviceId);
+        }
+      });
+
+      setDeviceOnline(onlineDevicesRef.current.size > 0);
+    };
+
     const setKnownDeviceOnline = (targetDeviceId: string, online: boolean) => {
       if (!targetDeviceId || targetDeviceId === resolvedDeviceId) {
         return;
       }
 
       if (online) {
-        onlineDevicesRef.current.add(targetDeviceId);
+        onlineDevicesRef.current.set(targetDeviceId, Date.now());
       } else {
         onlineDevicesRef.current.delete(targetDeviceId);
       }
@@ -97,8 +111,7 @@ export function useDeviceWS(
           console.log('[DeviceWS] Connected to device server:', wsUrl);
           reconnectAttemptRef.current = 0;
           setIsConnected(true);
-          onlineDevicesRef.current.clear();
-          setDeviceOnline(false);
+          pruneStaleDevices();
         };
 
         socket.onmessage = (event) => {
@@ -153,9 +166,14 @@ export function useDeviceWS(
 
     connect();
 
+    const staleDeviceSweep = window.setInterval(() => {
+      pruneStaleDevices();
+    }, DEVICE_ONLINE_SWEEP_MS);
+
     return () => {
       shouldReconnectRef.current = false;
       clearReconnectTimer();
+      window.clearInterval(staleDeviceSweep);
 
       if (wsRef.current) {
         const socket = wsRef.current;

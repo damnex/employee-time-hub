@@ -47,6 +47,8 @@ interface ClientConnection {
 }
 
 const activeConnections = new Set<ClientConnection>();
+const DEVICE_PRESENCE_HEARTBEAT_MS = 3000;
+const SESSION_TIMEOUT_SWEEP_MS = 1000;
 type AttendanceAction = "ENTRY" | "EXIT";
 type MovementDirection = AttendanceAction | "UNKNOWN";
 
@@ -408,6 +410,69 @@ async function logGateEvent(args: {
   }
 }
 
+let timeoutSweepInFlight = false;
+
+async function processTimedOutGateSessions() {
+  if (timeoutSweepInFlight) {
+    return;
+  }
+
+  timeoutSweepInFlight = true;
+  try {
+    const timeoutCandidates = gateMatchingEngine.collectTimedOutSessions(new Date());
+    for (const candidate of timeoutCandidates) {
+      const employee = await storage.getEmployeeByRfid(candidate.session.rfidUid);
+      if (!employee) {
+        continue;
+      }
+
+      const timeoutDecision = gateMatchingEngine.buildTimeoutExitDecision(candidate.session);
+      const timeoutDate = candidate.occurredAt.toISOString().split("T")[0];
+      const openEntry = await storage.getOpenAttendance(employee.id, timeoutDate);
+
+      if (!openEntry) {
+        gateMatchingEngine.recordSessionOutcome({
+          session: candidate.session,
+          occurredAt: candidate.occurredAt,
+          outcome: "EXIT",
+          action: "EXIT",
+        });
+        continue;
+      }
+
+      const attendance = await closeOpenAttendance(openEntry, candidate.occurredAt);
+      if (!attendance) {
+        console.warn("[gate-timeout] Timed-out exit could not be recorded:", candidate.session.rfidUid);
+        continue;
+      }
+
+      gateMatchingEngine.recordSessionOutcome({
+        session: candidate.session,
+        occurredAt: candidate.occurredAt,
+        outcome: "EXIT",
+        action: "EXIT",
+      });
+
+      await logGateEvent({
+        date: timeoutDate,
+        input: {
+          rfidUid: candidate.session.rfidUid,
+          deviceId: candidate.session.deviceId,
+          scanTechnology: candidate.session.scanTechnology,
+          movementDirection: "UNKNOWN",
+          movementAxis: "none",
+        },
+        employee,
+        verificationStatus: "EXIT",
+        decision: "EXIT",
+        message: timeoutDecision.reason,
+      });
+    }
+  } finally {
+    timeoutSweepInFlight = false;
+  }
+}
+
 async function createFailureAttendance(
   employeeId: number,
   date: string,
@@ -453,7 +518,7 @@ async function closeOpenAttendance(openEntry: Attendance, now: Date) {
 function rememberSessionOutcome(
   correlation: GateCorrelationMatch | null | undefined,
   now: Date,
-  outcome: "ENTRY" | "EXIT" | "REJECTED" | "IGNORED",
+  outcome: "ENTRY" | "EXIT" | "REJECTED" | "IGNORED" | "LOW_CONFIDENCE",
   action?: AttendanceAction,
 ) {
   if (!correlation) {
@@ -474,7 +539,10 @@ async function resolveAttendanceDecision(
   todayDate: string,
   deviceId: string,
   matchConfidence: number,
-  correlation?: GateCorrelationMatch | null,
+  correlation: GateCorrelationMatch | null,
+  facePresent: boolean,
+  faceMatched: boolean,
+  faceRfidUidHint?: string | null,
   movementDirection?: MovementDirection,
   movementConfidence?: number,
 ): Promise<ProcessedScanResult> {
@@ -500,56 +568,78 @@ async function resolveAttendanceDecision(
   }
 
   const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
-  const hasDirectionSignal = movementDirection !== undefined;
   const directionIsConfident =
     (movementDirection === "ENTRY" || movementDirection === "EXIT")
     && (movementConfidence ?? 0) >= DIRECTION_CONFIDENCE_THRESHOLD;
+  const validation = gateMatchingEngine.validateEvent({
+    correlation,
+    facePresent,
+    faceMatched,
+    faceRfidUidHint,
+    directionDetected: directionIsConfident,
+  });
+  const confidence = gateMatchingEngine.calculateConfidence(validation);
+  const decision = gateMatchingEngine.decideAction({
+    correlation,
+    validation,
+    confidence,
+    hasOpenAttendance: Boolean(openEntry),
+    movementDirection: directionIsConfident ? movementDirection : undefined,
+  });
 
-  if (hasDirectionSignal && directionIsConfident) {
-    if (movementDirection === "ENTRY") {
-      if (openEntry) {
-        rememberSessionOutcome(correlation, now, "IGNORED");
-        return {
-          success: true,
-          ignored: true,
-          message: "Tag is already inside the gate session. Duplicate entry ignored.",
-          employee,
-          matchConfidence,
-          movementDirection,
-          movementConfidence,
-        };
-      }
-
-      const attendance = await createEntryAttendance(employee.id, todayDate, now, deviceId);
-      rememberSessionOutcome(correlation, now, "ENTRY", "ENTRY");
-
-      return {
-        success: true,
-        message: "Entry marked successfully.",
-        employee,
-        attendance,
-        matchConfidence,
-        action: "ENTRY",
-        movementDirection,
-        movementConfidence,
-      };
+  if (decision.action === "IGNORE") {
+    if (correlation && openEntry && !directionIsConfident) {
+      gateMatchingEngine.armTimeoutExit({
+        session: correlation.session,
+        occurredAt: now,
+      });
     }
+    rememberSessionOutcome(correlation, now, "IGNORED");
+    return {
+      success: true,
+      ignored: true,
+      message: decision.reason,
+      employee,
+      matchConfidence,
+      movementDirection,
+      movementConfidence,
+    };
+  }
 
+  if (decision.action === "REJECT") {
+    const verificationStatus: "FAILED_FACE" | "FAILED_DIRECTION" =
+      validation.hardRejected ? "FAILED_FACE" : "FAILED_DIRECTION";
+    const attendance = await createFailureAttendance(
+      employee.id,
+      todayDate,
+      now,
+      deviceId,
+      verificationStatus,
+    );
+    rememberSessionOutcome(
+      correlation,
+      now,
+      decision.tier === "LOW_CONFIDENCE" ? "LOW_CONFIDENCE" : "REJECTED",
+    );
+
+    return {
+      success: false,
+      message: decision.reason,
+      employee,
+      attendance,
+      matchConfidence,
+      movementDirection,
+      movementConfidence,
+    };
+  }
+
+  if (decision.action === "EXIT") {
     if (!openEntry) {
-      const attendance = await createFailureAttendance(
-        employee.id,
-        todayDate,
-        now,
-        deviceId,
-        "FAILED_DIRECTION",
-      );
       rememberSessionOutcome(correlation, now, "REJECTED");
-
       return {
         success: false,
-        message: "No active entry was found. Mark an entry first while the correct entry-side face is visible.",
+        message: "Exit could not be recorded because no active entry exists.",
         employee,
-        attendance,
         matchConfidence,
         movementDirection,
         movementConfidence,
@@ -568,11 +658,11 @@ async function resolveAttendanceDecision(
         movementConfidence,
       };
     }
-    rememberSessionOutcome(correlation, now, "EXIT", "EXIT");
 
+    rememberSessionOutcome(correlation, now, "EXIT", "EXIT");
     return {
       success: true,
-      message: "Exit marked successfully.",
+      message: decision.reason,
       employee,
       attendance,
       matchConfidence,
@@ -582,39 +672,18 @@ async function resolveAttendanceDecision(
     };
   }
 
-  if (openEntry) {
-    const attendance = await closeOpenAttendance(openEntry, now);
-    if (!attendance) {
-      rememberSessionOutcome(correlation, now, "REJECTED");
-      return {
-        success: false,
-        message: "Exit could not be recorded. Please retry the scan.",
-        employee,
-        matchConfidence,
-      };
-    }
-    rememberSessionOutcome(correlation, now, "EXIT", "EXIT");
-
-    return {
-      success: true,
-      message: "Exit marked successfully.",
-      employee,
-      attendance,
-      matchConfidence,
-      action: "EXIT",
-    };
-  }
-
   const attendance = await createEntryAttendance(employee.id, todayDate, now, deviceId);
   rememberSessionOutcome(correlation, now, "ENTRY", "ENTRY");
 
   return {
     success: true,
-    message: "Entry marked successfully.",
+    message: decision.reason,
     employee,
     attendance,
     matchConfidence,
     action: "ENTRY",
+    movementDirection,
+    movementConfidence,
   };
 }
 
@@ -919,6 +988,9 @@ async function processPythonRfidScan(args: {
       input.deviceId,
       matchConfidence,
       correlation,
+      true,
+      true,
+      matchedRfidUid,
       verification.movementDirection,
       verification.movementConfidence,
     );
@@ -1388,6 +1460,9 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     input.deviceId,
     matchConfidence,
     correlation,
+    true,
+    true,
+    employee.rfidUid,
     input.movementDirection,
     input.movementConfidence,
   );
@@ -1498,6 +1573,26 @@ function broadcastDevicePresence(deviceId: string, online: boolean) {
   );
 }
 
+function getConnectedDeviceIds() {
+  return Array.from(activeConnections)
+    .filter((connection) => {
+      return connection.clientType === "device"
+        && connection.ws.readyState === WebSocket.OPEN;
+    })
+    .map((connection) => connection.deviceId);
+}
+
+function broadcastConnectedDevicePresence() {
+  const connectedDeviceIds = getConnectedDeviceIds();
+  if (!connectedDeviceIds.length) {
+    return;
+  }
+
+  connectedDeviceIds.forEach((deviceId) => {
+    broadcastDevicePresence(deviceId, true);
+  });
+}
+
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -1511,6 +1606,19 @@ export async function registerRoutes(
     server: httpServer,
     path: "/ws/device",
     perMessageDeflate: false,
+  });
+  const devicePresenceHeartbeat = setInterval(() => {
+    broadcastConnectedDevicePresence();
+  }, DEVICE_PRESENCE_HEARTBEAT_MS);
+  const timeoutExitSweep = setInterval(() => {
+    void processTimedOutGateSessions().catch((error) => {
+      console.error("[gate-timeout] Sweep failed:", error);
+    });
+  }, SESSION_TIMEOUT_SWEEP_MS);
+
+  httpServer.once("close", () => {
+    clearInterval(devicePresenceHeartbeat);
+    clearInterval(timeoutExitSweep);
   });
 
   wss.on("error", (error) => {
@@ -1544,10 +1652,8 @@ export async function registerRoutes(
     
     // On browser connect, send snapshot of current device presence
     if (clientType === "browser") {
-      activeConnections.forEach((existing) => {
-        if (existing.clientType === "device") {
-          sendDevicePresence(ws, existing.deviceId, true);
-        }
+      getConnectedDeviceIds().forEach((connectedDeviceId) => {
+        sendDevicePresence(ws, connectedDeviceId, true);
       });
     }
 

@@ -2,28 +2,9 @@
 > rest-express@1.0.0 dev
 > tsx server/index.ts
 
-12:26:38 PM [db] connected to PostgreSQL database
-12:26:40 PM [express] serving on port 5000
-[WebSocket] Reader connected: GATE-TERMINAL-01 from 10.161.159.92. Reader is online and ready to read badges.
-12:30:30 PM [express] GET /api/stats 200 in 949ms :: {"totalEmployees":0,"presentToday":0,"absentToday":0,"recentScans":[]}
-12:31:19 PM [express] GET /api/attendances 200 in 1145ms :: []
-12:31:19 PM [express] GET /api/employees 200 in 1190ms :: []
-12:31:19 PM [express] GET /api/gate-events 200 in 1319ms :: []
-12:31:19 PM [express] GET /api/stats 304 in 1482ms :: {"totalEmployees":0,"presentToday":0,"absentToday":0,"recentScans":[]}
-12:31:24 PM [express] GET /api/attendances 304 in 195ms :: []
-12:31:24 PM [express] GET /api/gate-events 304 in 107ms :: []
-12:31:24 PM [express] GET /api/stats 304 in 507ms :: {"totalEmployees":0,"presentToday":0,"absentToday":0,"recentScans":[]}
-12:31:29 PM [express] GET /api/attendances 304 in 113ms :: []
-12:31:29 PM [express] GET /api/gate-events 304 in 215ms :: []
-12:31:30 PM [express] GET /api/stats 304 in 619ms :: {"totalEmployees":0,"presentToday":0,"absentToday":0,"recentScans":[]}
-12:31:34 PM [express] GET /api/attendances 304 in 203ms :: []
-12:31:34 PM [express] GET /api/gate-events 304 in 105ms :: []
-12:31:35 PM [express] GET /api/stats 304 in 416ms :: {"totalEmployees":0,"presentToday":0,"absentToday":0,"recentScans":[]}
-12:31:39 PM [express] GET /api/attendances 304 in 119ms :: []
-12:31:39 PM [express] GET /api/gate-events 304 in 92ms :: []
-12:31:41 PM [express] GET /api/stats 304 in 317ms :: {"totalEmployees":0,"presentToday":0,"absentToday":0,"recentScans":[]}
-12:31:42 PM [express] GET /api/employees 304 in 118ms :: []
-[WebSocket] browser connected: ENROLLMENT-CONSOLE-01 from localhost
-[WebSocket] Reader connected: GATE-TERMINAL-01 from 10.161.159.92. Reader is online and ready to read badges.
-[WebSocket] Reader disconnected: GATE-TERMINAL-01 from 10.161.159.92. Reader is no longer ready.
+12:53:39 PM [db] connected to PostgreSQL database
+12:53:40 PM [express] serving on port 5000
+[WebSocket] browser connected: GATE-TERMINAL-01-BROWSER from localhost
+[WebSocket] Reader connected: Terminate batch job (Y/N)? 
+159.92. Reader is online and ready to read badges.
 Terminate batch job (Y/N)? 
