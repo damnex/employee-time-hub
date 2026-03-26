@@ -1096,6 +1096,85 @@ async function processPythonRfidScan(args: {
   }
 }
 
+async function processTriggeredCameraFaceScan(args: {
+  input: ProcessScanInput;
+  employee: Employee;
+  normalizedRfidUid: string;
+  now: Date;
+  todayDate: string;
+  correlation: GateCorrelationMatch | null;
+  logAndReturn: LogAndReturnFn;
+}) {
+  const { input, employee, normalizedRfidUid, now, todayDate, correlation, logAndReturn } = args;
+
+  try {
+    const recognition = await recognizeRfidTriggeredFaceWithPython({
+      rfidTag: normalizedRfidUid,
+      timestamp: now.getTime(),
+      frameCount: 3,
+      maxFaces: 5,
+      freshnessMs: 1500,
+      captureSpacingMs: 80,
+    });
+    const recognitionTimestampDeltaMs = Math.abs(recognition.timestamp - now.getTime());
+    const recognitionIsFresh = recognitionTimestampDeltaMs <= 2_000;
+    const detectedFaceLabel = recognition.name ?? undefined;
+    const detectedFaceBox = recognition.bestBox ?? null;
+    const matchConfidence = recognition.confidence;
+    const matchDetails = buildTriggeredCameraMatchDetails(matchConfidence);
+    const recognizedRfidUid = recognition.rfidUid?.trim().toUpperCase() ?? null;
+    const facePresent = recognition.status !== "NO_FACE" && recognition.facesDetected > 0 && recognitionIsFresh;
+    const faceMatched = Boolean(
+      recognitionIsFresh
+      && recognition.status === "MATCH"
+      && recognizedRfidUid
+      && recognizedRfidUid === normalizedRfidUid
+    );
+
+    const result = await resolveAttendanceDecision(
+      employee,
+      now,
+      todayDate,
+      input.deviceId,
+      matchConfidence,
+      correlation,
+      facePresent,
+      faceMatched,
+      recognizedRfidUid,
+      input.movementDirection,
+      input.movementConfidence,
+    );
+
+    const message = !recognitionIsFresh
+      ? "Triggered live face result arrived outside the allowed 2 second window, so the scan stayed low confidence."
+      : recognition.status === "NO_FACE"
+        ? "RFID was detected, but no live face was visible in the camera window."
+        : recognition.status === "UNKNOWN"
+          ? recognition.multipleFaces
+            ? result.message
+            : "A live face was captured after the RFID trigger, but the person could not be verified confidently."
+          : result.message;
+
+    return await logAndReturn({
+      ...result,
+      message,
+      matchConfidence,
+      matchDetails,
+      detectedFaceLabel,
+      detectedFaceBox,
+      movementDirection: input.movementDirection,
+      movementConfidence: input.movementConfidence,
+    }, {
+      verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_FACE"),
+      decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
+      liveFaceProfile: null,
+    });
+  } catch (error) {
+    console.warn("[gate-camera] Triggered face recognition failed. Falling back to alternate face flow:", error);
+    return null;
+  }
+}
+
 async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanResult> {
   const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
   input.rfidUid = normalizedRfidUid;
@@ -1139,6 +1218,22 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     });
   }
 
+  const triggeredCameraFaceEnabled = useTriggeredCameraFaceRecognition();
+  if (triggeredCameraFaceEnabled) {
+    const triggeredResult = await processTriggeredCameraFaceScan({
+      input,
+      employee,
+      normalizedRfidUid,
+      now,
+      todayDate,
+      correlation,
+      logAndReturn,
+    });
+    if (triggeredResult) {
+      return triggeredResult;
+    }
+  }
+
   if (input.faceFrames?.length) {
     return processPythonRfidScan({
       input,
@@ -1154,7 +1249,6 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   let faceMatched = false;
   let matchDetails: FaceMatchDetails | undefined;
   const insecureFallbackAllowed = allowInsecureFaceFallback();
-  const triggeredCameraFaceEnabled = useTriggeredCameraFaceRecognition();
   const liveFaceProfile = normalizeLiveFaceProfile(input);
   const storedFaceProfile = normalizeStoredFaceProfile(employee.faceDescriptor);
 
@@ -1181,73 +1275,6 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   }
 
   if (!liveFaceProfile) {
-    if (triggeredCameraFaceEnabled) {
-      try {
-        const recognition = await recognizeRfidTriggeredFaceWithPython({
-          rfidTag: normalizedRfidUid,
-          timestamp: now.getTime(),
-          frameCount: 3,
-          maxFaces: 5,
-          freshnessMs: 1500,
-          captureSpacingMs: 80,
-        });
-        const recognitionTimestampDeltaMs = Math.abs(recognition.timestamp - now.getTime());
-        const recognitionIsFresh = recognitionTimestampDeltaMs <= 2_000;
-        const detectedFaceLabel = recognition.name ?? undefined;
-        const detectedFaceBox = recognition.bestBox ?? null;
-        matchConfidence = recognition.confidence;
-        matchDetails = buildTriggeredCameraMatchDetails(matchConfidence);
-        const recognizedRfidUid = recognition.rfidUid?.trim().toUpperCase() ?? null;
-        const facePresent = recognition.status !== "NO_FACE" && recognition.facesDetected > 0 && recognitionIsFresh;
-        const triggeredFaceMatched = Boolean(
-          recognitionIsFresh
-          && recognition.status === "MATCH"
-          && recognizedRfidUid
-          && recognizedRfidUid === normalizedRfidUid
-        );
-
-        const result = await resolveAttendanceDecision(
-          employee,
-          now,
-          todayDate,
-          input.deviceId,
-          matchConfidence,
-          correlation,
-          facePresent,
-          triggeredFaceMatched,
-          recognizedRfidUid,
-          input.movementDirection,
-          input.movementConfidence,
-        );
-
-        const message = !recognitionIsFresh
-          ? "Triggered live face result arrived outside the allowed 2 second window, so the scan stayed low confidence."
-          : recognition.status === "NO_FACE"
-            ? "RFID was detected, but no live face was visible in the camera window."
-            : recognition.status === "UNKNOWN"
-              ? recognition.multipleFaces
-                ? result.message
-                : "A live face was captured after the RFID trigger, but the person could not be verified confidently."
-              : result.message;
-
-        return logAndReturn({
-          ...result,
-          message,
-          matchDetails,
-          detectedFaceLabel,
-          detectedFaceBox,
-          movementDirection: input.movementDirection,
-          movementConfidence: input.movementConfidence,
-        }, {
-          verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_FACE"),
-          decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
-          liveFaceProfile: null,
-        });
-      } catch (error) {
-        console.warn("[gate-camera] Triggered face recognition failed. Falling back to low-confidence flow:", error);
-      }
-    }
-
     const result = await resolveAttendanceDecision(
       employee,
       now,
