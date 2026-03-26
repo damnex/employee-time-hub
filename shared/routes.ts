@@ -74,6 +74,8 @@ const triggeredCameraFaceResponseSchema = z.object({
   name: z.string().nullish(),
   confidence: z.number().optional(),
   timestamp: z.number().optional(),
+  rfidTimestamp: z.number().optional(),
+  timestampDeltaMs: z.number().nullish(),
   status: z.enum(["MATCH", "UNKNOWN", "NO_FACE"]),
   employeeCode: z.string().nullish(),
   department: z.string().nullish(),

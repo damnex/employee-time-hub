@@ -1116,7 +1116,7 @@ async function processTriggeredCameraFaceScan(args: {
       freshnessMs: 1500,
       captureSpacingMs: 80,
     });
-    const recognitionTimestampDeltaMs = Math.abs(recognition.timestamp - now.getTime());
+    const recognitionTimestampDeltaMs = recognition.timestampDeltaMs;
     const recognitionIsFresh = recognitionTimestampDeltaMs <= 2_000;
     const detectedFaceLabel = recognition.name ?? undefined;
     const detectedFaceBox = recognition.bestBox ?? null;
@@ -2347,6 +2347,8 @@ export async function registerRoutes(
           success: false,
           message: "Python face model is not trained yet. Enroll employees and refresh Python training first.",
           processedAt,
+          rfidTimestamp: input.timestamp,
+          timestampDeltaMs: null,
           status: "NO_FACE" as const,
           facesDetected: 0,
           multipleFaces: false,
@@ -2380,6 +2382,8 @@ export async function registerRoutes(
         name: recognition.name ?? null,
         confidence: recognition.confidence,
         timestamp: recognition.timestamp,
+        rfidTimestamp: recognition.rfidTimestamp,
+        timestampDeltaMs: recognition.timestampDeltaMs,
         status: recognition.status,
         employeeCode: recognition.employeeCode ?? null,
         department: recognition.department ?? null,

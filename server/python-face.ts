@@ -109,6 +109,8 @@ export interface PythonTriggeredFaceRecognitionResult {
   name?: string | null;
   confidence: number;
   timestamp: number;
+  rfidTimestamp: number;
+  timestampDeltaMs: number;
   status: "MATCH" | "UNKNOWN" | "NO_FACE";
   employeeCode?: string | null;
   department?: string | null;

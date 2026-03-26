@@ -254,49 +254,48 @@ class LatestFrameCamera:
                 self._condition.wait(timeout=remaining)
         return None
 
-    def capture_sequence(
+    def _is_fresh_snapshot(
+        self,
+        snapshot: CapturedCameraFrame | None,
+        trigger_timestamp_ms: int,
+        freshness_ms: int,
+    ) -> bool:
+        if snapshot is None:
+            return False
+
+        now_ms = int(time.time() * 1000)
+        return (
+            snapshot.timestamp_ms >= trigger_timestamp_ms - freshness_ms
+            and now_ms - snapshot.timestamp_ms <= freshness_ms
+        )
+
+    def capture_latest(
         self,
         trigger_timestamp_ms: int,
-        frame_count: int,
-        capture_spacing_ms: int,
         freshness_ms: int,
         timeout_ms: int,
-    ) -> list[CapturedCameraFrame]:
+    ) -> CapturedCameraFrame | None:
         self.start()
 
-        accepted_frames: list[CapturedCameraFrame] = []
         latest = self.snapshot_latest()
+        if self._is_fresh_snapshot(latest, trigger_timestamp_ms, freshness_ms):
+            return latest
+
         last_sequence = latest.sequence if latest is not None else 0
-        now_ms = int(time.time() * 1000)
-        if (
-            latest is not None
-            and latest.timestamp_ms >= trigger_timestamp_ms - freshness_ms
-            and now_ms - latest.timestamp_ms <= freshness_ms
-        ):
-            accepted_frames.append(latest)
 
         deadline = time.monotonic() + max(timeout_ms, 1) / 1000
-        while len(accepted_frames) < frame_count:
+        while True:
             remaining_ms = int(max(0.0, (deadline - time.monotonic()) * 1000))
             if remaining_ms <= 0:
-                break
+                return None
 
             next_frame = self.wait_for_next_frame(last_sequence, remaining_ms)
             if next_frame is None:
-                break
+                return None
 
             last_sequence = next_frame.sequence
-            if next_frame.timestamp_ms < trigger_timestamp_ms - freshness_ms:
-                continue
-
-            if accepted_frames and capture_spacing_ms > 0:
-                frame_delta_ms = next_frame.timestamp_ms - accepted_frames[-1].timestamp_ms
-                if frame_delta_ms < capture_spacing_ms:
-                    continue
-
-            accepted_frames.append(next_frame)
-
-        return accepted_frames
+            if self._is_fresh_snapshot(next_frame, trigger_timestamp_ms, freshness_ms):
+                return next_frame
 
 
 def is_probable_face(
@@ -764,6 +763,90 @@ def choose_best_live_face(faces: list[LiveRecognitionFace]) -> LiveRecognitionFa
     )
 
 
+def recognize_face(
+    frame: np.ndarray,
+    recognizer: Any,
+    detector: cv2.CascadeClassifier,
+    eye_detector: cv2.CascadeClassifier,
+    labels: dict[int, LabelRecord],
+    distance_threshold: float,
+    image_size: int,
+    args: argparse.Namespace,
+    max_faces: int,
+) -> dict[str, Any]:
+    faces, frame_width, frame_height = recognize_faces_in_image(
+        frame,
+        recognizer,
+        detector,
+        eye_detector,
+        labels,
+        distance_threshold,
+        image_size,
+        args,
+        max_faces,
+    )
+    best_face = choose_best_live_face(faces)
+
+    if best_face is None:
+        return {
+            "name": None,
+            "confidence": 0.0,
+            "status": "NO_FACE",
+            "employeeCode": None,
+            "department": None,
+            "rfidUid": None,
+            "facesDetected": 0,
+            "multipleFaces": False,
+            "bestBox": None,
+            "frameWidth": frame_width,
+            "frameHeight": frame_height,
+        }
+
+    recognized_name = best_face.label.display_name if best_face.label is not None else None  # type: ignore
+    recognized_employee_code = best_face.label.employee_code if best_face.label is not None else None  # type: ignore
+    recognized_department = best_face.label.department if best_face.label is not None else None  # type: ignore
+    recognized_rfid_uid = best_face.label.rfid_uid if best_face.label is not None else None  # type: ignore
+    is_unknown = not best_face.verified or recognized_name is None or best_face.confidence < 0.45
+
+    return {
+        "name": "UNKNOWN" if is_unknown else recognized_name,
+        "confidence": round_float(best_face.confidence) or 0.0,
+        "status": "UNKNOWN" if is_unknown else "MATCH",
+        "employeeCode": None if is_unknown else recognized_employee_code,
+        "department": None if is_unknown else recognized_department,
+        "rfidUid": None if is_unknown else recognized_rfid_uid,
+        "facesDetected": len(faces),
+        "multipleFaces": len(faces) > 1,
+        "bestBox": {
+            "top": best_face.box[0],
+            "right": best_face.box[1],
+            "bottom": best_face.box[2],
+            "left": best_face.box[3],
+        },
+        "frameWidth": frame_width,
+        "frameHeight": frame_height,
+    }
+
+
+def select_best_live_result(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not results:
+        return None
+
+    status_priority = {
+        "MATCH": 2,
+        "UNKNOWN": 1,
+        "NO_FACE": 0,
+    }
+    return max(
+        results,
+        key=lambda result: (
+            status_priority.get(str(result.get("status")), -1),
+            float(result.get("confidence") or 0.0),
+            int(result.get("facesDetected") or 0),
+        ),
+    )
+
+
 def handle_verify_burst(
     request: dict[str, Any],
     recognizer: Any,
@@ -859,28 +942,19 @@ def handle_recognize_live_camera(
 
     frame_count = max(1, min(int(request.get("frameCount") or 3), 3))
     max_faces = max(1, min(int(request.get("maxFaces") or 5), 10))
-    capture_spacing_ms = max(0, int(request.get("captureSpacingMs") or 80))
     freshness_ms = max(200, int(request.get("freshnessMs") or args.frame_freshness_ms))
-
-    captured_frames = camera.capture_sequence(
+    captured_frame = camera.capture_latest(
         trigger_timestamp_ms=trigger_timestamp_ms,
-        frame_count=frame_count,
-        capture_spacing_ms=capture_spacing_ms,
         freshness_ms=freshness_ms,
-        timeout_ms=max(args.camera_ready_timeout_ms, freshness_ms * frame_count),
+        timeout_ms=max(args.camera_ready_timeout_ms, freshness_ms),
     )
-    if not captured_frames:
+    if captured_frame is None:
         raise RuntimeError("No fresh live camera frame was available after the RFID trigger.")
 
-    best_face: LiveRecognitionFace | None = None
-    best_face_timestamp_ms: int | None = None
-    faces_detected = 0
-    frame_width = 0
-    frame_height = 0
-
-    for captured in captured_frames:
-        faces, frame_width, frame_height = recognize_faces_in_image(
-            captured.frame,
+    # Keep RFID recognition event-driven: one snapped frame, repeated recognition passes.
+    results = [
+        recognize_face(
+            captured_frame.frame,
             recognizer,
             detector,
             eye_detector,
@@ -890,63 +964,20 @@ def handle_recognize_live_camera(
             args,
             max_faces,
         )
-        faces_detected = max(faces_detected, len(faces))
-        frame_best_face = choose_best_live_face(faces)
-        if frame_best_face is None:
-            continue
-        if best_face is None:
-            best_face = frame_best_face
-            best_face_timestamp_ms = captured.timestamp_ms
-            continue
-        contender = choose_best_live_face([best_face, frame_best_face])
-        if contender is not None and contender is frame_best_face:
-            best_face = frame_best_face
-            best_face_timestamp_ms = captured.timestamp_ms
+        for _ in range(frame_count)
+    ]
+    best_result = select_best_live_result(results)
+    if best_result is None:
+        raise RuntimeError("Live face recognition returned no result.")
 
-    if best_face is None:
-        return {
-            "name": None,
-            "confidence": 0.0,
-            "timestamp": captured_frames[-1].timestamp_ms,
-            "status": "NO_FACE",
-            "employeeCode": None,
-            "department": None,
-            "rfidUid": None,
-            "facesDetected": faces_detected,
-            "multipleFaces": faces_detected > 1,
-            "frameCount": len(captured_frames),
-            "frameLatencyMs": captured_frames[-1].timestamp_ms - trigger_timestamp_ms,
-            "bestBox": None,
-            "frameWidth": frame_width,
-            "frameHeight": frame_height,
-        }
-
-    recognized_name = best_face.label.display_name if best_face.label is not None else None  # type: ignore
-    recognized_employee_code = best_face.label.employee_code if best_face.label is not None else None  # type: ignore
-    recognized_department = best_face.label.department if best_face.label is not None else None  # type: ignore
-    recognized_rfid_uid = best_face.label.rfid_uid if best_face.label is not None else None  # type: ignore
-    is_unknown = not best_face.verified or recognized_name is None or best_face.confidence < 0.45
-
+    timestamp_delta_ms = abs(captured_frame.timestamp_ms - trigger_timestamp_ms)
     return {
-        "name": "UNKNOWN" if is_unknown else recognized_name,
-        "confidence": round_float(best_face.confidence),
-        "timestamp": best_face_timestamp_ms or captured_frames[-1].timestamp_ms,
-        "status": "UNKNOWN" if is_unknown else "MATCH",
-        "employeeCode": None if is_unknown else recognized_employee_code,
-        "department": None if is_unknown else recognized_department,
-        "rfidUid": None if is_unknown else recognized_rfid_uid,
-        "facesDetected": faces_detected,
-        "multipleFaces": faces_detected > 1,
-        "frameCount": len(captured_frames),
-        "frameLatencyMs": (best_face_timestamp_ms or captured_frames[-1].timestamp_ms) - trigger_timestamp_ms,
-        "bestBox": {
-            "top": best_face.box[0],
-            "right": best_face.box[1],
-            "bottom": best_face.box[2],
-            "left": best_face.box[3],
-        },
-        "frameWidth": frame_width,
-        "frameHeight": frame_height,
+        **best_result,
+        "timestamp": captured_frame.timestamp_ms,
+        "rfidTimestamp": trigger_timestamp_ms,
+        "timestampDeltaMs": timestamp_delta_ms,
+        "frameCount": frame_count,
+        "frameLatencyMs": timestamp_delta_ms,
     }
 
 

@@ -157,7 +157,7 @@ Notes:
 ## Path D: Event-triggered OpenCV camera service
 
 Use this when Node.js should trigger face recognition only after an RFID event.
-The Python worker keeps `cv2.VideoCapture` running in the background, always updates the latest frame, and returns the best match from 2-3 fresh frames captured right after the trigger.
+The Python worker keeps `cv2.VideoCapture` running in the background, continuously refreshes `latest_frame`, snapshots that buffered frame when RFID arrives, and runs recognition only on that single frame.
 
 ### Environment knobs
 
@@ -192,7 +192,7 @@ Request body:
 }
 ```
 
-This returns the freshest live face result near the RFID timestamp, ready to pass into the matching engine.
+`frameCount` is the number of recognition passes to run on the same snapped frame. The response includes both the RFID timestamp and the snapped frame timestamp so Node can enforce the `< 2s` synchronization rule before handing the result to the matching engine.
 ## Metadata CSV
 
 `metadata.example.csv` is still the format for both paths:
