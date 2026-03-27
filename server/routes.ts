@@ -1111,9 +1111,9 @@ async function processTriggeredCameraFaceScan(args: {
     const recognition = await recognizeRfidTriggeredFaceWithPython({
       rfidTag: normalizedRfidUid,
       timestamp: now.getTime(),
-      frameCount: 3,
-      maxFaces: 5,
-      freshnessMs: 1500,
+      frameCount: 1,
+      maxFaces: 2,
+      freshnessMs: 900,
       captureSpacingMs: 80,
     });
     const recognitionTimestampDeltaMs = recognition.timestampDeltaMs;
@@ -1643,7 +1643,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   });
 }
 
-function toSocketScanResult(result: ProcessedScanResult, rfidUid: string) {
+function toSocketScanResult(result: ProcessedScanResult, rfidUid: string, deviceId?: string) {
   return {
     type: "scan_result",
     success: result.success,
@@ -1660,6 +1660,7 @@ function toSocketScanResult(result: ProcessedScanResult, rfidUid: string) {
     detectedFaceLabel: result.detectedFaceLabel,
     detectedFaceBox: result.detectedFaceBox,
     rfidUid,
+    deviceId,
   };
 }
 
@@ -1944,7 +1945,9 @@ export async function registerRoutes(
                 : undefined,
           });
 
-          ws.send(JSON.stringify(toSocketScanResult(result, rfidUid)));
+          const payload = toSocketScanResult(result, rfidUid, deviceId);
+          ws.send(JSON.stringify(payload));
+          broadcastMessage(payload, (client) => client.clientType === "browser");
           return;
         }
       } catch (error) {
@@ -2361,9 +2364,9 @@ export async function registerRoutes(
       const recognition = await recognizeRfidTriggeredFaceWithPython({
         rfidTag: input.rfidTag,
         timestamp: input.timestamp,
-        frameCount: input.frameCount ?? 3,
-        maxFaces: input.maxFaces ?? 5,
-        freshnessMs: input.freshnessMs ?? 1500,
+        frameCount: input.frameCount ?? 1,
+        maxFaces: input.maxFaces ?? 2,
+        freshnessMs: input.freshnessMs ?? 900,
         captureSpacingMs: input.captureSpacingMs ?? 80,
       });
 

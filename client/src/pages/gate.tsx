@@ -1191,6 +1191,45 @@ export default function GateTerminal() {
   }, [armSensorWindow, busy, clearResult, handleScan, lastScanResult]);
 
   useEffect(() => {
+    if (lastScanResult?.type !== "scan_result" || !lastScanResult.rfidUid) {
+      return;
+    }
+
+    const scannedUid = lastScanResult.rfidUid.trim().toUpperCase();
+    const badgeOwner = employees?.find((employee) => {
+      return employee.rfidUid.toUpperCase() === scannedUid;
+    });
+    const matchedEmployee = lastScanResult.employee?.id
+      ? employees?.find((employee) => employee.id === lastScanResult.employee?.id)
+      : undefined;
+
+    setRfidUid(scannedUid);
+    setLiveTapUid(scannedUid);
+    setReaderMessage(lastScanResult.message);
+    setReaderSourceDeviceId(lastScanResult.deviceId ?? GATE_DEVICE_ID);
+    setLastResult({
+      success: Boolean(lastScanResult.success),
+      ignored: lastScanResult.ignored,
+      message: lastScanResult.message,
+      employee: matchedEmployee,
+      badgeOwner,
+      action: lastScanResult.action,
+      verifiedAt: new Date().toLocaleTimeString(),
+      latencyMs: 0,
+      previewImage: null,
+      source: "reader",
+      matchConfidence: lastScanResult.matchConfidence,
+      matchDetails: lastScanResult.matchDetails,
+      movementDirection: lastScanResult.movementDirection,
+      movementConfidence: lastScanResult.movementConfidence,
+      detectedFaceLabel: lastScanResult.detectedFaceLabel,
+      detectedFaceBox: lastScanResult.detectedFaceBox ?? null,
+      previewFrameSize: null,
+    });
+    clearResult();
+  }, [clearResult, employees, lastScanResult]);
+
+  useEffect(() => {
     if (!pendingReaderScan || busy) {
       return;
     }

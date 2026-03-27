@@ -11,6 +11,25 @@ export interface DeviceScanResult {
   employee?: { id: number; name: string };
   action?: 'ENTRY' | 'EXIT';
   matchConfidence?: number;
+  matchDetails?: {
+    primaryConfidence: number;
+    anchorAverage: number;
+    peakAnchorConfidence: number;
+    strongAnchorRatio: number;
+    liveConsistency: number;
+    poseConfidence?: number;
+    liveLiveness?: number;
+    liveRealness?: number;
+  };
+  movementDirection?: 'ENTRY' | 'EXIT' | 'UNKNOWN';
+  movementConfidence?: number;
+  detectedFaceLabel?: string;
+  detectedFaceBox?: {
+    top: number;
+    right: number;
+    bottom: number;
+    left: number;
+  } | null;
   rfidUid?: string;
   available?: boolean;
   deviceId?: string;

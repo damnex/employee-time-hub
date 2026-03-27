@@ -1004,7 +1004,13 @@ def main() -> int:
     recognizer.read(str(args.model.resolve()))
     detector = create_detector()
     eye_detector = create_eye_detector()
-    camera: LatestFrameCamera | None = None
+    camera = LatestFrameCamera(args)
+
+    try:
+        camera.start()
+    except Exception as error:  # noqa: BLE001
+        # Keep the worker alive and let the background camera thread continue retrying.
+        print(f"[python-face] Camera warm start is still waiting for frames: {error}", file=sys.stderr)
 
     try:
         for raw_line in sys.stdin:
@@ -1040,8 +1046,6 @@ def main() -> int:
                         args,
                     )
                 elif action == "recognize_live_camera":
-                    if camera is None:
-                        camera = LatestFrameCamera(args)
                     result = handle_recognize_live_camera(
                         request,
                         camera,
@@ -1067,8 +1071,7 @@ def main() -> int:
                     "error": str(error),
                 })
     finally:
-        if camera is not None:
-            camera.stop()
+        camera.stop()
 
     return 0
 

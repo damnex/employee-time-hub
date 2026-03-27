@@ -9,11 +9,12 @@
   - Connects the reader to your Wi-Fi / phone hotspot
   - Connects to the app WebSocket endpoint at /ws/device
   - Reads MFRC522 RFID cards
-  - Sends {"type":"rfid_detected","rfidUid":"...","scanTechnology":"HF_RFID"} to the server
+  - Sends an RFID event to the server
 
   Important:
-  This project's gate flow expects the browser to do face verification.
-  So this hardware should send "rfid_detected", not "rfid_scan".
+  For the gate flow, use "rfid_scan" so Node can trigger the persistent Python
+  face service immediately on tap.
+  For badge enrollment only, switch this to "rfid_detected".
 */
 
 #if defined(ESP8266)
@@ -40,6 +41,7 @@ const char* WS_HOST = "10.161.159.9";
 const uint16_t WS_PORT = 5000;
 const char* WS_PATH = "/ws/device?deviceId=GATE-TERMINAL-01&clientType=device";
 const char* SCAN_TECHNOLOGY = "HF_RFID";
+const char* RFID_EVENT_TYPE = "rfid_scan";
 
 const unsigned long WIFI_RETRY_MS = 2000;
 const unsigned long WIFI_CONNECT_TIMEOUT_MS = 20000;
@@ -424,14 +426,14 @@ String readCardUid() {
   return uid;
 }
 
-void sendRfidDetected(const String& uid) {
+void sendRfidEvent(const String& uid) {
   if (!socketConnected) {
     Serial.println(F("[RFID] Card read, but WebSocket is offline."));
     return;
   }
 
   String payload =
-    "{\"type\":\"rfid_detected\",\"rfidUid\":\"" + uid
+    "{\"type\":\"" + String(RFID_EVENT_TYPE) + "\",\"rfidUid\":\"" + uid
     + "\",\"scanTechnology\":\"" + String(SCAN_TECHNOLOGY) + "\"}";
 
   Serial.print(F("[RFID] Sending UID: "));
@@ -502,7 +504,7 @@ void loop() {
 
   lastUid = uid;
   lastCardSentAt = now;
-  sendRfidDetected(uid);
+  sendRfidEvent(uid);
   delay(RFID_LOOP_SETTLE_MS);
 }
 

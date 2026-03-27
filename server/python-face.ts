@@ -192,14 +192,17 @@ function getPythonFaceWorkerCameraArgs() {
   loadEnvironment();
 
   const cameraSource = process.env.PYTHON_FACE_CAMERA_SOURCE?.trim() || "0";
-  const cameraWidth = process.env.PYTHON_FACE_CAMERA_WIDTH?.trim() || "640";
-  const cameraHeight = process.env.PYTHON_FACE_CAMERA_HEIGHT?.trim() || "480";
+  const cameraWidth = process.env.PYTHON_FACE_CAMERA_WIDTH?.trim() || "480";
+  const cameraHeight = process.env.PYTHON_FACE_CAMERA_HEIGHT?.trim() || "360";
   const cameraFps = process.env.PYTHON_FACE_CAMERA_FPS?.trim() || "20";
-  const cameraReadyTimeoutMs = process.env.PYTHON_FACE_CAMERA_READY_TIMEOUT_MS?.trim() || "2500";
+  const cameraReadyTimeoutMs = process.env.PYTHON_FACE_CAMERA_READY_TIMEOUT_MS?.trim() || "1200";
   const cameraReconnectDelayMs = process.env.PYTHON_FACE_CAMERA_RECONNECT_DELAY_MS?.trim() || "500";
-  const frameFreshnessMs = process.env.PYTHON_FACE_FRAME_FRESHNESS_MS?.trim() || "1500";
+  const frameFreshnessMs = process.env.PYTHON_FACE_FRAME_FRESHNESS_MS?.trim() || "900";
+  const resizeWidth = process.env.PYTHON_FACE_RESIZE_WIDTH?.trim() || "480";
 
   return [
+    "--resize-width",
+    resizeWidth,
     "--camera-source",
     cameraSource,
     "--camera-width",
@@ -406,8 +409,6 @@ class PythonFaceWorker {
         PYTHON_LBPH_MODEL_PATH,
         "--labels",
         PYTHON_LBPH_LABELS_PATH,
-        "--resize-width",
-        "0",
         "--scale-factor",
         "1.04",
         "--min-face-size",
