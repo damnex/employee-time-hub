@@ -40,6 +40,10 @@ import {
 } from "./gate-matching-engine";
 import { registerRfidProxyRoutes } from "./rfid-proxy";
 import { stopManagedRfidService, warmRfidService } from "./rfid-service";
+import { handleRfidIntegration } from "./rfid-handler";
+import { handleVisionIntegration } from "./vision-handler";
+import { handleFaceIntegration } from "./face-handler";
+import { decisionEngine } from "./decision-engine";
 const SESSION_TIMEOUT_SWEEP_MS = 1000;
 type AttendanceAction = "ENTRY" | "EXIT";
 type MovementDirection = AttendanceAction | "UNKNOWN";
@@ -2120,6 +2124,11 @@ export async function registerRoutes(
         scanTechnology: input.scanTechnology ?? "UHF_RFID",
         source: "reader_detected",
       });
+      const fusion = await decisionEngine.ingestRfid({
+        deviceId: input.deviceId,
+        rfidTag: normalizedRfidUid,
+        scanTechnology: input.scanTechnology ?? "UHF_RFID",
+      });
       const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
 
       return res.json({
@@ -2127,6 +2136,7 @@ export async function registerRoutes(
         rfidUid: normalizedRfidUid,
         employee,
         session: detection.session,
+        fusionResolved: fusion.resolved,
       });
     } catch (err) {
       if (err instanceof z.ZodError) {
@@ -2138,6 +2148,61 @@ export async function registerRoutes(
 
       return res.status(500).json({ message: "Unable to process RFID event." });
     }
+  });
+
+  app.post("/api/integration/rfid", async (req, res) => {
+    try {
+      const result = await handleRfidIntegration(req.body);
+      return res.json({ success: true, ...result });
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({
+          message: err.errors[0]?.message ?? "Invalid RFID integration payload.",
+          field: err.errors[0]?.path.join("."),
+        });
+      }
+
+      console.error("[integration-rfid] Failed:", err);
+      return res.status(500).json({ message: "Unable to process RFID integration event." });
+    }
+  });
+
+  app.post("/api/integration/vision", async (req, res) => {
+    try {
+      const result = await handleVisionIntegration(req.body);
+      return res.json({ success: true, ...result });
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({
+          message: err.errors[0]?.message ?? "Invalid vision integration payload.",
+          field: err.errors[0]?.path.join("."),
+        });
+      }
+
+      console.error("[integration-vision] Failed:", err);
+      return res.status(500).json({ message: "Unable to process vision integration event." });
+    }
+  });
+
+  app.post("/api/integration/face", async (req, res) => {
+    try {
+      const result = await handleFaceIntegration(req.body);
+      return res.json({ success: true, ...result });
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({
+          message: err.errors[0]?.message ?? "Invalid face integration payload.",
+          field: err.errors[0]?.path.join("."),
+        });
+      }
+
+      console.error("[integration-face] Failed:", err);
+      return res.status(500).json({ message: "Unable to process face integration event." });
+    }
+  });
+
+  app.get("/api/integration/status", (_req, res) => {
+    return res.json(decisionEngine.getStatus());
   });
   // RFID Scan Endpoint (Core Logic)
   app.post(api.scan.rfid.path, async (req, res) => {
