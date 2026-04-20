@@ -1,6 +1,7 @@
 import type { Express, Request, Response } from "express";
 
 import { getRfidServiceBaseUrl } from "./env";
+import { ensureRfidServiceAvailable } from "./rfid-service";
 
 
 function buildServiceUrl(path: string) {
@@ -25,6 +26,8 @@ async function proxyJsonRequest(
   },
 ) {
   try {
+    await ensureRfidServiceAvailable();
+
     const response = await fetch(buildServiceUrl(options.path), {
       method: options.method,
       headers: options.body ? { "Content-Type": "application/json" } : {},
@@ -54,6 +57,14 @@ export function registerRfidProxyRoutes(app: Express) {
     return proxyJsonRequest(res, {
       method: "POST",
       path: "disconnect",
+    });
+  };
+
+  const detectPortHandler = async (req: Request, res: Response) => {
+    return proxyJsonRequest(res, {
+      method: "POST",
+      path: "detect-port",
+      body: req.body ?? {},
     });
   };
 
@@ -107,6 +118,9 @@ export function registerRfidProxyRoutes(app: Express) {
 
   app.post("/api/rfid/disconnect", disconnectHandler);
   app.post("/api/disconnect", disconnectHandler);
+
+  app.post("/api/rfid/detect-port", detectPortHandler);
+  app.post("/api/detect-port", detectPortHandler);
 
   app.post("/api/rfid/start", startHandler);
   app.post("/api/start", startHandler);

@@ -39,6 +39,7 @@ import {
   type GateCorrelationMatch,
 } from "./gate-matching-engine";
 import { registerRfidProxyRoutes } from "./rfid-proxy";
+import { stopManagedRfidService, warmRfidService } from "./rfid-service";
 const SESSION_TIMEOUT_SWEEP_MS = 1000;
 type AttendanceAction = "ENTRY" | "EXIT";
 type MovementDirection = AttendanceAction | "UNKNOWN";
@@ -1644,6 +1645,9 @@ export async function registerRoutes(
   void warmPythonFaceWorker().catch((error) => {
     console.warn("[python-face] Warm-up skipped:", error);
   });
+  void warmRfidService().catch((error) => {
+    console.warn("[rfid-service] Warm-up skipped:", error);
+  });
   registerRfidProxyRoutes(app);
   const timeoutExitSweep = setInterval(() => {
     void processTimedOutGateSessions().catch((error) => {
@@ -1653,6 +1657,7 @@ export async function registerRoutes(
 
   httpServer.once("close", () => {
     clearInterval(timeoutExitSweep);
+    void stopManagedRfidService();
   });
   
   async function validateEmployeeIdentityConflicts(

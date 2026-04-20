@@ -5,7 +5,15 @@ import threading
 from dataclasses import asdict, dataclass
 
 from .processor import TagProcessor
-from .reader import ReaderConfig, ReaderInfo, SerialRFIDReader, WorkModeConfig
+from .reader import (
+    ReaderConfig,
+    ReaderInfo,
+    SerialPortInfo,
+    SerialRFIDReader,
+    WorkModeConfig,
+    detect_reader_port,
+    list_serial_ports,
+)
 
 
 LOGGER = logging.getLogger("rfid_service.controller")
@@ -45,7 +53,7 @@ class RFIDController:
         debug_raw: bool | None = None,
     ) -> dict[str, object]:
         with self._lock:
-            desired_port = port or self._state.port
+            desired_port = self._normalize_port_name(port or self._state.port)
             desired_baudrate = baudrate or self._state.baudrate
             desired_debug = self._state.debug_raw if debug_raw is None else debug_raw
 
@@ -63,45 +71,34 @@ class RFIDController:
             self._state.debug_raw = desired_debug
             self._state.last_error = None
 
-            config = ReaderConfig(
-                port=desired_port,
-                baudrate=desired_baudrate,
-                debug_raw=desired_debug,
-            )
-            reader = SerialRFIDReader(
-                config=config,
-                on_tags=self._handle_detected_tags,
-                on_connection_change=self._handle_connection_change,
-            )
             try:
-                reader.start()
-                self._reader = reader
-                self._processor.set_mode(self._state.current_mode)
-                self._state.running = False
-                self._state.connected = reader.connected
-                self._needs_runtime_sync = True
+                return self._connect_locked(
+                    port=desired_port,
+                    baudrate=desired_baudrate,
+                    debug_raw=desired_debug,
+                )
+            except Exception as primary_exc:
+                LOGGER.warning("RFID connection failed on %s: %s", desired_port, primary_exc)
+                auto_detected = self._auto_detect_port_locked(
+                    preferred_port=desired_port,
+                    baudrate=desired_baudrate,
+                    debug_raw=desired_debug,
+                )
+                if auto_detected is not None and auto_detected[0].device != desired_port:
+                    fallback_port = auto_detected[0].device
+                    LOGGER.info(
+                        "Auto-detected RFID reader on %s after %s failed.",
+                        fallback_port,
+                        desired_port,
+                    )
+                    self._state.port = fallback_port
+                    return self._connect_locked(
+                        port=fallback_port,
+                        baudrate=desired_baudrate,
+                        debug_raw=desired_debug,
+                    )
 
-                try:
-                    self._reader_info = reader.get_reader_info()
-                    self._state.current_power = self._reader_info.power
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("Unable to read reader info during startup: %s", exc)
-
-                try:
-                    work_mode = reader.get_work_mode()
-                    self._state.current_mode = self._mode_from_work_mode(work_mode)
-                except Exception as exc:  # noqa: BLE001
-                    LOGGER.warning("Unable to read work mode during startup: %s", exc)
-
-                self._sync_runtime_state_locked()
-                return self.get_status()
-            except Exception:
-                reader.stop()
-                self._reader = None
-                self._reader_info = None
-                self._state.connected = False
-                self._state.running = False
-                self._needs_runtime_sync = False
+                self._state.last_error = str(primary_exc)
                 raise
 
     def start(
@@ -147,6 +144,55 @@ class RFIDController:
             self._state.running = False
             self._needs_runtime_sync = False
             return self.get_status()
+
+    def detect_port(
+        self,
+        *,
+        baudrate: int | None = None,
+        debug_raw: bool | None = None,
+    ) -> dict[str, object]:
+        with self._lock:
+            desired_baudrate = baudrate or self._state.baudrate
+            desired_debug = self._state.debug_raw if debug_raw is None else debug_raw
+
+            if self._state.connected:
+                active_port = SerialPortInfo(
+                    device=self._state.port,
+                    description="Active RFID reader connection",
+                )
+                return {
+                    **self.get_status(),
+                    "detected_port": asdict(active_port),
+                    "detected_reader_info": asdict(self._reader_info) if self._reader_info is not None else None,
+                }
+
+            detected = self._auto_detect_port_locked(
+                preferred_port=self._state.port,
+                baudrate=desired_baudrate,
+                debug_raw=desired_debug,
+            )
+            if detected is None:
+                available_ports = list_serial_ports()
+                if not available_ports:
+                    self._state.last_error = "No serial ports found for RFID auto-detect."
+                    raise RuntimeError(self._state.last_error)
+
+                available_names = ", ".join(port.device for port in available_ports)
+                self._state.last_error = (
+                    f"No UHF reader detected on available serial ports: {available_names}."
+                )
+                raise RuntimeError(self._state.last_error)
+
+            detected_port, detected_reader_info = detected
+            self._state.port = detected_port.device
+            self._state.baudrate = desired_baudrate
+            self._state.debug_raw = desired_debug
+            self._state.last_error = None
+            return {
+                **self.get_status(),
+                "detected_port": asdict(detected_port),
+                "detected_reader_info": asdict(detected_reader_info),
+            }
 
     def set_power(self, level: int) -> dict[str, object]:
         with self._lock:
@@ -231,6 +277,79 @@ class RFIDController:
         if normalized not in MODE_DEFAULT_POWER:
             raise ValueError("Mode must be one of: normal, registration.")
         return normalized
+
+    def _normalize_port_name(self, port: str) -> str:
+        normalized = port.strip()
+        if not normalized:
+            return self._state.port
+        if normalized.upper().startswith("COM"):
+            return normalized.upper()
+        return normalized
+
+    def _connect_locked(
+        self,
+        *,
+        port: str,
+        baudrate: int,
+        debug_raw: bool,
+    ) -> dict[str, object]:
+        config = ReaderConfig(
+            port=port,
+            baudrate=baudrate,
+            debug_raw=debug_raw,
+        )
+        reader = SerialRFIDReader(
+            config=config,
+            on_tags=self._handle_detected_tags,
+            on_connection_change=self._handle_connection_change,
+        )
+        try:
+            reader.start()
+            self._reader = reader
+            self._processor.set_mode(self._state.current_mode)
+            self._state.running = False
+            self._state.connected = reader.connected
+            self._needs_runtime_sync = True
+
+            try:
+                self._reader_info = reader.get_reader_info()
+                self._state.current_power = self._reader_info.power
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Unable to read reader info during startup: %s", exc)
+
+            try:
+                work_mode = reader.get_work_mode()
+                self._state.current_mode = self._mode_from_work_mode(work_mode)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Unable to read work mode during startup: %s", exc)
+
+            self._sync_runtime_state_locked()
+            return self.get_status()
+        except Exception:
+            reader.stop()
+            self._reader = None
+            self._reader_info = None
+            self._state.connected = False
+            self._state.running = False
+            self._needs_runtime_sync = False
+            raise
+
+    def _auto_detect_port_locked(
+        self,
+        *,
+        preferred_port: str | None,
+        baudrate: int,
+        debug_raw: bool,
+    ) -> tuple[SerialPortInfo, ReaderInfo] | None:
+        try:
+            return detect_reader_port(
+                preferred_port=preferred_port,
+                baudrate=baudrate,
+                debug_raw=debug_raw,
+            )
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("RFID auto-detect failed: %s", exc)
+            return None
 
     def _work_mode_for(self, mode: str) -> WorkModeConfig:
         if mode == "registration":

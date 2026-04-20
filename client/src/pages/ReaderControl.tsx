@@ -20,6 +20,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Slider } from "@/components/ui/slider";
 import { useToast } from "@/hooks/use-toast";
 import {
+  detectRfidPort,
   connectRfidReader,
   disconnectRfidReader,
   fetchRfidStatus,
@@ -72,11 +73,11 @@ export default function ReaderControl() {
 
   const connectMutation = useMutation({
     mutationFn: () => connectRfidReader({ port, baudrate: Number(baudrate), debug_raw: false }),
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       await refreshRfidQueries();
       toast({
         title: "Reader connected",
-        description: `Connected on ${port} at ${baudrate} baud.`,
+        description: `Connected on ${data.port} at ${data.baudrate} baud.`,
       });
     },
     onError: (error) => {
@@ -106,13 +107,31 @@ export default function ReaderControl() {
     },
   });
 
+  const detectPortMutation = useMutation({
+    mutationFn: () => detectRfidPort({ baudrate: Number(baudrate), debug_raw: false }),
+    onSuccess: (data) => {
+      setPort(data.detected_port.device);
+      toast({
+        title: "Port detected",
+        description: `Reader found on ${data.detected_port.device}.`,
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Unable to detect reader port",
+        description: error instanceof Error ? error.message : "Auto-detect failed.",
+        variant: "destructive",
+      });
+    },
+  });
+
   const startMutation = useMutation({
     mutationFn: () => startRfidReader({ port, baudrate: Number(baudrate), debug_raw: false }),
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       await refreshRfidQueries();
       toast({
         title: "Reader started",
-        description: "Continuous UHF reading is active.",
+        description: `Continuous UHF reading is active on ${data.port}.`,
       });
     },
     onError: (error) => {
@@ -183,13 +202,15 @@ export default function ReaderControl() {
   const isConnected = Boolean(status?.connected);
   const isRunning = Boolean(status?.running);
   const isBusy = useMemo(() => {
-    return connectMutation.isPending
+    return detectPortMutation.isPending
+      || connectMutation.isPending
       || disconnectMutation.isPending
       || startMutation.isPending
       || stopMutation.isPending
       || powerMutation.isPending
       || modeMutation.isPending;
   }, [
+    detectPortMutation.isPending,
     connectMutation.isPending,
     disconnectMutation.isPending,
     modeMutation.isPending,
@@ -224,7 +245,9 @@ export default function ReaderControl() {
           <AlertTriangle className="size-4 text-amber-700" />
           <AlertTitle>RFID service is not reachable</AlertTitle>
           <AlertDescription>
-            Start the FastAPI service from <span className="font-mono">rfid_service/main.py</span>, then reconnect the reader.
+            The backend could not reach the UHF reader service. If this stays visible, install
+            <span className="mx-1 font-mono">rfid_service/requirements.txt</span>
+            and restart the server.
           </AlertDescription>
         </Alert>
       )}
@@ -241,7 +264,18 @@ export default function ReaderControl() {
           <CardContent className="space-y-5">
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="reader-port">COM Port</Label>
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="reader-port">COM Port</Label>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => detectPortMutation.mutate()}
+                    disabled={isConnected || isBusy}
+                  >
+                    Auto Detect
+                  </Button>
+                </div>
                 <Input
                   id="reader-port"
                   value={port}

@@ -40,6 +40,11 @@ class SetModeRequest(BaseModel):
     mode: str = Field(min_length=1)
 
 
+class DetectPortRequest(BaseModel):
+    baudrate: int = Field(default=57600, ge=1200, le=921600)
+    debug_raw: bool = False
+
+
 def _service_error(exc: Exception) -> HTTPException:
     detail = str(exc) or exc.__class__.__name__
     return HTTPException(status_code=400, detail=detail)
@@ -57,6 +62,14 @@ def connect_reader(payload: ReaderConnectionRequest) -> dict[str, object]:
 def disconnect_reader() -> dict[str, object]:
     try:
         return controller.disconnect()
+    except Exception as exc:  # noqa: BLE001
+        raise _service_error(exc) from exc
+
+
+@app.post("/detect-port")
+def detect_port(payload: DetectPortRequest) -> dict[str, object]:
+    try:
+        return controller.detect_port(baudrate=payload.baudrate, debug_raw=payload.debug_raw)
     except Exception as exc:  # noqa: BLE001
         raise _service_error(exc) from exc
 

@@ -37,6 +37,15 @@ export interface RfidStatus {
   reader_info: RfidReaderInfo | null;
 }
 
+export interface RfidSerialPortInfo {
+  device: string;
+  description: string | null;
+  manufacturer: string | null;
+  hwid: string | null;
+  vid: number | null;
+  pid: number | null;
+}
+
 export interface RfidTagObservation {
   epc: string;
   seen_at: number;
@@ -68,6 +77,11 @@ export interface RfidActiveTagsResponse extends RfidStatus {
 export interface RfidRegistrationResponse extends RfidStatus {
   selected_tag: string | null;
   registration: RfidRegistrationState;
+}
+
+export interface RfidDetectPortResponse extends RfidStatus {
+  detected_port: RfidSerialPortInfo;
+  detected_reader_info: RfidReaderInfo | null;
 }
 
 export const rfidQueryKeys = {
@@ -120,6 +134,14 @@ export async function connectRfidReader(payload: {
 export async function disconnectRfidReader() {
   const response = await apiRequest("POST", "/api/rfid/disconnect");
   return response.json() as Promise<RfidStatus>;
+}
+
+export async function detectRfidPort(payload?: {
+  baudrate?: number;
+  debug_raw?: boolean;
+}) {
+  const response = await apiRequest("POST", "/api/rfid/detect-port", payload);
+  return response.json() as Promise<RfidDetectPortResponse>;
 }
 
 export async function startRfidReader(payload?: {

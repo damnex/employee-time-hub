@@ -10,9 +10,11 @@ from typing import Callable
 try:
     import serial  # type: ignore
     from serial import SerialException  # type: ignore
+    from serial.tools import list_ports  # type: ignore
 except ImportError:  # pragma: no cover
     serial = None
     SerialException = Exception
+    list_ports = None
 
 
 LOGGER = logging.getLogger("rfid_service.reader")
@@ -62,6 +64,16 @@ class ReaderInfo:
     min_frequency: int
     power: int
     scan_time: int
+
+
+@dataclass(slots=True)
+class SerialPortInfo:
+    device: str
+    description: str | None = None
+    manufacturer: str | None = None
+    hwid: str | None = None
+    vid: int | None = None
+    pid: int | None = None
 
 
 @dataclass(slots=True)
@@ -234,6 +246,93 @@ def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
             if tags:
                 return tags
     return []
+
+
+def _port_sort_key(device: str) -> tuple[int, int | str]:
+    normalized = device.strip().upper()
+    if normalized.startswith("COM") and normalized[3:].isdigit():
+        return (0, int(normalized[3:]))
+    return (1, normalized)
+
+
+def list_serial_ports() -> list[SerialPortInfo]:
+    if list_ports is None:  # pragma: no cover
+        raise RuntimeError("pyserial is required. Install rfid_service/requirements.txt first.")
+
+    ports = [
+        SerialPortInfo(
+            device=port.device,
+            description=getattr(port, "description", None),
+            manufacturer=getattr(port, "manufacturer", None),
+            hwid=getattr(port, "hwid", None),
+            vid=getattr(port, "vid", None),
+            pid=getattr(port, "pid", None),
+        )
+        for port in list_ports.comports()
+    ]
+    ports.sort(key=lambda port: _port_sort_key(port.device))
+    return ports
+
+
+def probe_reader_on_port(
+    port: str,
+    *,
+    baudrate: int = 57600,
+    debug_raw: bool = False,
+) -> ReaderInfo | None:
+    reader = SerialRFIDReader(
+        config=ReaderConfig(
+            port=port,
+            baudrate=baudrate,
+            read_timeout=0.1,
+            write_timeout=0.3,
+            reconnect_delay=0.25,
+            command_timeout=0.8,
+            debug_raw=debug_raw,
+        ),
+    )
+
+    try:
+        reader.start()
+        return reader.get_reader_info()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("RFID probe failed on %s @ %s: %s", port, baudrate, exc)
+        return None
+    finally:
+        reader.stop()
+
+
+def detect_reader_port(
+    *,
+    baudrate: int = 57600,
+    preferred_port: str | None = None,
+    debug_raw: bool = False,
+) -> tuple[SerialPortInfo, ReaderInfo] | None:
+    available_ports = list_serial_ports()
+    if not available_ports:
+        return None
+
+    preferred = preferred_port.strip().upper() if preferred_port else None
+    ordered_ports = available_ports
+    if preferred:
+        ordered_ports = sorted(
+            available_ports,
+            key=lambda port: (
+                0 if port.device.strip().upper() == preferred else 1,
+                *_port_sort_key(port.device),
+            ),
+        )
+
+    for port_info in ordered_ports:
+        reader_info = probe_reader_on_port(
+            port_info.device,
+            baudrate=baudrate,
+            debug_raw=debug_raw,
+        )
+        if reader_info is not None:
+            return port_info, reader_info
+
+    return None
 
 
 class SerialRFIDReader:
