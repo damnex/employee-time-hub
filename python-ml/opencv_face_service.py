@@ -1007,12 +1007,6 @@ def main() -> int:
     camera = LatestFrameCamera(args)
 
     try:
-        camera.start()
-    except Exception as error:  # noqa: BLE001
-        # Keep the worker alive and let the background camera thread continue retrying.
-        print(f"[python-face] Camera warm start is still waiting for frames: {error}", file=sys.stderr)
-
-    try:
         for raw_line in sys.stdin:
             line = raw_line.strip()
             if not line:

@@ -635,7 +635,7 @@ export class MemoryStorage implements IStorage {
       occurredAt: new Date(),
       rfidUid: event.rfidUid,
       deviceId: event.deviceId,
-      scanTechnology: event.scanTechnology ?? "HF_RFID",
+      scanTechnology: event.scanTechnology ?? "UHF_RFID",
       decision: event.decision,
       verificationStatus: event.verificationStatus,
       eventMessage: event.eventMessage,

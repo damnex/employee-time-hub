@@ -6,7 +6,7 @@ import { z } from "zod";
 export type AttendanceRecord = z.infer<typeof api.attendances.list.responses[200]>[number];
 export type AttendanceStatus = "ENTRY" | "EXIT" | "FAILED_FACE" | "FAILED_DIRECTION" | "UNKNOWN_RFID";
 export type GateEventRecord = z.infer<typeof api.gateEvents.list.responses[200]>[number];
-export type ScanTechnology = "HF_RFID" | "UHF_RFID";
+export type ScanTechnology = "UHF_RFID";
 export type GateDecision = "ENTRY" | "EXIT" | "REJECTED" | "UNKNOWN";
 
 export function formatWorkingDuration(workingHours: number) {
@@ -37,8 +37,6 @@ export function getAttendanceStatusLabel(status: AttendanceStatus | string) {
 
 export function getScanTechnologyLabel(value: ScanTechnology | string) {
   switch (value) {
-    case "HF_RFID":
-      return "HF RFID";
     case "UHF_RFID":
       return "UHF RFID";
     default:

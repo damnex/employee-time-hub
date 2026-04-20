@@ -125,3 +125,8 @@ export function useTriggeredCameraFaceRecognition() {
     ?? null,
   );
 }
+
+export function getRfidServiceBaseUrl() {
+  loadEnvironment();
+  return process.env.RFID_SERVICE_BASE_URL?.trim() || "http://127.0.0.1:8001";
+}

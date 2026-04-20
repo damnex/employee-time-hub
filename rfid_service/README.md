@@ -1,0 +1,39 @@
+# RFID Service
+
+Standalone FastAPI service for a `UHFReader18` serial reader.
+
+## Features
+
+- Binary packet parsing with CRC-16 validation.
+- EPC extraction for spontaneous `0xEE` frames and inventory responses.
+- Background reader thread with reconnection.
+- ENTRY / EXIT event processing using `last_seen` and `active_tags`.
+- Registration mode that requires one stable tag repeated at least 5 times.
+- Reader power control and work mode control.
+
+## Run
+
+```bash
+python -m pip install -r rfid_service/requirements.txt
+python -m rfid_service.main
+```
+
+The service listens on `http://127.0.0.1:8001` by default.
+
+## API
+
+- `POST /start`
+- `POST /stop`
+- `POST /set-power`
+- `POST /set-mode`
+- `GET /tags`
+- `GET /active-tags`
+- `GET /registration-tag`
+- `GET /status`
+
+## Notes
+
+- `normal` mode applies scan mode + inventory multiple + power `30`.
+- `registration` mode applies scan mode + inventory single + power `8`.
+- `trigger` mode applies trigger-low mode + inventory single + power `8`.
+- If you need raw packet logging, pass `debug_raw: true` in `POST /start`.

@@ -4,7 +4,7 @@ import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
 export const faceCaptureModeSchema = z.enum(["detected", "fallback"]);
-export const scanTechnologySchema = z.enum(["HF_RFID", "UHF_RFID"]);
+export const scanTechnologySchema = z.enum(["UHF_RFID"]);
 export const movementAxisSchema = z.enum(["horizontal", "depth", "pose", "none"]);
 export const gateDecisionSchema = z.enum(["ENTRY", "EXIT", "REJECTED", "UNKNOWN"]);
 export const facePoseSchema = z.enum(["front", "left", "right", "up", "down", "unknown"]);
@@ -118,7 +118,7 @@ export const gateEvents = pgTable("gate_events", {
   occurredAt: timestamp("occurred_at").defaultNow(),
   rfidUid: text("rfid_uid").notNull(),
   deviceId: text("device_id").notNull(),
-  scanTechnology: text("scan_technology").notNull().default("HF_RFID"),
+  scanTechnology: text("scan_technology").notNull().default("UHF_RFID"),
   decision: text("decision").notNull(), // 'ENTRY', 'EXIT', 'REJECTED', 'UNKNOWN'
   verificationStatus: text("verification_status").notNull(), // 'ENTRY', 'EXIT', 'FAILED_FACE', 'FAILED_DIRECTION', 'UNKNOWN_RFID'
   eventMessage: text("event_message").notNull(),

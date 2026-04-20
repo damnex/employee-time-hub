@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useDeleteEmployee, useEmployees, usePythonEnrollEmployee, useUpdateEmployee } from "@/hooks/use-employees";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -50,9 +51,16 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { insertEmployeeSchema, type Employee } from "@shared/schema";
-import { useDeviceWS } from "@/hooks/use-device-ws";
+import {
+  fetchRfidRegistrationTag,
+  fetchRfidTags,
+  rfidQueryKeys,
+  setRfidMode,
+  startRfidReader,
+} from "@/lib/rfid";
 
-const ENROLLMENT_CAMERA_ID = "ENROLLMENT-CONSOLE-01";
+const REGISTRATION_PORT = "COM3";
+const REGISTRATION_BAUDRATE = 57600;
 const MIN_DATASET_SAMPLES = 20;
 const DEFAULT_DATASET_SAMPLES = 60;
 const MAX_DATASET_SAMPLES = 100;
@@ -149,17 +157,11 @@ function getPythonFaceStatus(faceDescriptor: unknown) {
 }
 
 export default function Employees() {
+  const queryClient = useQueryClient();
   const { data: employees, isLoading } = useEmployees();
   const deleteEmployee = useDeleteEmployee();
   const pythonEnrollEmployee = usePythonEnrollEmployee();
   const updateEmployee = useUpdateEmployee();
-  const {
-    isConnected: enrollmentSocketConnected,
-    deviceOnline: enrollmentDeviceOnline,
-    lastScanResult: lastDeviceMessage,
-    clearResult: clearDeviceMessage,
-  } = useDeviceWS(ENROLLMENT_CAMERA_ID, { clientType: "browser" });
-  const enrollmentReaderOnline = enrollmentDeviceOnline;
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false);
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
@@ -174,6 +176,7 @@ export default function Employees() {
   const [datasetError, setDatasetError] = useState<string | null>(null);
   const [rfidReaderMessage, setRfidReaderMessage] = useState<string | null>(null);
   const [rfidSourceDeviceId, setRfidSourceDeviceId] = useState<string | null>(null);
+  const [registrationModeEnabled, setRegistrationModeEnabled] = useState(false);
   const [editProfilePreview, setEditProfilePreview] = useState<string | null>(null);
   const [editProfilePhoto, setEditProfilePhoto] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -196,6 +199,47 @@ export default function Employees() {
   });
   const rfidReady = Boolean(normalizedRfidUid) && !mappedBadgeOwner;
   const datasetReady = datasetPhotos.length >= MIN_DATASET_SAMPLES;
+
+  const readerStatusQuery = useQuery({
+    queryKey: rfidQueryKeys.tags,
+    queryFn: fetchRfidTags,
+    enabled: isDialogOpen,
+    refetchInterval: isDialogOpen ? 2000 : false,
+  });
+
+  const registrationTagQuery = useQuery({
+    queryKey: rfidQueryKeys.registrationTag,
+    queryFn: fetchRfidRegistrationTag,
+    enabled: isDialogOpen && registrationModeEnabled,
+    refetchInterval: isDialogOpen && registrationModeEnabled ? 1200 : false,
+  });
+
+  const enableRegistrationModeMutation = useMutation({
+    mutationFn: async () => {
+      await startRfidReader({
+        port: readerStatusQuery.data?.port ?? REGISTRATION_PORT,
+        baudrate: readerStatusQuery.data?.baudrate ?? REGISTRATION_BAUDRATE,
+      });
+      return setRfidMode("registration");
+    },
+    onSuccess: async () => {
+      setRegistrationModeEnabled(true);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: rfidQueryKeys.tags }),
+        queryClient.invalidateQueries({ queryKey: rfidQueryKeys.registrationTag }),
+      ]);
+    },
+    onError: (error) => {
+      setRfidReaderMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to enable UHF registration mode.",
+      );
+      setRfidSourceDeviceId("RFID Service");
+    },
+  });
+
+  const enrollmentReaderOnline = Boolean(readerStatusQuery.data?.connected && readerStatusQuery.data?.running);
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -263,30 +307,41 @@ export default function Employees() {
       return;
     }
 
-    if (lastDeviceMessage?.type !== "rfid_detected" || !lastDeviceMessage.rfidUid) {
+    if (readerStatusQuery.data?.current_mode === "registration") {
+      setRegistrationModeEnabled(true);
+    }
+  }, [isDialogOpen, readerStatusQuery.data?.current_mode]);
+
+  useEffect(() => {
+    if (!isDialogOpen) {
       return;
     }
 
-    const scannedUid = lastDeviceMessage.rfidUid.trim().toUpperCase();
-    form.setValue("rfidUid", scannedUid, {
-      shouldDirty: true,
-      shouldTouch: true,
-      shouldValidate: true,
-    });
-    setRfidReaderMessage(lastDeviceMessage.message);
-    setRfidSourceDeviceId(lastDeviceMessage.deviceId ?? null);
-
-    if (lastDeviceMessage.available === false && lastDeviceMessage.employee) {
-      form.setError("rfidUid", {
-        type: "manual",
-        message: `RFID badge already mapped to ${lastDeviceMessage.employee.name}.`,
-      });
-    } else {
-      form.clearErrors("rfidUid");
+    const registration = registrationTagQuery.data?.registration;
+    if (!registrationModeEnabled || !registration) {
+      return;
     }
 
-    clearDeviceMessage();
-  }, [clearDeviceMessage, form, isDialogOpen, lastDeviceMessage]);
+    setRfidReaderMessage(registration.message);
+    setRfidSourceDeviceId(readerStatusQuery.data?.port ?? "RFID Service");
+
+    if (registration.multiple_tags_detected) {
+      form.setError("rfidUid", {
+        type: "manual",
+        message: "Multiple UHF tags detected. Keep only one tag near the reader.",
+      });
+      return;
+    }
+
+    if (registration.selected_tag) {
+      form.setValue("rfidUid", registration.selected_tag, {
+        shouldDirty: true,
+        shouldTouch: true,
+        shouldValidate: true,
+      });
+      form.clearErrors("rfidUid");
+    }
+  }, [form, isDialogOpen, readerStatusQuery.data?.port, registrationModeEnabled, registrationTagQuery.data?.registration]);
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -294,8 +349,10 @@ export default function Employees() {
     }
 
     if (!normalizedRfidUid) {
-      setRfidReaderMessage(null);
-      setRfidSourceDeviceId(null);
+      if (!registrationModeEnabled) {
+        setRfidReaderMessage(null);
+        setRfidSourceDeviceId(null);
+      }
       return;
     }
 
@@ -309,7 +366,7 @@ export default function Employees() {
     }
 
     form.clearErrors("rfidUid");
-  }, [form, isDialogOpen, mappedBadgeOwner, normalizedRfidUid]);
+  }, [form, isDialogOpen, mappedBadgeOwner, normalizedRfidUid, registrationModeEnabled]);
 
   const resetEnrollment = () => {
     setDatasetPhotos([]);
@@ -319,6 +376,7 @@ export default function Employees() {
     setDatasetSamplesTarget(DEFAULT_DATASET_SAMPLES);
     setRfidReaderMessage(null);
     setRfidSourceDeviceId(null);
+    setRegistrationModeEnabled(false);
     setCameraError(null);
     setIsCapturingDataset(false);
     form.reset(defaultFormValues);
@@ -328,6 +386,9 @@ export default function Employees() {
     setIsDialogOpen(open);
 
     if (!open) {
+      if (registrationModeEnabled) {
+        void setRfidMode("normal").catch(() => undefined);
+      }
       resetEnrollment();
     }
   };
@@ -594,7 +655,7 @@ export default function Employees() {
                             </div>
                             <FormControl>
                               <Input
-                                placeholder="Tap a badge or type A1B2C3D4"
+                                placeholder="Present one UHF tag or type E2..."
                                 className="font-mono uppercase tracking-[0.2em]"
                                 {...field}
                                 onChange={(event) => {
@@ -607,15 +668,46 @@ export default function Employees() {
                         )}
                       />
 
+                      <div className="flex flex-wrap items-center gap-3">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          onClick={() => enableRegistrationModeMutation.mutate()}
+                          disabled={enableRegistrationModeMutation.isPending}
+                        >
+                          {enableRegistrationModeMutation.isPending ? (
+                            <>
+                              <Loader2 className="mr-2 size-4 animate-spin" />
+                              Enabling Registration Mode
+                            </>
+                          ) : (
+                            <>
+                              <ScanLine className="mr-2 size-4" />
+                              Enable Registration Mode
+                            </>
+                          )}
+                        </Button>
+                        <Badge
+                          variant={registrationModeEnabled ? "secondary" : "outline"}
+                          className={cn(
+                            registrationModeEnabled
+                              ? "bg-sky-100 text-sky-800 border-sky-200"
+                              : "border-slate-300 text-slate-600",
+                          )}
+                        >
+                          {registrationModeEnabled ? "Registration Active" : "Registration Inactive"}
+                        </Badge>
+                      </div>
+
                       <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm">
                         <div className="flex items-start gap-2 text-muted-foreground">
                           <ShieldCheck className="mt-0.5 size-4 shrink-0" />
                           <div className="space-y-1">
                             <p>
-                              {rfidReaderMessage ?? "Tap a real RFID card on the enrollment reader or type the UID manually."}
+                              {rfidReaderMessage ?? "Enable registration mode, keep one UHF tag near the reader, or type the EPC manually."}
                             </p>
                             <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                              Source: {rfidSourceDeviceId ?? ENROLLMENT_CAMERA_ID}
+                              Source: {rfidSourceDeviceId ?? "RFID Service"}
                             </p>
                           </div>
                         </div>

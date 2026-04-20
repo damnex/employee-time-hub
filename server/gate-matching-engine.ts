@@ -12,7 +12,6 @@ export const MATCH_WINDOW_MS = 2_000;
 export const FRAGMENT_TTL_MS = 12_000;
 export const SESSION_TTL_MS = 12 * 60 * 60 * 1_000;
 export const SESSION_EXIT_TIMEOUT_MS = 5_000;
-export const HF_DUPLICATE_WINDOW_MS = 3_500;
 export const UHF_DUPLICATE_WINDOW_MS = 1_200;
 
 const RFID_SCORE = 40;
@@ -183,8 +182,8 @@ function normalizeOptionalRfidUid(rfidUid?: string | null) {
   return rfidUid?.trim() ? normalizeRfidUid(rfidUid) : undefined;
 }
 
-function duplicateWindowForTechnology(scanTechnology: ScanTechnology) {
-  return scanTechnology === "UHF_RFID" ? UHF_DUPLICATE_WINDOW_MS : HF_DUPLICATE_WINDOW_MS;
+function duplicateWindowForTechnology(_scanTechnology: ScanTechnology) {
+  return UHF_DUPLICATE_WINDOW_MS;
 }
 
 function hasFacePayload(signal: GateSignalInput) {
@@ -397,7 +396,7 @@ export class GateMatchingEngine {
     source?: RfidSource;
   }) {
     const occurredAtMs = toOccurredAtMs(args.occurredAt);
-    const scanTechnology = args.scanTechnology ?? "HF_RFID";
+    const scanTechnology = args.scanTechnology ?? "UHF_RFID";
     const rfidUid = normalizeRfidUid(args.rfidUid);
 
     this.cleanup(occurredAtMs);

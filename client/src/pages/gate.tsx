@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type MutableRefObject } from "react";
+import { useQuery } from "@tanstack/react-query";
 import type { Employee } from "@shared/schema";
 import { fetchLiveFaceRecognition, useScanRFID } from "@/hooks/use-gate";
 import { useEmployees } from "@/hooks/use-employees";
-import { useDeviceWS } from "@/hooks/use-device-ws";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
@@ -11,14 +11,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { detectLiveTrackingFaces, isFaceDetectorAvailable } from "@/lib/biometrics";
+import { fetchRfidActiveTags, fetchRfidTags, rfidQueryKeys } from "@/lib/rfid";
 import { cn } from "@/lib/utils";
 import {
   AlertCircle,
@@ -38,7 +32,6 @@ import {
 
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
-const GATE_BROWSER_CLIENT_ID = "GATE-TERMINAL-01-BROWSER";
 const GATE_FRAME_COUNT = 3;
 const GATE_FRAME_DELAY_MS = 20;
 const GATE_MAX_FRAME_WIDTH = 480;
@@ -230,7 +223,7 @@ function captureGateFrame(
 
 function getCaptureMessage(progress: number) {
   if (progress <= 2) {
-    return "Hold the face centered while the badge tap starts the burst.";
+    return "Hold the face centered while the UHF event starts the burst.";
   }
 
   if (progress <= 5) {
@@ -451,12 +444,17 @@ function matchRecognizedFacesToTrackedFaces(
 export default function GateTerminal() {
   const { data: employees } = useEmployees();
   const scanMutation = useScanRFID();
-  const {
-    isConnected,
-    deviceOnline,
-    lastScanResult,
-    clearResult,
-  } = useDeviceWS(GATE_BROWSER_CLIENT_ID, { clientType: "browser" });
+  const readerTagsQuery = useQuery({
+    queryKey: rfidQueryKeys.tags,
+    queryFn: fetchRfidTags,
+    refetchInterval: 1200,
+  });
+  const readerActiveTagsQuery = useQuery({
+    queryKey: rfidQueryKeys.activeTags,
+    queryFn: fetchRfidActiveTags,
+    enabled: Boolean(readerTagsQuery.data?.running),
+    refetchInterval: 1500,
+  });
   const cameraViewportRef = useRef<HTMLDivElement>(null);
   const pythonPreviousLiveTracksRef = useRef<Array<{ trackId: number; centerX: number; centerY: number }>>([]);
   const pythonNextTrackIdRef = useRef(1);
@@ -469,7 +467,7 @@ export default function GateTerminal() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [rfidUid, setRfidUid] = useState("");
-  const [scanTechnology, setScanTechnology] = useState<"HF_RFID" | "UHF_RFID">("HF_RFID");
+  const scanTechnology: "UHF_RFID" = "UHF_RFID";
   const [cameraActive, setCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [cameraRetryToken, setCameraRetryToken] = useState(0);
@@ -477,7 +475,7 @@ export default function GateTerminal() {
   const [captureProgress, setCaptureProgress] = useState(0);
   const [readerMessage, setReaderMessage] = useState<string | null>(null);
   const [readerSourceDeviceId, setReaderSourceDeviceId] = useState<string | null>(null);
-  const [liveTapUid, setLiveTapUid] = useState<string | null>(null);
+  const [liveDetectedUid, setLiveDetectedUid] = useState<string | null>(null);
   const [pythonTrackedFaces, setPythonTrackedFaces] = useState<LiveTrackedFace[]>([]);
   const [browserTrackedFaces, setBrowserTrackedFaces] = useState<LiveTrackedFace[]>([]);
   const [liveRecognitionAssignments, setLiveRecognitionAssignments] = useState<LiveRecognitionAssignment[]>([]);
@@ -489,10 +487,13 @@ export default function GateTerminal() {
     sourceDeviceId: string;
   } | null>(null);
   const [lastResult, setLastResult] = useState<GateDisplayResult | null>(null);
+  const lastProcessedReaderDetectionRef = useRef<number>(0);
 
   const busy = isCapturingFrames || scanMutation.isPending;
   const sensorWindowActive = sensorWindowOpen || busy;
   const busyRef = useRef(busy);
+  const readerConnected = Boolean(readerTagsQuery.data?.connected && readerTagsQuery.data?.running);
+  const readerEndpointLabel = readerTagsQuery.data?.port ?? "UHFReader18";
   const normalizedRfidUid = rfidUid.trim().toUpperCase();
   const selectedBadgeOwner = employees?.find((employee) => {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
@@ -504,13 +505,14 @@ export default function GateTerminal() {
     ? `/api/employees/${latestEmployee.id}/photo${profileNonce ? `?t=${profileNonce}` : ""}`
     : lastResult?.previewImage ?? null;
   const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
+  const activeReaderTags = readerActiveTagsQuery.data?.active_tags ?? [];
   const pythonRosterCount = (employees ?? []).filter((employee) => {
     return Boolean(getPythonFaceMeta(employee.faceDescriptor));
   }).length;
   const pythonTrainedCount = (employees ?? []).filter((employee) => {
     return getPythonFaceMeta(employee.faceDescriptor)?.status === "trained";
   }).length;
-  const lastTapDisplay = liveTapUid ?? (normalizedRfidUid || "--");
+  const lastDetectedDisplay = liveDetectedUid ?? (normalizedRfidUid || "--");
   const detectedFaceBoxStyle = getFaceBoxStyle(lastResult?.detectedFaceBox, lastResult?.previewFrameSize);
   const stableRecognitionAssignments = liveRecognitionAssignments.filter((assignment) => {
     return Date.now() - assignment.lastSeenAt <= LIVE_RECOGNITION_TTL_MS
@@ -752,7 +754,7 @@ export default function GateTerminal() {
 
       try {
         const response = await fetchLiveFaceRecognition({
-          deviceId: GATE_BROWSER_CLIENT_ID,
+          deviceId: GATE_DEVICE_ID,
           frame: frame.dataUrl,
           maxFaces: hasBrowserTracker
             ? Math.min(Math.max(trackedFacesBeforeRequest.length + 2, 4), 50)
@@ -1066,7 +1068,7 @@ export default function GateTerminal() {
 
     armSensorWindow();
     setRfidUid(normalizedUid);
-    setLiveTapUid(normalizedUid);
+    setLiveDetectedUid(normalizedUid);
 
     const badgeOwner = employees?.find((employee) => {
       return employee.rfidUid.toUpperCase() === normalizedUid;
@@ -1122,7 +1124,7 @@ export default function GateTerminal() {
       setReaderSourceDeviceId(requestDeviceId);
       setReaderMessage(
         source === "reader"
-          ? `Badge tap received from ${requestDeviceId}. Python verification completed.`
+          ? `UHF reader event received from ${requestDeviceId}. Python verification completed.`
           : `Manual verification sent through ${requestDeviceId}.`,
       );
       setLastResult({
@@ -1165,69 +1167,49 @@ export default function GateTerminal() {
   ]);
 
   useEffect(() => {
-    if (lastScanResult?.type !== "rfid_detected" || !lastScanResult.rfidUid) {
+    if (!readerConnected || !activeReaderTags.length) {
       return;
     }
 
-    const tappedUid = lastScanResult.rfidUid.trim().toUpperCase();
-    const sourceDeviceId = lastScanResult.deviceId ?? GATE_DEVICE_ID;
+    const sourceDeviceId = readerEndpointLabel;
+    setReaderSourceDeviceId(sourceDeviceId);
+
+    if (activeReaderTags.length > 1) {
+      setReaderMessage(
+        `Multiple active UHF tags detected (${activeReaderTags.length}). Keep only one tag in the read zone for face verification.`,
+      );
+      return;
+    }
+
+    const activeTag = activeReaderTags[0];
+    const detectionKey = Math.round(activeTag.first_seen_at * 1000);
+    if (detectionKey <= lastProcessedReaderDetectionRef.current) {
+      return;
+    }
+    lastProcessedReaderDetectionRef.current = detectionKey;
 
     armSensorWindow();
-    setRfidUid(tappedUid);
-    setLiveTapUid(tappedUid);
-    setReaderMessage(lastScanResult.message);
-    setReaderSourceDeviceId(sourceDeviceId);
-    clearResult();
+    setRfidUid(activeTag.epc);
+    setLiveDetectedUid(activeTag.epc);
+    setReaderMessage(`Live UHF detection captured from ${sourceDeviceId}. Starting face verification.`);
 
     if (busy) {
       setPendingReaderScan({
-        rfidUid: tappedUid,
+        rfidUid: activeTag.epc,
         sourceDeviceId,
       });
       return;
     }
 
-    void handleScan(tappedUid, "reader", sourceDeviceId);
-  }, [armSensorWindow, busy, clearResult, handleScan, lastScanResult]);
-
-  useEffect(() => {
-    if (lastScanResult?.type !== "scan_result" || !lastScanResult.rfidUid) {
-      return;
-    }
-
-    const scannedUid = lastScanResult.rfidUid.trim().toUpperCase();
-    const badgeOwner = employees?.find((employee) => {
-      return employee.rfidUid.toUpperCase() === scannedUid;
-    });
-    const matchedEmployee = lastScanResult.employee?.id
-      ? employees?.find((employee) => employee.id === lastScanResult.employee?.id)
-      : undefined;
-
-    setRfidUid(scannedUid);
-    setLiveTapUid(scannedUid);
-    setReaderMessage(lastScanResult.message);
-    setReaderSourceDeviceId(lastScanResult.deviceId ?? GATE_DEVICE_ID);
-    setLastResult({
-      success: Boolean(lastScanResult.success),
-      ignored: lastScanResult.ignored,
-      message: lastScanResult.message,
-      employee: matchedEmployee,
-      badgeOwner,
-      action: lastScanResult.action,
-      verifiedAt: new Date().toLocaleTimeString(),
-      latencyMs: 0,
-      previewImage: null,
-      source: "reader",
-      matchConfidence: lastScanResult.matchConfidence,
-      matchDetails: lastScanResult.matchDetails,
-      movementDirection: lastScanResult.movementDirection,
-      movementConfidence: lastScanResult.movementConfidence,
-      detectedFaceLabel: lastScanResult.detectedFaceLabel,
-      detectedFaceBox: lastScanResult.detectedFaceBox ?? null,
-      previewFrameSize: null,
-    });
-    clearResult();
-  }, [clearResult, employees, lastScanResult]);
+    void handleScan(activeTag.epc, "reader", sourceDeviceId);
+  }, [
+    activeReaderTags,
+    armSensorWindow,
+    busy,
+    handleScan,
+    readerConnected,
+    readerEndpointLabel,
+  ]);
 
   useEffect(() => {
     if (!pendingReaderScan || busy) {
@@ -1269,18 +1251,18 @@ export default function GateTerminal() {
         <CardContent className="flex flex-wrap items-center justify-between gap-2 p-3">
           <div className="flex items-baseline gap-2">
             <h1 className="text-2xl font-semibold tracking-tight text-foreground">Gate Monitor</h1>
-            <p className="text-sm text-muted-foreground">RFID tap + live face verification in one view.</p>
+            <p className="text-sm text-muted-foreground">Continuous UHF RFID + live face verification in one view.</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Badge
-              variant={deviceOnline ? "secondary" : "outline"}
+              variant={readerConnected ? "secondary" : "outline"}
               className={cn(
-                deviceOnline
+                readerConnected
                   ? "bg-emerald-100 text-emerald-800 border-emerald-200"
                   : "border-slate-300 text-slate-600",
               )}
             >
-              {deviceOnline ? "Reader Online" : "Reader Offline"}
+              {readerConnected ? "Reader Online" : "Reader Offline"}
             </Badge>
             <Badge
               variant={cameraActive ? "secondary" : "outline"}
@@ -1303,8 +1285,8 @@ export default function GateTerminal() {
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <h2 className="text-xl font-semibold text-foreground">Live gate camera</h2>
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                {isConnected ? <Wifi className="size-4 text-emerald-600" /> : <WifiOff className="size-4" />}
-                <span>{readerSourceDeviceId ?? GATE_DEVICE_ID}</span>
+                {readerConnected ? <Wifi className="size-4 text-emerald-600" /> : <WifiOff className="size-4" />}
+                <span>{readerSourceDeviceId ?? readerEndpointLabel}</span>
               </div>
             </div>
 
@@ -1405,19 +1387,41 @@ export default function GateTerminal() {
 
             <div className="grid gap-2 sm:grid-cols-3">
               <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Tap</p>
-                <p className="mt-1 font-mono text-sm text-foreground">{lastTapDisplay}</p>
+                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Detection</p>
+                <p className="mt-1 font-mono text-sm text-foreground">{lastDetectedDisplay}</p>
               </div>
               <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Queue</p>
                 <p className="mt-1 text-sm text-foreground">
-                  {pendingReaderScan ? `Waiting ${pendingReaderScan.rfidUid}` : "No queued badge"}
+                  {pendingReaderScan ? `Waiting ${pendingReaderScan.rfidUid}` : "No queued UHF tag"}
                 </p>
               </div>
               <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
                 <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Reader Channel</p>
-                <p className="mt-1 text-sm text-foreground">{isConnected ? "Live" : "Offline"}</p>
+                <p className="mt-1 text-sm text-foreground">{readerConnected ? `Live (${activeReaderTags.length} active)` : "Offline"}</p>
               </div>
+            </div>
+
+            <div className="rounded-2xl border border-border/60 bg-muted/15 px-3 py-3">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Active Reader Tags</p>
+                <Badge variant="outline">{activeReaderTags.length}</Badge>
+              </div>
+              {!activeReaderTags.length ? (
+                <p className="mt-2 text-sm text-muted-foreground">No active UHF tags in the read zone.</p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  {activeReaderTags.slice(0, 4).map((tag) => (
+                    <div
+                      key={tag.epc}
+                      className="flex items-center justify-between gap-3 rounded-xl border border-border/50 bg-white/80 px-3 py-2"
+                    >
+                      <p className="min-w-0 truncate font-mono text-xs text-foreground">{tag.epc}</p>
+                      <p className="shrink-0 text-[11px] text-muted-foreground">{tag.idle_seconds.toFixed(1)}s idle</p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </CardContent>
         </Card>
@@ -1440,12 +1444,12 @@ export default function GateTerminal() {
                         Latest Verification
                       </p>
                       <h2 className="truncate text-lg font-semibold text-foreground leading-tight">
-                        {latestEmployee?.name ?? "Waiting for next badge tap"}
+                        {latestEmployee?.name ?? "Waiting for the next UHF detection"}
                       </h2>
                       <p className="truncate text-sm text-muted-foreground">
                         {latestEmployee
                           ? `${latestEmployee.employeeCode} - ${latestEmployee.department}`
-                          : "Badge tap or enter a UID manually to start the Python face scan."}
+                          : "Present a UHF tag or enter an EPC manually to start the Python face scan."}
                       </p>
                     </div>
                     <Badge
@@ -1580,21 +1584,18 @@ export default function GateTerminal() {
                 <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
                   Manual Trigger
                 </p>
-                <h2 className="mt-1 text-xl font-semibold text-foreground">Badge + face burst</h2>
+                <h2 className="mt-1 text-xl font-semibold text-foreground">UHF event + face burst</h2>
               </div>
 
               <form className="space-y-4" onSubmit={handleManualSubmit}>
                 <div className="space-y-2">
                   <Label htmlFor="gate-scan-technology">RFID Technology</Label>
-                  <Select value={scanTechnology} onValueChange={(value) => setScanTechnology(value as "HF_RFID" | "UHF_RFID")}>
-                    <SelectTrigger id="gate-scan-technology">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="HF_RFID">HF RFID</SelectItem>
-                      <SelectItem value="UHF_RFID">UHF RFID</SelectItem>
-                    </SelectContent>
-                  </Select>
+                  <div
+                    id="gate-scan-technology"
+                    className="flex min-h-10 items-center rounded-md border border-border/70 bg-muted/20 px-3 text-sm font-medium text-foreground"
+                  >
+                    UHF RFID continuous stream
+                  </div>
                 </div>
 
                 <div className="space-y-2">
@@ -1604,7 +1605,7 @@ export default function GateTerminal() {
                   </Label>
                   <Input
                     id="gate-rfid"
-                    placeholder="Tap a card or type A1B2C3D4"
+                    placeholder="Present a tag or type E2..."
                     className="font-mono uppercase tracking-[0.2em]"
                     value={rfidUid}
                     onChange={(event) => setRfidUid(event.target.value.toUpperCase())}
@@ -1619,7 +1620,7 @@ export default function GateTerminal() {
                       <div className="space-y-1">
                         <p>{readerMessage}</p>
                         <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          Source: {readerSourceDeviceId ?? GATE_DEVICE_ID}
+                          Source: {readerSourceDeviceId ?? readerEndpointLabel}
                         </p>
                       </div>
                     </div>

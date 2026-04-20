@@ -779,7 +779,7 @@ export default function Dashboard() {
         <CardHeader>
           <CardTitle>Live Gate Event Stream</CardTitle>
           <CardDescription>
-            Raw gate reads with RFID technology, direction inference, and biometric confidence. This feed is the layer you will keep when moving from HF tap to UHF portal reads.
+            Raw UHF RFID reads with direction inference and biometric confidence. This feed reflects the continuous portal-style detection pipeline.
           </CardDescription>
         </CardHeader>
         <CardContent>

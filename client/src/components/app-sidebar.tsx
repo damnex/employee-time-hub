@@ -1,5 +1,5 @@
 import { Link, useLocation } from "wouter";
-import { LayoutDashboard, Users, Clock, ScanFace, Building2 } from "lucide-react";
+import { LayoutDashboard, Users, Clock, ScanFace, Building2, Settings2 } from "lucide-react";
 import {
   Sidebar,
   SidebarContent,
@@ -17,6 +17,7 @@ const items = [
   { title: "Employees", url: "/employees", icon: Users },
   { title: "Attendance", url: "/attendance", icon: Clock },
   { title: "Gate Simulator", url: "/gate", icon: ScanFace },
+  { title: "Reader Control", url: "/reader-control", icon: Settings2 },
 ];
 
 export function AppSidebar() {

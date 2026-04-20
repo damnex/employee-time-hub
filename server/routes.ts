@@ -1,6 +1,5 @@
 import type { Express } from "express";
-import type { IncomingMessage, Server } from "http";
-import { WebSocketServer, WebSocket } from "ws";
+import type { Server } from "http";
 import { promises as fs } from "fs";
 import { storage } from "./storage";
 import { allowInsecureFaceFallback, useTriggeredCameraFaceRecognition } from "./env";
@@ -14,6 +13,7 @@ import {
   type MovementAxis,
   type GateDecision,
   type ScanTechnology,
+  scanTechnologySchema,
 } from "@shared/schema";
 import { z } from "zod";
 import {
@@ -38,17 +38,7 @@ import {
   gateMatchingEngine,
   type GateCorrelationMatch,
 } from "./gate-matching-engine";
-
-type ClientType = "browser" | "device";
-
-interface ClientConnection {
-  ws: WebSocket;
-  deviceId: string;
-  clientType: ClientType;
-}
-
-const activeConnections = new Set<ClientConnection>();
-const DEVICE_PRESENCE_HEARTBEAT_MS = 3000;
+import { registerRfidProxyRoutes } from "./rfid-proxy";
 const SESSION_TIMEOUT_SWEEP_MS = 1000;
 type AttendanceAction = "ENTRY" | "EXIT";
 type MovementDirection = AttendanceAction | "UNKNOWN";
@@ -375,7 +365,7 @@ const MIN_HUMAN_LIVE_REALNESS = 0.35;
 const DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
 
 function normalizeScanTechnology(scanTechnology?: ScanTechnology): ScanTechnology {
-  return scanTechnology ?? "HF_RFID";
+  return scanTechnology ?? "UHF_RFID";
 }
 
 async function logGateEvent(args: {
@@ -1219,7 +1209,11 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   }
 
   const triggeredCameraFaceEnabled = useTriggeredCameraFaceRecognition();
-  if (triggeredCameraFaceEnabled) {
+  // The web gate UI already captures frames from the same browser camera the
+  // operator is looking at. Prefer those frames when present so we do not
+  // silently switch to a different OpenCV device (camera source 0 / RTSP)
+  // mid-scan and create "camera mismatch" failures.
+  if (triggeredCameraFaceEnabled && !input.faceFrames?.length) {
     const triggeredResult = await processTriggeredCameraFaceScan({
       input,
       employee,
@@ -1643,123 +1637,6 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
   });
 }
 
-function toSocketScanResult(result: ProcessedScanResult, rfidUid: string, deviceId?: string) {
-  return {
-    type: "scan_result",
-    success: result.success,
-    ignored: result.ignored,
-    message: result.message,
-    employee: result.employee
-      ? { id: result.employee.id, name: result.employee.name }
-      : undefined,
-    action: result.action,
-    matchConfidence: result.matchConfidence,
-    matchDetails: result.matchDetails,
-    movementDirection: result.movementDirection,
-    movementConfidence: result.movementConfidence,
-    detectedFaceLabel: result.detectedFaceLabel,
-    detectedFaceBox: result.detectedFaceBox,
-    rfidUid,
-    deviceId,
-  };
-}
-
-function getConnectionIp(req: IncomingMessage) {
-  const forwardedFor = req.headers["x-forwarded-for"];
-  const forwardedIp = Array.isArray(forwardedFor)
-    ? forwardedFor[0]
-    : forwardedFor?.split(",")[0];
-
-  return (forwardedIp || req.socket.remoteAddress || "unknown")
-    .replace(/^::ffff:/, "");
-}
-
-function formatConnectionIp(clientType: ClientType, connectionIp: string) {
-  if (
-    clientType === "browser"
-    && (connectionIp === "127.0.0.1" || connectionIp === "::1" || connectionIp === "localhost")
-  ) {
-    return "localhost";
-  }
-
-  return connectionIp;
-}
-
-function broadcastMessage(
-  payload: Record<string, unknown>,
-  predicate?: (connection: ClientConnection) => boolean,
-) {
-  const message = JSON.stringify(payload);
-
-  activeConnections.forEach((connection) => {
-    if (connection.ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    if (predicate && !predicate(connection)) {
-      return;
-    }
-
-    connection.ws.send(message);
-  });
-}
-
-function replaceExistingConnection(deviceId: string, clientType: ClientType) {
-  activeConnections.forEach((connection) => {
-    if (connection.deviceId !== deviceId || connection.clientType !== clientType) {
-      return;
-    }
-
-    activeConnections.delete(connection);
-
-    if (
-      connection.ws.readyState === WebSocket.OPEN
-      || connection.ws.readyState === WebSocket.CONNECTING
-    ) {
-      connection.ws.close(4002, "Replaced by newer connection");
-    }
-  });
-}
-
-function sendDevicePresence(ws: WebSocket, deviceId: string, online: boolean) {
-  ws.send(JSON.stringify({
-    type: "device_presence",
-    deviceId,
-    online,
-  }));
-}
-
-function broadcastDevicePresence(deviceId: string, online: boolean) {
-  broadcastMessage(
-    {
-      type: "device_presence",
-      deviceId,
-      online,
-    },
-    (client) => client.clientType === "browser",
-  );
-}
-
-function getConnectedDeviceIds() {
-  return Array.from(activeConnections)
-    .filter((connection) => {
-      return connection.clientType === "device"
-        && connection.ws.readyState === WebSocket.OPEN;
-    })
-    .map((connection) => connection.deviceId);
-}
-
-function broadcastConnectedDevicePresence() {
-  const connectedDeviceIds = getConnectedDeviceIds();
-  if (!connectedDeviceIds.length) {
-    return;
-  }
-
-  connectedDeviceIds.forEach((deviceId) => {
-    broadcastDevicePresence(deviceId, true);
-  });
-}
-
 export async function registerRoutes(
   httpServer: Server,
   app: Express
@@ -1767,16 +1644,7 @@ export async function registerRoutes(
   void warmPythonFaceWorker().catch((error) => {
     console.warn("[python-face] Warm-up skipped:", error);
   });
-  
-  // Setup WebSocket server for real ESP8266 device communication
-  const wss = new WebSocketServer({
-    server: httpServer,
-    path: "/ws/device",
-    perMessageDeflate: false,
-  });
-  const devicePresenceHeartbeat = setInterval(() => {
-    broadcastConnectedDevicePresence();
-  }, DEVICE_PRESENCE_HEARTBEAT_MS);
+  registerRfidProxyRoutes(app);
   const timeoutExitSweep = setInterval(() => {
     void processTimedOutGateSessions().catch((error) => {
       console.error("[gate-timeout] Sweep failed:", error);
@@ -1784,194 +1652,7 @@ export async function registerRoutes(
   }, SESSION_TIMEOUT_SWEEP_MS);
 
   httpServer.once("close", () => {
-    clearInterval(devicePresenceHeartbeat);
     clearInterval(timeoutExitSweep);
-  });
-
-  wss.on("error", (error) => {
-    console.error("[WebSocket] Server startup error:", error);
-  });
-  
-  wss.on("connection", (ws: WebSocket, req) => {
-    req.socket.setNoDelay(true);
-    const searchParams = new URL(
-      `http://${req.headers.host}${req.url}`,
-    ).searchParams;
-    const deviceId =
-      searchParams.get("deviceId") || `device-${Date.now()}`;
-    const clientType = (searchParams.get("clientType") === "device"
-      ? "device"
-      : "browser") as ClientType;
-    const connectionIp = formatConnectionIp(clientType, getConnectionIp(req));
-    const connection: ClientConnection = { ws, deviceId, clientType };
-
-    replaceExistingConnection(deviceId, clientType);
-
-    if (clientType === "device") {
-      console.log(
-        `[WebSocket] Reader connected: ${deviceId} from ${connectionIp}. Reader is online and ready to read badges.`,
-      );
-      broadcastDevicePresence(deviceId, true);
-    } else {
-      console.log(`[WebSocket] ${clientType} connected: ${deviceId} from ${connectionIp}`);
-    }
-    activeConnections.add(connection);
-    
-    // On browser connect, send snapshot of current device presence
-    if (clientType === "browser") {
-      getConnectedDeviceIds().forEach((connectedDeviceId) => {
-        sendDevicePresence(ws, connectedDeviceId, true);
-      });
-    }
-
-    ws.send(JSON.stringify({
-      type: "connected",
-      deviceId,
-      message: "Connected to attendance system",
-    }));
-    
-    ws.on("message", async (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-
-        if (message.type === "rfid_detected") {
-          const rfidUid = String(message.rfidUid || "").trim().toUpperCase();
-
-          if (!rfidUid) {
-            ws.send(JSON.stringify({
-              type: "error",
-              message: "RFID UID is required.",
-            }));
-            return;
-          }
-
-          gateMatchingEngine.recordRfidDetection({
-            deviceId,
-            rfidUid,
-            scanTechnology:
-              message.scanTechnology === "UHF_RFID" ? "UHF_RFID" : "HF_RFID",
-            source: "reader_detected",
-          });
-
-          const mappedEmployee = await storage.getEmployeeByRfid(rfidUid);
-          const payload = {
-            type: "rfid_detected",
-            message: mappedEmployee
-              ? `Badge already mapped to ${mappedEmployee.name}.`
-              : "Badge detected and ready to assign.",
-            rfidUid,
-            available: !mappedEmployee,
-            employee: mappedEmployee
-              ? { id: mappedEmployee.id, name: mappedEmployee.name }
-              : undefined,
-            deviceId,
-          };
-
-          ws.send(JSON.stringify(payload));
-          broadcastMessage(payload, (client) => client.clientType === "browser");
-          return;
-        }
-        
-        // Handle RFID scan from ESP8266 device
-        if (message.type === "rfid_scan") {
-          const rfidUid = String(message.rfidUid || "").trim().toUpperCase();
-          const result = await processRfidScan({
-            rfidUid,
-            deviceId,
-            faceDescriptor: Array.isArray(message.faceDescriptor)
-              ? message.faceDescriptor
-              : undefined,
-            faceAnchorDescriptors: Array.isArray(message.faceAnchorDescriptors)
-              ? message.faceAnchorDescriptors.filter((value: unknown) => {
-                  return Array.isArray(value) && value.every((item) => typeof item === "number");
-                }) as number[][]
-              : undefined,
-            faceConsistency:
-              typeof message.faceConsistency === "number"
-                ? message.faceConsistency
-                : undefined,
-            faceQuality:
-              typeof message.faceQuality === "number"
-                ? message.faceQuality
-                : undefined,
-            facePose:
-              message.facePose === "front"
-              || message.facePose === "left"
-              || message.facePose === "right"
-              || message.facePose === "up"
-              || message.facePose === "down"
-              || message.facePose === "unknown"
-                ? message.facePose
-                : undefined,
-            faceYaw:
-              typeof message.faceYaw === "number"
-                ? message.faceYaw
-                : undefined,
-            facePitch:
-              typeof message.facePitch === "number"
-                ? message.facePitch
-                : undefined,
-            faceRoll:
-              typeof message.faceRoll === "number"
-                ? message.faceRoll
-                : undefined,
-            faceLiveConfidence:
-              typeof message.faceLiveConfidence === "number"
-                ? message.faceLiveConfidence
-                : undefined,
-            faceRealConfidence:
-              typeof message.faceRealConfidence === "number"
-                ? message.faceRealConfidence
-                : undefined,
-            scanTechnology:
-              message.scanTechnology === "HF_RFID" || message.scanTechnology === "UHF_RFID"
-                ? message.scanTechnology
-                : undefined,
-            movementDirection:
-              message.movementDirection === "ENTRY"
-              || message.movementDirection === "EXIT"
-              || message.movementDirection === "UNKNOWN"
-                ? message.movementDirection
-                : undefined,
-            movementAxis:
-              message.movementAxis === "horizontal"
-              || message.movementAxis === "depth"
-              || message.movementAxis === "none"
-                ? message.movementAxis
-                : undefined,
-            movementConfidence:
-              typeof message.movementConfidence === "number"
-                ? message.movementConfidence
-                : undefined,
-          });
-
-          const payload = toSocketScanResult(result, rfidUid, deviceId);
-          ws.send(JSON.stringify(payload));
-          broadcastMessage(payload, (client) => client.clientType === "browser");
-          return;
-        }
-      } catch (error) {
-        console.error("[WebSocket] Error processing message:", error);
-        ws.send(JSON.stringify({ type: "error", message: "Error processing request" }));
-      }
-    });
-
-    ws.on("error", (error) => {
-      console.error(`[WebSocket] ${clientType} socket error for ${deviceId}:`, error);
-      activeConnections.delete(connection);
-    });
-    
-    ws.on("close", () => {
-      if (clientType === "device") {
-        console.log(
-          `[WebSocket] Reader disconnected: ${deviceId} from ${connectionIp}. Reader is no longer ready.`,
-        );
-        broadcastDevicePresence(deviceId, false);
-      } else {
-        console.log(`[WebSocket] ${clientType} disconnected: ${deviceId} from ${connectionIp}`);
-      }
-      activeConnections.delete(connection);
-    });
   });
   
   async function validateEmployeeIdentityConflicts(
@@ -2416,6 +2097,41 @@ export async function registerRoutes(
         frameLatencyMs: null,
         bestBox: null,
       });
+    }
+  });
+
+  app.post("/api/rfid-event", async (req, res) => {
+    try {
+      const input = z.object({
+        rfidUid: z.string().trim().min(1),
+        deviceId: z.string().trim().min(1),
+        scanTechnology: scanTechnologySchema.optional(),
+      }).parse(req.body);
+
+      const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
+      const detection = gateMatchingEngine.recordRfidDetection({
+        deviceId: input.deviceId,
+        rfidUid: normalizedRfidUid,
+        scanTechnology: input.scanTechnology ?? "UHF_RFID",
+        source: "reader_detected",
+      });
+      const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
+
+      return res.json({
+        success: true,
+        rfidUid: normalizedRfidUid,
+        employee,
+        session: detection.session,
+      });
+    } catch (err) {
+      if (err instanceof z.ZodError) {
+        return res.status(400).json({
+          message: err.errors[0]?.message ?? "Invalid RFID event payload.",
+          field: err.errors[0]?.path.join("."),
+        });
+      }
+
+      return res.status(500).json({ message: "Unable to process RFID event." });
     }
   });
   // RFID Scan Endpoint (Core Logic)

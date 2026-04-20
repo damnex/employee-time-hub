@@ -11,6 +11,7 @@ import Dashboard from "./pages/dashboard";
 import Employees from "./pages/employees";
 import Attendance from "./pages/attendance";
 import GateSimulator from "./pages/gate";
+import ReaderControl from "./pages/ReaderControl";
 import NotFound from "./pages/not-found";
 
 function Router() {
@@ -20,6 +21,7 @@ function Router() {
       <Route path="/employees" component={Employees}/>
       <Route path="/attendance" component={Attendance}/>
       <Route path="/gate" component={GateSimulator}/>
+      <Route path="/reader-control" component={ReaderControl}/>
       <Route component={NotFound} />
     </Switch>
   );
