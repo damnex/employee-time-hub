@@ -124,6 +124,7 @@ class TagProcessor:
             for active_state in list(self.active_tags.values()):
                 LOGGER.info("EXIT %s (%s)", active_state.epc, reason)
             self.active_tags.clear()
+            self.last_seen.clear()
 
     def get_recent_tags(self, limit: int = 20) -> list[dict[str, object]]:
         with self._lock:

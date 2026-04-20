@@ -4,9 +4,11 @@ Standalone FastAPI service for a `UHFReader18` serial reader.
 
 ## Features
 
+- Dedicated binary parser module for CRC validation, packet framing, and EPC extraction.
 - Binary packet parsing with CRC-16 validation.
 - EPC extraction for spontaneous `0xEE` frames and inventory responses.
 - Background reader thread with reconnection.
+- Rolling buffer management for fragmented, concatenated, and noisy serial traffic.
 - ENTRY / EXIT event processing using `last_seen` and `active_tags`.
 - Registration mode that requires one stable tag repeated at least 5 times.
 - Reader power control and work mode control.
@@ -19,6 +21,18 @@ python -m rfid_service.main
 ```
 
 The service listens on `http://127.0.0.1:8001` by default.
+
+## Project Layout
+
+```text
+rfid_service/
+├── api.py
+├── controller.py
+├── main.py
+├── parser.py
+├── processor.py
+└── reader.py
+```
 
 ## API
 

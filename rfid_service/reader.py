@@ -7,6 +7,16 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from .parser import (
+    MAX_PACKET_TOTAL_BYTES,
+    MIN_PACKET_TOTAL_BYTES,
+    ReaderPacket,
+    build_command_frame,
+    decode_packet,
+    extract_epcs_from_packet,
+    verify_packet_crc,
+)
+
 try:
     import serial  # type: ignore
     from serial import SerialException  # type: ignore
@@ -18,15 +28,7 @@ except ImportError:  # pragma: no cover
 
 
 LOGGER = logging.getLogger("rfid_service.reader")
-MIN_PACKET_TOTAL_BYTES = 5
-MAX_PACKET_TOTAL_BYTES = 256
 DEFAULT_ADDRESS = 0x00
-SPONTANEOUS_TAG_RESPONSE = 0xEE
-INVENTORY_RESPONSE = 0x01
-INVENTORY_SINGLE_RESPONSE = 0x0F
-SUCCESS_STATUSES = {0x00, 0x01, 0x02, 0x03, 0x04}
-REQUIRED_EPC_HEX_LENGTH = 8
-REQUIRED_EPC_BYTES = REQUIRED_EPC_HEX_LENGTH // 2
 
 
 @dataclass(slots=True)
@@ -34,25 +36,12 @@ class ReaderConfig:
     port: str = "COM3"
     baudrate: int = 57600
     address: int = DEFAULT_ADDRESS
-    read_timeout: float = 0.2
+    read_timeout: float = 0.1
     write_timeout: float = 0.5
     reconnect_delay: float = 2.0
     command_timeout: float = 1.5
+    max_buffer_bytes: int = 8192
     debug_raw: bool = False
-
-
-@dataclass(slots=True)
-class ReaderPacket:
-    length: int
-    address: int
-    response_code: int
-    status: int
-    data: bytes
-    raw: bytes
-
-    @property
-    def raw_hex(self) -> str:
-        return self.raw.hex().upper()
 
 
 @dataclass(slots=True)
@@ -99,7 +88,7 @@ class WorkModeConfig:
 
     @classmethod
     def answer_mode(cls, *, mem_inven: int = 0x04) -> "WorkModeConfig":
-        # Answer Mode keeps host-driven inventory commands in control.
+        # Answer Mode keeps the host in control of inventory polling.
         return cls(read_mode=0x00, mode_state=0x06, mem_inven=mem_inven, word_num=0x06, tag_time=0x00)
 
     @classmethod
@@ -124,133 +113,6 @@ class WorkModeConfig:
             word_num=payload[8],
             tag_time=payload[9],
         )
-
-
-def calculate_crc16(frame_without_crc: bytes) -> int:
-    crc = 0xFFFF
-    for byte in frame_without_crc:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 0x0001:
-                crc = (crc >> 1) ^ 0x8408
-            else:
-                crc >>= 1
-    return crc & 0xFFFF
-
-
-def verify_packet_crc(raw_packet: bytes) -> bool:
-    if len(raw_packet) < MIN_PACKET_TOTAL_BYTES:
-        return False
-    expected_crc = int.from_bytes(raw_packet[-2:], byteorder="little")
-    calculated_crc = calculate_crc16(raw_packet[:-2])
-    return expected_crc == calculated_crc
-
-
-def build_command_frame(address: int, command: int, payload: bytes = b"") -> bytes:
-    frame_without_crc = bytes([len(payload) + 4, address & 0xFF, command & 0xFF, *payload])
-    crc = calculate_crc16(frame_without_crc)
-    return frame_without_crc + crc.to_bytes(2, byteorder="little")
-
-
-def decode_packet(raw_packet: bytes) -> ReaderPacket:
-    if not verify_packet_crc(raw_packet):
-        raise ValueError("Packet CRC mismatch.")
-    length = raw_packet[0]
-    payload = raw_packet[1:-2]
-    if len(payload) < 3:
-        raise ValueError("Packet payload is shorter than required header fields.")
-    return ReaderPacket(
-        length=length,
-        address=payload[0],
-        response_code=payload[1],
-        status=payload[2],
-        data=bytes(payload[3:]),
-        raw=bytes(raw_packet),
-    )
-
-
-def is_valid_epc(epc: str) -> bool:
-    if not epc or len(epc) != REQUIRED_EPC_HEX_LENGTH:
-        return False
-    if not epc.startswith("E2"):
-        return False
-    return all(ch in "0123456789ABCDEF" for ch in epc)
-
-
-def _normalize_epc(candidate: bytes) -> str | None:
-    if not candidate:
-        return None
-    if len(candidate) != REQUIRED_EPC_BYTES:
-        return None
-    epc = candidate.hex().upper()
-    if not is_valid_epc(epc):
-        return None
-    return epc
-
-
-def _parse_declared_epcs(payload: bytes, *, starts_with_count: bool) -> list[str]:
-    tags: list[str] = []
-    seen: set[str] = set()
-    cursor = 1 if starts_with_count and payload else 0
-
-    while cursor < len(payload):
-        epc_length = payload[cursor]
-        cursor += 1
-        if epc_length <= 0:
-            continue
-        if cursor + epc_length > len(payload):
-            break
-
-        candidate = _normalize_epc(payload[cursor:cursor + epc_length])
-        next_cursor = cursor + epc_length
-        cursor = next_cursor
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            tags.append(candidate)
-    return tags
-
-
-def _scan_for_embedded_epcs(payload: bytes) -> list[str]:
-    tags: list[str] = []
-    seen: set[str] = set()
-    cursor = 0
-    while cursor < len(payload):
-        declared_length = payload[cursor]
-        if declared_length != REQUIRED_EPC_BYTES:
-            cursor += 1
-            continue
-        start = cursor + 1
-        end = start + declared_length
-        if end > len(payload):
-            cursor += 1
-            continue
-
-        candidate = _normalize_epc(payload[start:end])
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            tags.append(candidate)
-            cursor = end
-            continue
-
-        cursor += 1
-    return tags
-
-
-def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
-    if packet.status not in SUCCESS_STATUSES or not packet.data:
-        return []
-
-    if packet.response_code in {INVENTORY_RESPONSE, INVENTORY_SINGLE_RESPONSE, SPONTANEOUS_TAG_RESPONSE}:
-        parsers = [
-            lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
-            lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
-            lambda: _scan_for_embedded_epcs(packet.data),
-        ]
-        for parser in parsers:
-            tags = parser()
-            if tags:
-                return tags
-    return []
 
 
 def _port_sort_key(device: str) -> tuple[int, int | str]:
@@ -296,7 +158,6 @@ def probe_reader_on_port(
             debug_raw=debug_raw,
         ),
     )
-
     try:
         reader.start()
         return reader.get_reader_info()
@@ -503,13 +364,23 @@ class SerialRFIDReader:
                     continue
                 if self._config.debug_raw:
                     LOGGER.debug("RX %s", chunk.hex().upper())
-                self._buffer.extend(chunk)
+                self._append_to_buffer(chunk)
                 for packet in self._extract_packets():
                     self._dispatch_packet(packet)
             except SerialException as exc:
                 LOGGER.warning("Reader serial error: %s", exc)
                 self._close_serial()
                 time.sleep(self._config.reconnect_delay)
+
+    def _append_to_buffer(self, chunk: bytes) -> None:
+        self._buffer.extend(chunk)
+        if len(self._buffer) <= self._config.max_buffer_bytes:
+            return
+        LOGGER.warning(
+            "RFID buffer exceeded %s bytes. Resetting buffer to recover framing.",
+            self._config.max_buffer_bytes,
+        )
+        self._buffer.clear()
 
     def _extract_packets(self) -> list[ReaderPacket]:
         packets: list[ReaderPacket] = []
@@ -520,15 +391,18 @@ class SerialRFIDReader:
                 continue
             if len(self._buffer) < total_length:
                 break
+
             candidate = bytes(self._buffer[:total_length])
             if not verify_packet_crc(candidate):
                 del self._buffer[0]
                 continue
+
             try:
                 packets.append(decode_packet(candidate))
             except ValueError:
                 del self._buffer[0]
                 continue
+
             del self._buffer[:total_length]
         return packets
 

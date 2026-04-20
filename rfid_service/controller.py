@@ -5,6 +5,7 @@ import threading
 from dataclasses import asdict, dataclass
 
 from .processor import TagProcessor
+from .parser import extract_epcs_from_packet
 from .reader import (
     ReaderConfig,
     ReaderInfo,
@@ -12,7 +13,6 @@ from .reader import (
     SerialRFIDReader,
     WorkModeConfig,
     detect_reader_port,
-    extract_epcs_from_packet,
     list_serial_ports,
 )
 
