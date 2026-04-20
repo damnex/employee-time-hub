@@ -2,6 +2,7 @@ import { apiRequest } from "./queryClient";
 
 
 export type RfidMode = "normal" | "registration";
+export type RfidTransportMode = "scan" | "answer";
 
 export interface RfidReaderInfo {
   version: number;
@@ -31,6 +32,7 @@ export interface RfidStatus {
   connected: boolean;
   running: boolean;
   current_mode: RfidMode;
+  transport_mode: RfidTransportMode;
   current_power: number;
   debug_raw: boolean;
   last_error: string | null;
@@ -165,5 +167,10 @@ export async function setRfidPower(level: number) {
 
 export async function setRfidMode(mode: RfidMode) {
   const response = await apiRequest("POST", "/api/rfid/set-mode", { mode });
+  return response.json() as Promise<RfidStatus>;
+}
+
+export async function setRfidTransportMode(mode: RfidTransportMode) {
+  const response = await apiRequest("POST", "/api/rfid/set-transport-mode", { mode });
   return response.json() as Promise<RfidStatus>;
 }

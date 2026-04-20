@@ -12,6 +12,7 @@ from .reader import (
     SerialRFIDReader,
     WorkModeConfig,
     detect_reader_port,
+    extract_epcs_from_packet,
     list_serial_ports,
 )
 
@@ -22,6 +23,8 @@ MODE_DEFAULT_POWER = {
     "normal": 30,
     "registration": 8,
 }
+ANSWER_MODE_RETRY_SECONDS = 0.2
+ANSWER_MODE_IDLE_SECONDS = 0.05
 
 
 @dataclass(slots=True)
@@ -31,6 +34,7 @@ class ControllerState:
     connected: bool = False
     running: bool = False
     current_mode: str = "normal"
+    transport_mode: str = "scan"
     current_power: int = 30
     debug_raw: bool = False
     last_error: str | None = None
@@ -44,6 +48,9 @@ class RFIDController:
         self._reader_info: ReaderInfo | None = None
         self._lock = threading.RLock()
         self._needs_runtime_sync = False
+        self._answer_poll_thread: threading.Thread | None = None
+        self._answer_poll_stop_event: threading.Event | None = None
+        self._answer_poll_generation = 0
 
     def connect(
         self,
@@ -120,7 +127,12 @@ class RFIDController:
             self._processor.set_mode(self._state.current_mode)
             self._processor.start()
             self._state.running = True
-            LOGGER.info("Reader stream started in %s mode.", self._state.current_mode)
+            self._ensure_answer_polling_locked()
+            LOGGER.info(
+                "Reader stream started in %s mode using %s transport.",
+                self._state.current_mode,
+                self._state.transport_mode,
+            )
             return self.get_status()
 
     def stop(self) -> dict[str, object]:
@@ -129,6 +141,7 @@ class RFIDController:
                 return self.get_status()
 
             self._processor.stop(force_exit=True)
+            self._stop_answer_polling_locked()
             self._state.running = False
             LOGGER.info("Reader stream stopped.")
             return self.get_status()
@@ -140,6 +153,7 @@ class RFIDController:
             self._reader = None
             self._reader_info = None
             self._processor.stop(force_exit=True)
+            self._stop_answer_polling_locked()
             self._state.connected = False
             self._state.running = False
             self._needs_runtime_sync = False
@@ -200,23 +214,35 @@ class RFIDController:
             reader = self._require_reader()
             reader.set_power(level)
             self._state.current_power = level
+            self._state.last_error = None
             LOGGER.info("Power changed to %s", level)
             return self.get_status()
 
     def set_mode(self, mode: str) -> dict[str, object]:
         normalized_mode = self._normalize_mode(mode)
         with self._lock:
-            self._sync_runtime_state_locked()
-            reader = self._require_reader()
-            reader.set_work_mode(self._work_mode_for(normalized_mode))
             self._processor.set_mode(normalized_mode)
             self._state.current_mode = normalized_mode
-            LOGGER.info("Mode changed to %s", normalized_mode)
-
             default_power = MODE_DEFAULT_POWER[normalized_mode]
-            reader.set_power(default_power)
             self._state.current_power = default_power
-            LOGGER.info("Power changed to %s", default_power)
+            self._state.last_error = None
+            if self._state.connected:
+                self._apply_runtime_configuration_locked()
+            LOGGER.info(
+                "Mode changed to %s with default power %s.",
+                normalized_mode,
+                default_power,
+            )
+            return self.get_status()
+
+    def set_transport_mode(self, mode: str) -> dict[str, object]:
+        normalized_mode = self._normalize_transport_mode(mode)
+        with self._lock:
+            self._state.transport_mode = normalized_mode
+            self._state.last_error = None
+            if self._state.connected:
+                self._apply_runtime_configuration_locked()
+            LOGGER.info("Transport mode changed to %s.", normalized_mode)
             return self.get_status()
 
     def get_tags(self) -> dict[str, object]:
@@ -278,6 +304,12 @@ class RFIDController:
             raise ValueError("Mode must be one of: normal, registration.")
         return normalized
 
+    def _normalize_transport_mode(self, mode: str) -> str:
+        normalized = mode.strip().lower()
+        if normalized not in {"scan", "answer"}:
+            raise ValueError("Transport mode must be one of: scan, answer.")
+        return normalized
+
     def _normalize_port_name(self, port: str) -> str:
         normalized = port.strip()
         if not normalized:
@@ -319,6 +351,7 @@ class RFIDController:
 
             try:
                 work_mode = reader.get_work_mode()
+                self._state.transport_mode = self._transport_mode_from_work_mode(work_mode)
                 self._state.current_mode = self._mode_from_work_mode(work_mode)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Unable to read work mode during startup: %s", exc)
@@ -351,25 +384,37 @@ class RFIDController:
             LOGGER.warning("RFID auto-detect failed: %s", exc)
             return None
 
-    def _work_mode_for(self, mode: str) -> WorkModeConfig:
+    def _work_mode_for(self, mode: str, transport_mode: str) -> WorkModeConfig:
+        if transport_mode == "answer":
+            return WorkModeConfig.answer_mode(mem_inven=0x05 if mode == "registration" else 0x04)
         if mode == "registration":
             return WorkModeConfig.registration_scan()
         return WorkModeConfig.normal_scan()
 
+    def _transport_mode_from_work_mode(self, mode: WorkModeConfig) -> str:
+        if mode.read_mode == 0x00:
+            return "answer"
+        return "scan"
+
     def _mode_from_work_mode(self, mode: WorkModeConfig) -> str:
-        if mode.read_mode == 0x01 and mode.mem_inven == 0x05:
+        if mode.mem_inven == 0x05:
             return "registration"
         return "normal"
 
     def _apply_runtime_configuration_locked(self) -> None:
         reader = self._require_reader()
-        reader.set_work_mode(self._work_mode_for(self._state.current_mode))
+        reader.set_work_mode(self._work_mode_for(self._state.current_mode, self._state.transport_mode))
         self._processor.set_mode(self._state.current_mode)
         reader.set_power(self._state.current_power)
+        if self._state.transport_mode == "answer" and self._state.running:
+            self._ensure_answer_polling_locked()
+        else:
+            self._stop_answer_polling_locked()
         self._needs_runtime_sync = False
         LOGGER.info(
-            "Reader runtime synchronized: mode=%s power=%s",
+            "Reader runtime synchronized: mode=%s transport=%s power=%s",
             self._state.current_mode,
+            self._state.transport_mode,
             self._state.current_power,
         )
 
@@ -377,3 +422,66 @@ class RFIDController:
         if not self._needs_runtime_sync or not self._state.connected:
             return
         self._apply_runtime_configuration_locked()
+
+    def _ensure_answer_polling_locked(self) -> None:
+        if not self._state.running or self._state.transport_mode != "answer":
+            return
+        if self._answer_poll_thread is not None and self._answer_poll_thread.is_alive():
+            return
+
+        stop_event = threading.Event()
+        self._answer_poll_generation += 1
+        generation = self._answer_poll_generation
+        self._answer_poll_stop_event = stop_event
+        self._answer_poll_thread = threading.Thread(
+            target=self._answer_poll_loop,
+            args=(generation, stop_event),
+            name="rfid-answer-poller",
+            daemon=True,
+        )
+        self._answer_poll_thread.start()
+
+    def _stop_answer_polling_locked(self) -> None:
+        self._answer_poll_generation += 1
+        if self._answer_poll_stop_event is not None:
+            self._answer_poll_stop_event.set()
+        self._answer_poll_stop_event = None
+        self._answer_poll_thread = None
+
+    def _answer_poll_loop(self, generation: int, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
+            with self._lock:
+                if (
+                    generation != self._answer_poll_generation
+                    or not self._state.running
+                    or self._state.transport_mode != "answer"
+                ):
+                    return
+                reader = self._reader
+                current_mode = self._state.current_mode
+                connected = self._state.connected
+
+            if reader is None or not connected or not reader.connected:
+                stop_event.wait(ANSWER_MODE_RETRY_SECONDS)
+                continue
+
+            try:
+                packet = reader.inventory_single() if current_mode == "registration" else reader.inventory()
+                tags = extract_epcs_from_packet(packet)
+                if tags:
+                    self._processor.process_tags(tags, raw_hex=packet.raw_hex)
+                with self._lock:
+                    if generation == self._answer_poll_generation:
+                        self._state.last_error = None
+            except TimeoutError:
+                stop_event.wait(ANSWER_MODE_RETRY_SECONDS)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Answer mode inventory failed: %s", exc)
+                with self._lock:
+                    if generation == self._answer_poll_generation:
+                        self._state.last_error = str(exc)
+                stop_event.wait(ANSWER_MODE_RETRY_SECONDS)
+                continue
+
+            stop_event.wait(ANSWER_MODE_IDLE_SECONDS)

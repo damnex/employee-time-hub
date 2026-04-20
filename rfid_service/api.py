@@ -40,6 +40,10 @@ class SetModeRequest(BaseModel):
     mode: str = Field(min_length=1)
 
 
+class SetTransportModeRequest(BaseModel):
+    mode: str = Field(min_length=1)
+
+
 class DetectPortRequest(BaseModel):
     baudrate: int = Field(default=57600, ge=1200, le=921600)
     debug_raw: bool = False
@@ -102,6 +106,14 @@ def set_power(payload: SetPowerRequest) -> dict[str, object]:
 def set_mode(payload: SetModeRequest) -> dict[str, object]:
     try:
         return controller.set_mode(payload.mode)
+    except Exception as exc:  # noqa: BLE001
+        raise _service_error(exc) from exc
+
+
+@app.post("/set-transport-mode")
+def set_transport_mode(payload: SetTransportModeRequest) -> dict[str, object]:
+    try:
+        return controller.set_transport_mode(payload.mode)
     except Exception as exc:  # noqa: BLE001
         raise _service_error(exc) from exc
 

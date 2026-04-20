@@ -98,6 +98,11 @@ class WorkModeConfig:
         )
 
     @classmethod
+    def answer_mode(cls, *, mem_inven: int = 0x04) -> "WorkModeConfig":
+        # Answer Mode keeps host-driven inventory commands in control.
+        return cls(read_mode=0x00, mode_state=0x06, mem_inven=mem_inven, word_num=0x06, tag_time=0x00)
+
+    @classmethod
     def normal_scan(cls) -> "WorkModeConfig":
         # Scan Mode + RS232 output + no buzzer + inventory multiple.
         return cls(read_mode=0x01, mode_state=0x06, mem_inven=0x04, word_num=0x06, tag_time=0x00)
@@ -401,6 +406,12 @@ class SerialRFIDReader:
             power=response.data[5],
             scan_time=response.data[6],
         )
+
+    def inventory(self) -> ReaderPacket:
+        return self.send_command(0x01)
+
+    def inventory_single(self) -> ReaderPacket:
+        return self.send_command(0x0F)
 
     def set_work_mode(self, mode: WorkModeConfig) -> None:
         response = self.send_command(0x35, mode.to_payload())

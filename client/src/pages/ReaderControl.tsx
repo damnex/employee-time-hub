@@ -25,9 +25,11 @@ import {
   disconnectRfidReader,
   fetchRfidStatus,
   type RfidMode,
+  type RfidTransportMode,
   rfidQueryKeys,
   setRfidMode,
   setRfidPower,
+  setRfidTransportMode,
   startRfidReader,
   stopRfidReader,
 } from "@/lib/rfid";
@@ -39,6 +41,7 @@ export default function ReaderControl() {
   const [baudrate, setBaudrate] = useState("57600");
   const [powerValue, setPowerValue] = useState([30]);
   const [selectedMode, setSelectedMode] = useState<RfidMode>("normal");
+  const [selectedTransportMode, setSelectedTransportMode] = useState<RfidTransportMode>("scan");
 
   const statusQuery = useQuery({
     queryKey: rfidQueryKeys.status,
@@ -55,11 +58,13 @@ export default function ReaderControl() {
     setBaudrate(String(statusQuery.data.baudrate));
     setPowerValue([statusQuery.data.current_power]);
     setSelectedMode(statusQuery.data.current_mode);
+    setSelectedTransportMode(statusQuery.data.transport_mode);
   }, [
     statusQuery.data?.baudrate,
     statusQuery.data?.current_mode,
     statusQuery.data?.current_power,
     statusQuery.data?.port,
+    statusQuery.data?.transport_mode,
   ]);
 
   const refreshRfidQueries = async () => {
@@ -197,6 +202,24 @@ export default function ReaderControl() {
     },
   });
 
+  const transportModeMutation = useMutation({
+    mutationFn: () => setRfidTransportMode(selectedTransportMode),
+    onSuccess: async () => {
+      await refreshRfidQueries();
+      toast({
+        title: "Transport updated",
+        description: `Reader switched to ${selectedTransportMode} transport.`,
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Unable to set transport",
+        description: error instanceof Error ? error.message : "Transport update failed.",
+        variant: "destructive",
+      });
+    },
+  });
+
   const status = statusQuery.data;
   const serviceOffline = statusQuery.isError;
   const isConnected = Boolean(status?.connected);
@@ -208,7 +231,8 @@ export default function ReaderControl() {
       || startMutation.isPending
       || stopMutation.isPending
       || powerMutation.isPending
-      || modeMutation.isPending;
+      || modeMutation.isPending
+      || transportModeMutation.isPending;
   }, [
     detectPortMutation.isPending,
     connectMutation.isPending,
@@ -217,6 +241,7 @@ export default function ReaderControl() {
     powerMutation.isPending,
     startMutation.isPending,
     stopMutation.isPending,
+    transportModeMutation.isPending,
   ]);
 
   return (
@@ -225,7 +250,7 @@ export default function ReaderControl() {
         <div>
           <h1 className="text-3xl font-bold text-foreground">UHF Reader Control</h1>
           <p className="mt-1 text-muted-foreground">
-            Connect the reader, choose the required mode, and start or stop the continuous UHF stream.
+            Connect the reader, choose the required mode and transport, then start or stop live reading.
           </p>
         </div>
         <Button
@@ -259,7 +284,7 @@ export default function ReaderControl() {
               <Cable className="size-4 text-primary" />
               Connection
             </CardTitle>
-            <CardDescription>Use COM3 / 57600 by default, then connect before starting the stream.</CardDescription>
+            <CardDescription>Use COM3 / 57600 by default, then connect before starting live scan or answer polling.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
             <div className="grid gap-4 md:grid-cols-2">
@@ -347,6 +372,12 @@ export default function ReaderControl() {
               <p className="mt-2 text-lg font-semibold capitalize text-foreground">{status?.current_mode ?? selectedMode}</p>
             </div>
             <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Transport</p>
+              <p className="mt-2 text-lg font-semibold capitalize text-foreground">
+                {status?.transport_mode ?? selectedTransportMode}
+              </p>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
               <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Power</p>
               <p className="mt-2 text-lg font-semibold text-foreground">{status?.current_power ?? powerValue[0]}</p>
             </div>
@@ -390,9 +421,11 @@ export default function ReaderControl() {
               <Settings2 className="size-4 text-primary" />
               Mode Selection
             </CardTitle>
-            <CardDescription>Use normal mode for live gate detection and registration mode for one stable tag.</CardDescription>
+            <CardDescription>
+              Use normal or registration for business behavior, then choose scan or answer for how the reader sends data.
+            </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent className="space-y-6">
             <div className="space-y-2">
               <Label htmlFor="reader-mode">Mode</Label>
               <Select value={selectedMode} onValueChange={(value) => setSelectedMode(value as RfidMode)}>
@@ -407,6 +440,24 @@ export default function ReaderControl() {
             </div>
             <Button onClick={() => modeMutation.mutate()} disabled={!isConnected || isBusy}>
               Apply Mode
+            </Button>
+            <div className="space-y-2">
+              <Label htmlFor="reader-transport-mode">Transport Mode</Label>
+              <Select
+                value={selectedTransportMode}
+                onValueChange={(value) => setSelectedTransportMode(value as RfidTransportMode)}
+              >
+                <SelectTrigger id="reader-transport-mode">
+                  <SelectValue placeholder="Choose transport mode" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="scan">Scan Transport</SelectItem>
+                  <SelectItem value="answer">Answer Transport</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <Button onClick={() => transportModeMutation.mutate()} disabled={!isConnected || isBusy}>
+              Apply Transport
             </Button>
           </CardContent>
         </Card>
