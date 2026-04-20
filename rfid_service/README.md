@@ -22,6 +22,8 @@ The service listens on `http://127.0.0.1:8001` by default.
 
 ## API
 
+- `POST /connect`
+- `POST /disconnect`
 - `POST /start`
 - `POST /stop`
 - `POST /set-power`
@@ -35,5 +37,5 @@ The service listens on `http://127.0.0.1:8001` by default.
 
 - `normal` mode applies scan mode + inventory multiple + power `30`.
 - `registration` mode applies scan mode + inventory single + power `8`.
-- `trigger` mode applies trigger-low mode + inventory single + power `8`.
-- If you need raw packet logging, pass `debug_raw: true` in `POST /start`.
+- `POST /connect` opens the serial connection first. `POST /start` begins continuous UHF processing.
+- If you need raw packet logging, pass `debug_raw: true` in `POST /connect` or `POST /start`.

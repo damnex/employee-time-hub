@@ -1,17 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { format } from "date-fns";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Cable,
   Play,
-  Radio,
   RefreshCcw,
-  ScanLine,
   Settings2,
   SlidersHorizontal,
   Square,
-  Tag,
 } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
@@ -21,13 +17,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Skeleton } from "@/components/ui/skeleton";
 import { Slider } from "@/components/ui/slider";
 import { useToast } from "@/hooks/use-toast";
 import {
-  fetchRfidActiveTags,
-  fetchRfidRegistrationTag,
-  fetchRfidTags,
+  connectRfidReader,
+  disconnectRfidReader,
+  fetchRfidStatus,
   type RfidMode,
   rfidQueryKeys,
   setRfidMode,
@@ -35,22 +30,6 @@ import {
   startRfidReader,
   stopRfidReader,
 } from "@/lib/rfid";
-
-
-function formatReaderTimestamp(value: number | null | undefined) {
-  if (!value) {
-    return "--";
-  }
-  return format(new Date(value * 1000), "dd MMM yyyy, hh:mm:ss a");
-}
-
-function StatusBadge(props: { active: boolean; activeLabel: string; idleLabel: string }) {
-  if (props.active) {
-    return <Badge className="bg-emerald-500 hover:bg-emerald-600 text-white">{props.activeLabel}</Badge>;
-  }
-
-  return <Badge variant="outline">{props.idleLabel}</Badge>;
-}
 
 export default function ReaderControl() {
   const queryClient = useQueryClient();
@@ -60,44 +39,31 @@ export default function ReaderControl() {
   const [powerValue, setPowerValue] = useState([30]);
   const [selectedMode, setSelectedMode] = useState<RfidMode>("normal");
 
-  const tagsQuery = useQuery({
-    queryKey: rfidQueryKeys.tags,
-    queryFn: fetchRfidTags,
+  const statusQuery = useQuery({
+    queryKey: rfidQueryKeys.status,
+    queryFn: fetchRfidStatus,
     refetchInterval: 2000,
-  });
-
-  const activeTagsQuery = useQuery({
-    queryKey: rfidQueryKeys.activeTags,
-    queryFn: fetchRfidActiveTags,
-    enabled: Boolean(tagsQuery.data?.running),
-    refetchInterval: 2000,
-  });
-
-  const registrationQuery = useQuery({
-    queryKey: rfidQueryKeys.registrationTag,
-    queryFn: fetchRfidRegistrationTag,
-    enabled: Boolean(tagsQuery.data?.running),
-    refetchInterval: 1500,
   });
 
   useEffect(() => {
-    if (!tagsQuery.data) {
+    if (!statusQuery.data) {
       return;
     }
 
-    setPort(tagsQuery.data.port);
-    setBaudrate(String(tagsQuery.data.baudrate));
-    setPowerValue([tagsQuery.data.current_power]);
-    setSelectedMode(tagsQuery.data.current_mode);
+    setPort(statusQuery.data.port);
+    setBaudrate(String(statusQuery.data.baudrate));
+    setPowerValue([statusQuery.data.current_power]);
+    setSelectedMode(statusQuery.data.current_mode);
   }, [
-    tagsQuery.data?.port,
-    tagsQuery.data?.baudrate,
-    tagsQuery.data?.current_power,
-    tagsQuery.data?.current_mode,
+    statusQuery.data?.baudrate,
+    statusQuery.data?.current_mode,
+    statusQuery.data?.current_power,
+    statusQuery.data?.port,
   ]);
 
   const refreshRfidQueries = async () => {
     await Promise.all([
+      queryClient.invalidateQueries({ queryKey: rfidQueryKeys.status }),
       queryClient.invalidateQueries({ queryKey: rfidQueryKeys.tags }),
       queryClient.invalidateQueries({ queryKey: rfidQueryKeys.activeTags }),
       queryClient.invalidateQueries({ queryKey: rfidQueryKeys.registrationTag }),
@@ -105,36 +71,72 @@ export default function ReaderControl() {
   };
 
   const connectMutation = useMutation({
-    mutationFn: () => startRfidReader({ port, baudrate: Number(baudrate), debug_raw: false }),
+    mutationFn: () => connectRfidReader({ port, baudrate: Number(baudrate), debug_raw: false }),
     onSuccess: async () => {
       await refreshRfidQueries();
       toast({
         title: "Reader connected",
-        description: `Listening on ${port} at ${baudrate} baud.`,
+        description: `Connected on ${port} at ${baudrate} baud.`,
       });
     },
     onError: (error) => {
       toast({
         title: "Unable to connect reader",
-        description: error instanceof Error ? error.message : "RFID service could not start the reader.",
+        description: error instanceof Error ? error.message : "Reader connection failed.",
         variant: "destructive",
       });
     },
   });
 
   const disconnectMutation = useMutation({
-    mutationFn: stopRfidReader,
+    mutationFn: disconnectRfidReader,
     onSuccess: async () => {
       await refreshRfidQueries();
       toast({
         title: "Reader disconnected",
-        description: "RFID reading has been stopped.",
+        description: "Serial connection has been closed.",
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Unable to disconnect reader",
+        description: error instanceof Error ? error.message : "Disconnect failed.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const startMutation = useMutation({
+    mutationFn: () => startRfidReader({ port, baudrate: Number(baudrate), debug_raw: false }),
+    onSuccess: async () => {
+      await refreshRfidQueries();
+      toast({
+        title: "Reader started",
+        description: "Continuous UHF reading is active.",
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Unable to start reader",
+        description: error instanceof Error ? error.message : "Start failed.",
+        variant: "destructive",
+      });
+    },
+  });
+
+  const stopMutation = useMutation({
+    mutationFn: stopRfidReader,
+    onSuccess: async () => {
+      await refreshRfidQueries();
+      toast({
+        title: "Reader stopped",
+        description: "Continuous UHF reading has been paused.",
       });
     },
     onError: (error) => {
       toast({
         title: "Unable to stop reader",
-        description: error instanceof Error ? error.message : "RFID service could not stop the reader.",
+        description: error instanceof Error ? error.message : "Stop failed.",
         variant: "destructive",
       });
     },
@@ -152,7 +154,7 @@ export default function ReaderControl() {
     onError: (error) => {
       toast({
         title: "Unable to set power",
-        description: error instanceof Error ? error.message : "Power command failed.",
+        description: error instanceof Error ? error.message : "Power update failed.",
         variant: "destructive",
       });
     },
@@ -170,19 +172,21 @@ export default function ReaderControl() {
     onError: (error) => {
       toast({
         title: "Unable to set mode",
-        description: error instanceof Error ? error.message : "Mode change failed.",
+        description: error instanceof Error ? error.message : "Mode update failed.",
         variant: "destructive",
       });
     },
   });
 
-  const status = tagsQuery.data;
-  const registration = registrationQuery.data?.registration ?? status?.registration;
-  const activeTags = activeTagsQuery.data?.active_tags ?? [];
-  const lastTag = status?.last_detected_tag ?? "--";
+  const status = statusQuery.data;
+  const serviceOffline = statusQuery.isError;
+  const isConnected = Boolean(status?.connected);
+  const isRunning = Boolean(status?.running);
   const isBusy = useMemo(() => {
     return connectMutation.isPending
       || disconnectMutation.isPending
+      || startMutation.isPending
+      || stopMutation.isPending
       || powerMutation.isPending
       || modeMutation.isPending;
   }, [
@@ -190,19 +194,17 @@ export default function ReaderControl() {
     disconnectMutation.isPending,
     modeMutation.isPending,
     powerMutation.isPending,
+    startMutation.isPending,
+    stopMutation.isPending,
   ]);
 
-  const serviceOffline = tagsQuery.isError;
-  const readerRunning = Boolean(status?.running);
-  const registrationSelected = selectedMode === "registration" || status?.current_mode === "registration";
-
   return (
-    <div className="space-y-8 p-6 md:p-8 animate-in fade-in duration-500">
-      <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
+    <div className="space-y-6 p-6 md:p-8 animate-in fade-in duration-500">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-foreground">RFID Reader Control Panel</h1>
+          <h1 className="text-3xl font-bold text-foreground">UHF Reader Control</h1>
           <p className="mt-1 text-muted-foreground">
-            Connect the UHF reader, tune power and mode profiles, and watch the live EPC stream without leaving the dashboard.
+            Connect the reader, choose the required mode, and start or stop the continuous UHF stream.
           </p>
         </div>
         <Button
@@ -213,7 +215,7 @@ export default function ReaderControl() {
           disabled={isBusy}
         >
           <RefreshCcw className="mr-2 size-4" />
-          Refresh Status
+          Refresh
         </Button>
       </div>
 
@@ -222,16 +224,8 @@ export default function ReaderControl() {
           <AlertTriangle className="size-4 text-amber-700" />
           <AlertTitle>RFID service is not reachable</AlertTitle>
           <AlertDescription>
-            Start the FastAPI service from <span className="font-mono">rfid_service/main.py</span>, then refresh this page.
+            Start the FastAPI service from <span className="font-mono">rfid_service/main.py</span>, then reconnect the reader.
           </AlertDescription>
-        </Alert>
-      )}
-
-      {registrationSelected && (
-        <Alert className="border-sky-200 bg-sky-50">
-          <Radio className="size-4 text-sky-700" />
-          <AlertTitle>Registration Mode</AlertTitle>
-          <AlertDescription>Keep only one tag near the reader.</AlertDescription>
         </Alert>
       )}
 
@@ -242,69 +236,46 @@ export default function ReaderControl() {
               <Cable className="size-4 text-primary" />
               Connection
             </CardTitle>
-            <CardDescription>Choose the serial port and start the background reader thread.</CardDescription>
+            <CardDescription>Use COM3 / 57600 by default, then connect before starting the stream.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
             <div className="grid gap-4 md:grid-cols-2">
               <div className="space-y-2">
-                <Label htmlFor="rfid-port">COM Port</Label>
+                <Label htmlFor="reader-port">COM Port</Label>
                 <Input
-                  id="rfid-port"
+                  id="reader-port"
                   value={port}
                   onChange={(event) => setPort(event.target.value.toUpperCase())}
                   placeholder="COM3"
-                  disabled={readerRunning || isBusy}
+                  disabled={isConnected || isBusy}
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="rfid-baudrate">Baud Rate</Label>
+                <Label htmlFor="reader-baudrate">Baud Rate</Label>
                 <Input
-                  id="rfid-baudrate"
+                  id="reader-baudrate"
                   value={baudrate}
                   onChange={(event) => setBaudrate(event.target.value)}
                   placeholder="57600"
-                  disabled={readerRunning || isBusy}
+                  disabled={isConnected || isBusy}
                 />
               </div>
             </div>
 
-            <div className="flex flex-col gap-3 sm:flex-row">
-              <Button
-                className="sm:min-w-44"
-                onClick={() => {
-                  if (readerRunning) {
-                    disconnectMutation.mutate();
-                    return;
-                  }
-                  connectMutation.mutate();
-                }}
-                disabled={isBusy}
-              >
-                {readerRunning ? (
-                  <>
-                    <Square className="mr-2 size-4" />
-                    Disconnect
-                  </>
-                ) : (
-                  <>
-                    <Play className="mr-2 size-4" />
-                    Connect
-                  </>
-                )}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Button onClick={() => connectMutation.mutate()} disabled={isConnected || isBusy}>
+                <Play className="mr-2 size-4" />
+                Connect
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => connectMutation.mutate()}
-                disabled={readerRunning || isBusy}
-              >
+              <Button variant="outline" onClick={() => disconnectMutation.mutate()} disabled={!isConnected || isBusy}>
+                <Square className="mr-2 size-4" />
+                Disconnect
+              </Button>
+              <Button variant="outline" onClick={() => startMutation.mutate()} disabled={!isConnected || isRunning || isBusy}>
                 <Play className="mr-2 size-4" />
                 Start Reader
               </Button>
-              <Button
-                variant="outline"
-                onClick={() => disconnectMutation.mutate()}
-                disabled={!readerRunning || isBusy}
-              >
+              <Button variant="outline" onClick={() => stopMutation.mutate()} disabled={!isRunning || isBusy}>
                 <Square className="mr-2 size-4" />
                 Stop Reader
               </Button>
@@ -315,60 +286,50 @@ export default function ReaderControl() {
         <Card className="border-border/50 shadow-sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-lg">
-              <ScanLine className="size-4 text-primary" />
-              Reader Status
+              <Settings2 className="size-4 text-primary" />
+              Current Status
             </CardTitle>
-            <CardDescription>Live state from the Python RFID service.</CardDescription>
+            <CardDescription>Only the UHF reader lifecycle needed for connection, registration, and gate operation.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-4 sm:grid-cols-2">
-            {tagsQuery.isLoading ? (
-              Array.from({ length: 6 }).map((_, index) => <Skeleton key={index} className="h-20 w-full" />)
-            ) : (
-              <>
-                <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Connection</p>
-                  <div className="mt-2">
-                    <StatusBadge
-                      active={Boolean(status?.connected)}
-                      activeLabel="Connected"
-                      idleLabel="Disconnected"
-                    />
-                  </div>
-                  <p className="mt-3 text-sm text-muted-foreground">{status?.port ?? port}</p>
-                </div>
-                <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Current Mode</p>
-                  <p className="mt-2 text-lg font-semibold capitalize text-foreground">
-                    {status?.current_mode ?? selectedMode}
-                  </p>
-                  <p className="mt-1 text-sm text-muted-foreground">Continuous scan, registration, or trigger workflow.</p>
-                </div>
-                <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Current Power</p>
-                  <p className="mt-2 text-lg font-semibold text-foreground">{status?.current_power ?? powerValue[0]}</p>
-                  <p className="mt-1 text-sm text-muted-foreground">Supported range is 0 to 30.</p>
-                </div>
-                <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-                  <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Detected Tag</p>
-                  <p className="mt-2 break-all font-mono text-sm text-foreground">{lastTag}</p>
-                  <p className="mt-1 text-sm text-muted-foreground">{formatReaderTimestamp(status?.last_detected_at)}</p>
-                </div>
-              </>
-            )}
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Connection</p>
+              <div className="mt-2">
+                <Badge variant={isConnected ? "secondary" : "outline"}>
+                  {isConnected ? "Connected" : "Disconnected"}
+                </Badge>
+              </div>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Reader</p>
+              <div className="mt-2">
+                <Badge variant={isRunning ? "secondary" : "outline"}>
+                  {isRunning ? "Running" : "Stopped"}
+                </Badge>
+              </div>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Mode</p>
+              <p className="mt-2 text-lg font-semibold capitalize text-foreground">{status?.current_mode ?? selectedMode}</p>
+            </div>
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Power</p>
+              <p className="mt-2 text-lg font-semibold text-foreground">{status?.current_power ?? powerValue[0]}</p>
+            </div>
           </CardContent>
         </Card>
       </div>
 
-      <div className="grid gap-6 xl:grid-cols-[1fr_1fr_1.15fr]">
+      <div className="grid gap-6 xl:grid-cols-2">
         <Card className="border-border/50 shadow-sm">
           <CardHeader>
             <CardTitle className="flex items-center gap-2 text-lg">
               <SlidersHorizontal className="size-4 text-primary" />
               Power Control
             </CardTitle>
-            <CardDescription>Fine-tune read range and collision behavior.</CardDescription>
+            <CardDescription>Use 30 for normal detection and 5-10 for registration mode.</CardDescription>
           </CardHeader>
-          <CardContent className="space-y-6">
+          <CardContent className="space-y-5">
             <div className="space-y-4">
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Power Level</span>
@@ -380,11 +341,11 @@ export default function ReaderControl() {
                 step={1}
                 value={powerValue}
                 onValueChange={setPowerValue}
-                disabled={!readerRunning || isBusy}
+                disabled={!isConnected || isBusy}
               />
             </div>
-            <Button onClick={() => powerMutation.mutate()} disabled={!readerRunning || isBusy}>
-              Set Power
+            <Button onClick={() => powerMutation.mutate()} disabled={!isConnected || isBusy}>
+              Apply Power
             </Button>
           </CardContent>
         </Card>
@@ -395,7 +356,7 @@ export default function ReaderControl() {
               <Settings2 className="size-4 text-primary" />
               Mode Selection
             </CardTitle>
-            <CardDescription>Switch between multi-tag scanning and single-tag registration behavior.</CardDescription>
+            <CardDescription>Use normal mode for live gate detection and registration mode for one stable tag.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
@@ -407,121 +368,12 @@ export default function ReaderControl() {
                 <SelectContent>
                   <SelectItem value="normal">Normal Mode</SelectItem>
                   <SelectItem value="registration">Registration Mode</SelectItem>
-                  <SelectItem value="trigger">Trigger Mode</SelectItem>
                 </SelectContent>
               </Select>
             </div>
-            <Button onClick={() => modeMutation.mutate()} disabled={!readerRunning || isBusy}>
+            <Button onClick={() => modeMutation.mutate()} disabled={!isConnected || isBusy}>
               Apply Mode
             </Button>
-          </CardContent>
-        </Card>
-
-        <Card className="border-border/50 shadow-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <Radio className="size-4 text-primary" />
-              Registration Capture
-            </CardTitle>
-            <CardDescription>Stable single-tag detection state for enrollment workflows.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
-              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Selected Tag</p>
-              <p className="mt-2 break-all font-mono text-sm text-foreground">
-                {registration?.selected_tag ?? "Waiting for a stable single-tag read"}
-              </p>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="rounded-2xl border border-border/60 p-4">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Candidate</p>
-                <p className="mt-2 break-all font-mono text-sm text-foreground">{registration?.candidate_tag ?? "--"}</p>
-              </div>
-              <div className="rounded-2xl border border-border/60 p-4">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Stability</p>
-                <p className="mt-2 text-sm font-semibold text-foreground">
-                  {registration ? `${registration.candidate_hits}/${registration.stable_threshold}` : "--"}
-                </p>
-              </div>
-            </div>
-            <Alert className="border-border/60 bg-white/80">
-              <Tag className="size-4 text-primary" />
-              <AlertTitle>Registration state</AlertTitle>
-              <AlertDescription>{registration?.message ?? "Registration data is not available yet."}</AlertDescription>
-            </Alert>
-          </CardContent>
-        </Card>
-      </div>
-
-      <div className="grid gap-6 xl:grid-cols-[1.05fr_0.95fr]">
-        <Card className="border-border/50 shadow-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <Tag className="size-4 text-primary" />
-              Recent EPC Tags
-            </CardTitle>
-            <CardDescription>Clean EPC values extracted from the live binary stream.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {!status?.recent_tags?.length ? (
-              <div className="rounded-2xl border border-dashed border-border/70 px-5 py-10 text-center text-sm text-muted-foreground">
-                No EPC tags have been detected yet.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {status.recent_tags.slice(0, 10).map((tag) => (
-                  <div key={`${tag.epc}-${tag.seen_at}`} className="rounded-2xl border border-border/60 p-4">
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                      <div className="min-w-0">
-                        <p className="break-all font-mono text-sm font-semibold text-foreground">{tag.epc}</p>
-                        <p className="mt-1 text-xs text-muted-foreground">{formatReaderTimestamp(tag.seen_at)}</p>
-                      </div>
-                      <Badge variant="outline">Observed</Badge>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card className="border-border/50 shadow-sm">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <ScanLine className="size-4 text-primary" />
-              Active Tags
-            </CardTitle>
-            <CardDescription>Tags that are still inside the active ENTRY window.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {activeTagsQuery.isLoading && readerRunning ? (
-              <div className="space-y-3">
-                {Array.from({ length: 4 }).map((_, index) => <Skeleton key={index} className="h-20 w-full" />)}
-              </div>
-            ) : !activeTags.length ? (
-              <div className="rounded-2xl border border-dashed border-border/70 px-5 py-10 text-center text-sm text-muted-foreground">
-                No active tags right now.
-              </div>
-            ) : (
-              <div className="space-y-3">
-                {activeTags.map((tag) => (
-                  <div key={tag.epc} className="rounded-2xl border border-border/60 p-4">
-                    <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-                      <div className="min-w-0">
-                        <p className="break-all font-mono text-sm font-semibold text-foreground">{tag.epc}</p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          First seen {formatReaderTimestamp(tag.first_seen_at)}
-                        </p>
-                      </div>
-                      <div className="text-left sm:text-right">
-                        <p className="text-sm font-semibold text-foreground">{tag.detections} detections</p>
-                        <p className="text-xs text-muted-foreground">Idle {tag.idle_seconds.toFixed(2)}s</p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
           </CardContent>
         </Card>
       </div>

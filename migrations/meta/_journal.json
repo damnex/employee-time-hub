@@ -8,6 +8,13 @@
       "when": 1774192764039,
       "tag": "0000_init_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1776663807734,
+      "tag": "0001_set_uhf_scan_technology_default",
+      "breakpoints": true
     }
   ]
 }

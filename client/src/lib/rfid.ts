@@ -1,7 +1,7 @@
 import { apiRequest } from "./queryClient";
 
 
-export type RfidMode = "normal" | "registration" | "trigger";
+export type RfidMode = "normal" | "registration";
 
 export interface RfidReaderInfo {
   version: number;
@@ -71,6 +71,7 @@ export interface RfidRegistrationResponse extends RfidStatus {
 }
 
 export const rfidQueryKeys = {
+  connection: ["/api/rfid/status"] as const,
   tags: ["/api/rfid/tags"] as const,
   activeTags: ["/api/rfid/active-tags"] as const,
   registrationTag: ["/api/rfid/registration-tag"] as const,
@@ -95,6 +96,10 @@ export function fetchRfidTags() {
   return readJson<RfidTagsResponse>("/api/rfid/tags");
 }
 
+export function fetchRfidStatus() {
+  return readJson<RfidStatus>("/api/rfid/status");
+}
+
 export function fetchRfidActiveTags() {
   return readJson<RfidActiveTagsResponse>("/api/rfid/active-tags");
 }
@@ -103,9 +108,23 @@ export function fetchRfidRegistrationTag() {
   return readJson<RfidRegistrationResponse>("/api/rfid/registration-tag");
 }
 
-export async function startRfidReader(payload: {
+export async function connectRfidReader(payload: {
   port: string;
   baudrate: number;
+  debug_raw?: boolean;
+}) {
+  const response = await apiRequest("POST", "/api/rfid/connect", payload);
+  return response.json() as Promise<RfidStatus>;
+}
+
+export async function disconnectRfidReader() {
+  const response = await apiRequest("POST", "/api/rfid/disconnect");
+  return response.json() as Promise<RfidStatus>;
+}
+
+export async function startRfidReader(payload?: {
+  port?: string;
+  baudrate?: number;
   debug_raw?: boolean;
 }) {
   const response = await apiRequest("POST", "/api/rfid/start", payload);

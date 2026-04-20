@@ -39,7 +39,7 @@ CREATE TABLE "gate_events" (
 	"occurred_at" timestamp DEFAULT now(),
 	"rfid_uid" text NOT NULL,
 	"device_id" text NOT NULL,
-	"scan_technology" text DEFAULT 'HF_RFID' NOT NULL,
+	"scan_technology" text DEFAULT 'UHF_RFID' NOT NULL,
 	"decision" text NOT NULL,
 	"verification_status" text NOT NULL,
 	"event_message" text NOT NULL,

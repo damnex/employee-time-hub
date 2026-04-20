@@ -41,7 +41,7 @@ class RegistrationState:
 class TagProcessor:
     def __init__(
         self,
-        exit_timeout_seconds: float = 3.0,
+        exit_timeout_seconds: float = 5.0,
         registration_stable_hits: int = 5,
         registration_window_seconds: float = 1.5,
         registration_gap_seconds: float = 1.0,
@@ -90,7 +90,7 @@ class TagProcessor:
             self.registration.last_seen_at = None
             self.registration.message = (
                 "Keep only one tag near the reader."
-                if mode in {"registration", "trigger"}
+                if mode == "registration"
                 else "Registration mode inactive."
             )
 
@@ -183,6 +183,7 @@ class TagProcessor:
         ]
         for tag in expired:
             self.active_tags.pop(tag, None)
+            self.last_seen.pop(tag, None)
             LOGGER.info("EXIT %s", tag)
 
     def _trim_registration_observations(self, now: float) -> None:
@@ -190,7 +191,7 @@ class TagProcessor:
             self._registration_observations.popleft()
 
     def _update_registration_state(self, tags: list[str], now: float) -> None:
-        if self.registration.mode not in {"registration", "trigger"}:
+        if self.registration.mode != "registration":
             return
 
         for tag in tags:

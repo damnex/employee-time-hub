@@ -1,0 +1,1 @@
+ALTER TABLE "gate_events" ALTER COLUMN "scan_technology" SET DEFAULT 'UHF_RFID';

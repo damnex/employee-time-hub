@@ -14,7 +14,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 
-app = FastAPI(title="RFID Reader Service", version="1.0.0")
+app = FastAPI(title="UHF RFID Reader Service", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,7 +26,7 @@ app.add_middleware(
 controller = RFIDController()
 
 
-class StartRequest(BaseModel):
+class ReaderConnectionRequest(BaseModel):
     port: str = Field(default="COM3", min_length=1)
     baudrate: int = Field(default=57600, ge=1200, le=921600)
     debug_raw: bool = False
@@ -45,8 +45,24 @@ def _service_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=400, detail=detail)
 
 
+@app.post("/connect")
+def connect_reader(payload: ReaderConnectionRequest) -> dict[str, object]:
+    try:
+        return controller.connect(port=payload.port, baudrate=payload.baudrate, debug_raw=payload.debug_raw)
+    except Exception as exc:  # noqa: BLE001
+        raise _service_error(exc) from exc
+
+
+@app.post("/disconnect")
+def disconnect_reader() -> dict[str, object]:
+    try:
+        return controller.disconnect()
+    except Exception as exc:  # noqa: BLE001
+        raise _service_error(exc) from exc
+
+
 @app.post("/start")
-def start_reader(payload: StartRequest) -> dict[str, object]:
+def start_reader(payload: ReaderConnectionRequest) -> dict[str, object]:
     try:
         return controller.start(port=payload.port, baudrate=payload.baudrate, debug_raw=payload.debug_raw)
     except Exception as exc:  # noqa: BLE001

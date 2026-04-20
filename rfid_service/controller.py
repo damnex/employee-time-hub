@@ -13,7 +13,6 @@ LOGGER = logging.getLogger("rfid_service.controller")
 MODE_DEFAULT_POWER = {
     "normal": 30,
     "registration": 8,
-    "trigger": 8,
 }
 
 
@@ -38,7 +37,7 @@ class RFIDController:
         self._lock = threading.RLock()
         self._needs_runtime_sync = False
 
-    def start(
+    def connect(
         self,
         *,
         port: str | None = None,
@@ -50,14 +49,14 @@ class RFIDController:
             desired_baudrate = baudrate or self._state.baudrate
             desired_debug = self._state.debug_raw if debug_raw is None else debug_raw
 
-            if self._state.running:
+            if self._reader is not None:
                 if (
                     desired_port == self._state.port
                     and desired_baudrate == self._state.baudrate
                     and desired_debug == self._state.debug_raw
                 ):
                     return self.get_status()
-                self.stop()
+                self.disconnect()
 
             self._state.port = desired_port
             self._state.baudrate = desired_baudrate
@@ -77,10 +76,10 @@ class RFIDController:
             try:
                 reader.start()
                 self._reader = reader
-                self._processor.start()
-                self._state.running = True
+                self._processor.set_mode(self._state.current_mode)
+                self._state.running = False
                 self._state.connected = reader.connected
-                self._needs_runtime_sync = False
+                self._needs_runtime_sync = True
 
                 try:
                     self._reader_info = reader.get_reader_info()
@@ -94,7 +93,7 @@ class RFIDController:
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning("Unable to read work mode during startup: %s", exc)
 
-                self._apply_runtime_configuration_locked()
+                self._sync_runtime_state_locked()
                 return self.get_status()
             except Exception:
                 reader.stop()
@@ -105,7 +104,39 @@ class RFIDController:
                 self._needs_runtime_sync = False
                 raise
 
+    def start(
+        self,
+        *,
+        port: str | None = None,
+        baudrate: int | None = None,
+        debug_raw: bool | None = None,
+    ) -> dict[str, object]:
+        with self._lock:
+            if self._reader is None or not self._state.connected:
+                self.connect(port=port, baudrate=baudrate, debug_raw=debug_raw)
+
+            self._sync_runtime_state_locked()
+            if self._state.running:
+                return self.get_status()
+
+            self._processor.stop(force_exit=True)
+            self._processor.set_mode(self._state.current_mode)
+            self._processor.start()
+            self._state.running = True
+            LOGGER.info("Reader stream started in %s mode.", self._state.current_mode)
+            return self.get_status()
+
     def stop(self) -> dict[str, object]:
+        with self._lock:
+            if not self._state.running:
+                return self.get_status()
+
+            self._processor.stop(force_exit=True)
+            self._state.running = False
+            LOGGER.info("Reader stream stopped.")
+            return self.get_status()
+
+    def disconnect(self) -> dict[str, object]:
         with self._lock:
             if self._reader is not None:
                 self._reader.stop()
@@ -177,11 +208,13 @@ class RFIDController:
             }
 
     def _require_reader(self) -> SerialRFIDReader:
-        if self._reader is None or not self._state.running:
-            raise RuntimeError("RFID reader is not started.")
+        if self._reader is None or not self._state.connected:
+            raise RuntimeError("RFID reader is not connected.")
         return self._reader
 
     def _handle_detected_tags(self, packet, tags: list[str]) -> None:
+        if not self._state.running:
+            return
         self._processor.process_tags(tags, raw_hex=packet.raw_hex)
 
     def _handle_connection_change(self, connected: bool) -> None:
@@ -189,27 +222,22 @@ class RFIDController:
             self._state.connected = connected
             if connected:
                 self._state.last_error = None
-                if self._state.running:
-                    self._needs_runtime_sync = True
-            elif self._state.running:
+                self._needs_runtime_sync = True
+            else:
                 self._state.last_error = f"RFID reader on {self._state.port} disconnected."
 
     def _normalize_mode(self, mode: str) -> str:
         normalized = mode.strip().lower()
         if normalized not in MODE_DEFAULT_POWER:
-            raise ValueError("Mode must be one of: normal, registration, trigger.")
+            raise ValueError("Mode must be one of: normal, registration.")
         return normalized
 
     def _work_mode_for(self, mode: str) -> WorkModeConfig:
-        if mode == "normal":
-            return WorkModeConfig.normal_scan()
         if mode == "registration":
             return WorkModeConfig.registration_scan()
-        return WorkModeConfig.trigger_low()
+        return WorkModeConfig.normal_scan()
 
     def _mode_from_work_mode(self, mode: WorkModeConfig) -> str:
-        if mode.read_mode in {0x02, 0x03}:
-            return "trigger"
         if mode.read_mode == 0x01 and mode.mem_inven == 0x05:
             return "registration"
         return "normal"
@@ -227,6 +255,6 @@ class RFIDController:
         )
 
     def _sync_runtime_state_locked(self) -> None:
-        if not self._needs_runtime_sync or not self._state.connected or not self._state.running:
+        if not self._needs_runtime_sync or not self._state.connected:
             return
         self._apply_runtime_configuration_locked()

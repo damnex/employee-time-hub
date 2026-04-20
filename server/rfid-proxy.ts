@@ -42,6 +42,21 @@ async function proxyJsonRequest(
 }
 
 export function registerRfidProxyRoutes(app: Express) {
+  const connectHandler = async (req: Request, res: Response) => {
+    return proxyJsonRequest(res, {
+      method: "POST",
+      path: "connect",
+      body: req.body ?? {},
+    });
+  };
+
+  const disconnectHandler = async (_req: unknown, res: Response) => {
+    return proxyJsonRequest(res, {
+      method: "POST",
+      path: "disconnect",
+    });
+  };
+
   const startHandler = async (req: Request, res: Response) => {
     return proxyJsonRequest(res, {
       method: "POST",
@@ -86,6 +101,12 @@ export function registerRfidProxyRoutes(app: Express) {
       path: "active-tags",
     });
   };
+
+  app.post("/api/rfid/connect", connectHandler);
+  app.post("/api/connect", connectHandler);
+
+  app.post("/api/rfid/disconnect", disconnectHandler);
+  app.post("/api/disconnect", disconnectHandler);
 
   app.post("/api/rfid/start", startHandler);
   app.post("/api/start", startHandler);

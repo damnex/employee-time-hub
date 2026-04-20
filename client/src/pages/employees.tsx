@@ -52,11 +52,13 @@ import {
 } from "@/components/ui/form";
 import { insertEmployeeSchema, type Employee } from "@shared/schema";
 import {
+  connectRfidReader,
   fetchRfidRegistrationTag,
   fetchRfidTags,
   rfidQueryKeys,
   setRfidMode,
   startRfidReader,
+  stopRfidReader,
 } from "@/lib/rfid";
 
 const REGISTRATION_PORT = "COM3";
@@ -181,6 +183,8 @@ export default function Employees() {
   const [editProfilePhoto, setEditProfilePhoto] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const autoRegistrationAttemptedRef = useRef(false);
+  const registrationReaderStartedRef = useRef(false);
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -216,11 +220,21 @@ export default function Employees() {
 
   const enableRegistrationModeMutation = useMutation({
     mutationFn: async () => {
-      await startRfidReader({
-        port: readerStatusQuery.data?.port ?? REGISTRATION_PORT,
-        baudrate: readerStatusQuery.data?.baudrate ?? REGISTRATION_BAUDRATE,
+      const readerPort = readerStatusQuery.data?.port ?? REGISTRATION_PORT;
+      const readerBaudrate = readerStatusQuery.data?.baudrate ?? REGISTRATION_BAUDRATE;
+      registrationReaderStartedRef.current = !readerStatusQuery.data?.running;
+
+      await connectRfidReader({
+        port: readerPort,
+        baudrate: readerBaudrate,
+        debug_raw: false,
       });
-      return setRfidMode("registration");
+      await setRfidMode("registration");
+      return startRfidReader({
+        port: readerPort,
+        baudrate: readerBaudrate,
+        debug_raw: false,
+      });
     },
     onSuccess: async () => {
       setRegistrationModeEnabled(true);
@@ -230,6 +244,7 @@ export default function Employees() {
       ]);
     },
     onError: (error) => {
+      registrationReaderStartedRef.current = false;
       setRfidReaderMessage(
         error instanceof Error
           ? error.message
@@ -307,10 +322,31 @@ export default function Employees() {
       return;
     }
 
-    if (readerStatusQuery.data?.current_mode === "registration") {
+    if (readerStatusQuery.data?.current_mode === "registration" && readerStatusQuery.data?.running) {
       setRegistrationModeEnabled(true);
     }
   }, [isDialogOpen, readerStatusQuery.data?.current_mode]);
+
+  useEffect(() => {
+    if (!isDialogOpen || autoRegistrationAttemptedRef.current || enableRegistrationModeMutation.isPending) {
+      return;
+    }
+
+    if (readerStatusQuery.data?.current_mode === "registration" && readerStatusQuery.data?.running) {
+      autoRegistrationAttemptedRef.current = true;
+      setRegistrationModeEnabled(true);
+      return;
+    }
+
+    autoRegistrationAttemptedRef.current = true;
+    enableRegistrationModeMutation.mutate();
+  }, [
+    enableRegistrationModeMutation,
+    enableRegistrationModeMutation.isPending,
+    isDialogOpen,
+    readerStatusQuery.data?.current_mode,
+    readerStatusQuery.data?.running,
+  ]);
 
   useEffect(() => {
     if (!isDialogOpen) {
@@ -385,10 +421,19 @@ export default function Employees() {
   const handleDialogChange = (open: boolean) => {
     setIsDialogOpen(open);
 
+    if (open) {
+      autoRegistrationAttemptedRef.current = false;
+      return;
+    }
+
     if (!open) {
       if (registrationModeEnabled) {
         void setRfidMode("normal").catch(() => undefined);
+        if (registrationReaderStartedRef.current) {
+          void stopRfidReader().catch(() => undefined);
+        }
       }
+      registrationReaderStartedRef.current = false;
       resetEnrollment();
     }
   };
@@ -678,12 +723,12 @@ export default function Employees() {
                           {enableRegistrationModeMutation.isPending ? (
                             <>
                               <Loader2 className="mr-2 size-4 animate-spin" />
-                              Enabling Registration Mode
+                              Starting Registration Mode
                             </>
                           ) : (
                             <>
                               <ScanLine className="mr-2 size-4" />
-                              Enable Registration Mode
+                              Retry Registration Mode
                             </>
                           )}
                         </Button>
@@ -704,7 +749,7 @@ export default function Employees() {
                           <ShieldCheck className="mt-0.5 size-4 shrink-0" />
                           <div className="space-y-1">
                             <p>
-                              {rfidReaderMessage ?? "Enable registration mode, keep one UHF tag near the reader, or type the EPC manually."}
+                              {rfidReaderMessage ?? "Registration mode starts automatically. Keep one UHF tag near the reader or type the EPC manually."}
                             </p>
                             <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
                               Source: {rfidSourceDeviceId ?? "RFID Service"}

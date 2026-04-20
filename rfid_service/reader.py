@@ -23,6 +23,8 @@ SPONTANEOUS_TAG_RESPONSE = 0xEE
 INVENTORY_RESPONSE = 0x01
 INVENTORY_SINGLE_RESPONSE = 0x0F
 SUCCESS_STATUSES = {0x00, 0x01, 0x02, 0x03, 0x04}
+REQUIRED_EPC_HEX_LENGTH = 8
+REQUIRED_EPC_BYTES = REQUIRED_EPC_HEX_LENGTH // 2
 
 
 @dataclass(slots=True)
@@ -94,11 +96,6 @@ class WorkModeConfig:
         return cls(read_mode=0x01, mode_state=0x06, mem_inven=0x05, word_num=0x06, tag_time=0x00)
 
     @classmethod
-    def trigger_low(cls) -> "WorkModeConfig":
-        # Trigger Low Mode + RS232 output + inventory single.
-        return cls(read_mode=0x02, mode_state=0x06, mem_inven=0x05, word_num=0x06, tag_time=0x00)
-
-    @classmethod
     def from_response(cls, payload: bytes) -> "WorkModeConfig":
         if len(payload) < 10:
             raise ValueError("Get Work Mode response payload is shorter than expected.")
@@ -156,9 +153,7 @@ def decode_packet(raw_packet: bytes) -> ReaderPacket:
 
 
 def is_valid_epc(epc: str) -> bool:
-    if not epc or len(epc) % 2 != 0:
-        return False
-    if len(epc) < 12 or len(epc) > 64:
+    if not epc or len(epc) != REQUIRED_EPC_HEX_LENGTH:
         return False
     if not epc.startswith("E2"):
         return False
@@ -168,45 +163,59 @@ def is_valid_epc(epc: str) -> bool:
 def _normalize_epc(candidate: bytes) -> str | None:
     if not candidate:
         return None
+    if len(candidate) != REQUIRED_EPC_BYTES:
+        return None
     epc = candidate.hex().upper()
     if not is_valid_epc(epc):
         return None
     return epc
 
 
-def _parse_len_prefixed_epcs(payload: bytes, *, starts_with_count: bool) -> list[str]:
+def _parse_declared_epcs(payload: bytes, *, starts_with_count: bool) -> list[str]:
     tags: list[str] = []
     seen: set[str] = set()
     cursor = 1 if starts_with_count and payload else 0
 
     while cursor < len(payload):
-        epc_words = payload[cursor]
+        epc_length = payload[cursor]
         cursor += 1
-        epc_length = epc_words * 2
-        if epc_length <= 0 or cursor + epc_length > len(payload):
+        if epc_length <= 0:
+            continue
+        if cursor + epc_length > len(payload):
             break
+
         candidate = _normalize_epc(payload[cursor:cursor + epc_length])
-        cursor += epc_length
+        next_cursor = cursor + epc_length
+        cursor = next_cursor
         if candidate and candidate not in seen:
             seen.add(candidate)
             tags.append(candidate)
     return tags
 
 
-def _heuristic_epc_scan(payload: bytes) -> list[str]:
+def _scan_for_embedded_epcs(payload: bytes) -> list[str]:
     tags: list[str] = []
     seen: set[str] = set()
-    for start in range(len(payload)):
-        if payload[start] != 0xE2:
+    cursor = 0
+    while cursor < len(payload):
+        declared_length = payload[cursor]
+        if declared_length != REQUIRED_EPC_BYTES:
+            cursor += 1
             continue
-        for epc_length in range(12, 33, 2):
-            end = start + epc_length
-            if end > len(payload):
-                break
-            candidate = _normalize_epc(payload[start:end])
-            if candidate and candidate not in seen:
-                seen.add(candidate)
-                tags.append(candidate)
+        start = cursor + 1
+        end = start + declared_length
+        if end > len(payload):
+            cursor += 1
+            continue
+
+        candidate = _normalize_epc(payload[start:end])
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            tags.append(candidate)
+            cursor = end
+            continue
+
+        cursor += 1
     return tags
 
 
@@ -216,9 +225,9 @@ def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
 
     if packet.response_code in {INVENTORY_RESPONSE, INVENTORY_SINGLE_RESPONSE, SPONTANEOUS_TAG_RESPONSE}:
         parsers = [
-            lambda: _parse_len_prefixed_epcs(packet.data, starts_with_count=True),
-            lambda: _parse_len_prefixed_epcs(packet.data, starts_with_count=False),
-            lambda: _heuristic_epc_scan(packet.data),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
+            lambda: _scan_for_embedded_epcs(packet.data),
         ]
         for parser in parsers:
             tags = parser()
