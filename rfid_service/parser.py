@@ -9,8 +9,10 @@ SPONTANEOUS_TAG_RESPONSE = 0xEE
 INVENTORY_RESPONSE = 0x01
 INVENTORY_SINGLE_RESPONSE = 0x0F
 SUCCESS_STATUSES = {0x00, 0x01, 0x02, 0x03, 0x04}
-REQUIRED_EPC_HEX_LENGTH = 8
-REQUIRED_EPC_BYTES = REQUIRED_EPC_HEX_LENGTH // 2
+MIN_EPC_BYTES = 4
+MAX_EPC_BYTES = 30
+MIN_EPC_HEX_LENGTH = MIN_EPC_BYTES * 2
+MAX_EPC_HEX_LENGTH = MAX_EPC_BYTES * 2
 
 
 @dataclass(slots=True)
@@ -71,11 +73,15 @@ def decode_packet(raw_packet: bytes) -> ReaderPacket:
 
 
 def is_valid_epc(epc: str) -> bool:
-    return bool(epc) and epc.startswith("E2") and len(epc) == REQUIRED_EPC_HEX_LENGTH
+    if not epc or len(epc) < MIN_EPC_HEX_LENGTH or len(epc) > MAX_EPC_HEX_LENGTH:
+        return False
+    if len(epc) % 2 != 0:
+        return False
+    return all(character in "0123456789ABCDEF" for character in epc)
 
 
 def _normalize_epc(candidate: bytes) -> str | None:
-    if len(candidate) != REQUIRED_EPC_BYTES:
+    if len(candidate) < MIN_EPC_BYTES or len(candidate) > MAX_EPC_BYTES:
         return None
     epc = candidate.hex().upper()
     if not is_valid_epc(epc):
@@ -112,7 +118,7 @@ def _scan_for_embedded_epcs(payload: bytes) -> list[str]:
 
     while cursor < len(payload):
         declared_length = payload[cursor]
-        if declared_length != REQUIRED_EPC_BYTES:
+        if declared_length < MIN_EPC_BYTES or declared_length > MAX_EPC_BYTES:
             cursor += 1
             continue
 
@@ -134,6 +140,11 @@ def _scan_for_embedded_epcs(payload: bytes) -> list[str]:
     return tags
 
 
+def _parse_direct_epc(payload: bytes) -> list[str]:
+    candidate = _normalize_epc(payload)
+    return [candidate] if candidate else []
+
+
 def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
     if packet.status not in SUCCESS_STATUSES or not packet.data:
         return []
@@ -141,11 +152,20 @@ def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
     if packet.response_code not in {INVENTORY_RESPONSE, INVENTORY_SINGLE_RESPONSE, SPONTANEOUS_TAG_RESPONSE}:
         return []
 
-    parsers = [
-        lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
-        lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
-        lambda: _scan_for_embedded_epcs(packet.data),
-    ]
+    if packet.response_code == SPONTANEOUS_TAG_RESPONSE:
+        parsers = [
+            lambda: _parse_direct_epc(packet.data),
+            lambda: _scan_for_embedded_epcs(packet.data),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
+        ]
+    else:
+        parsers = [
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
+            lambda: _scan_for_embedded_epcs(packet.data),
+            lambda: _parse_direct_epc(packet.data),
+        ]
+
     for parser in parsers:
         tags = parser()
         if tags:

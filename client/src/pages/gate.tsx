@@ -1605,7 +1605,7 @@ export default function GateTerminal() {
                   </Label>
                   <Input
                     id="gate-rfid"
-                    placeholder="Present a tag or type E2..."
+                    placeholder="Present a tag or type the EPC..."
                     className="font-mono uppercase tracking-[0.2em]"
                     value={rfidUid}
                     onChange={(event) => setRfidUid(event.target.value.toUpperCase())}

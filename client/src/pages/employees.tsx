@@ -700,7 +700,7 @@ export default function Employees() {
                             </div>
                             <FormControl>
                               <Input
-                                placeholder="Present one UHF tag or type E2..."
+                                placeholder="Present one UHF tag or type the EPC..."
                                 className="font-mono uppercase tracking-[0.2em]"
                                 {...field}
                                 onChange={(event) => {
