@@ -24,20 +24,20 @@ export function AppSidebar() {
   const [location] = useLocation();
 
   return (
-    <Sidebar className="border-r border-sidebar-border bg-sidebar">
-      <SidebarHeader className="p-4 flex flex-row items-center gap-2">
-        <div className="flex aspect-square size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+    <Sidebar collapsible="icon" className="border-r border-sidebar-border/70 bg-sidebar/95 backdrop-blur">
+      <SidebarHeader className="flex flex-row items-center gap-3 px-4 py-5 transition-[padding] duration-300 ease-in-out group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-3">
+        <div className="flex aspect-square size-10 shrink-0 items-center justify-center rounded-2xl bg-primary text-primary-foreground shadow-sm">
           <Building2 className="size-4" />
         </div>
-        <div className="flex flex-col gap-0.5 leading-none">
-          <span className="font-semibold tracking-tight">CorpGuard</span>
-          <span className="text-xs text-muted-foreground">Access Control</span>
+        <div className="flex min-w-0 flex-col gap-1 leading-none transition-opacity duration-200 group-data-[collapsible=icon]:hidden">
+          <span className="font-semibold tracking-tight text-sidebar-foreground">CorpGuard</span>
+          <span className="text-xs text-sidebar-foreground/60">Access Control Platform</span>
         </div>
       </SidebarHeader>
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel className="text-xs font-medium text-sidebar-foreground/70 uppercase tracking-wider">
-            Overview
+        <SidebarGroup className="px-3 py-2">
+          <SidebarGroupLabel className="px-3 text-[11px] font-semibold uppercase tracking-[0.2em] text-sidebar-foreground/55">
+            Workspace
           </SidebarGroupLabel>
           <SidebarGroupContent>
             <SidebarMenu>
@@ -47,10 +47,11 @@ export function AppSidebar() {
                     asChild 
                     isActive={location === item.url}
                     tooltip={item.title}
+                    className="h-11 rounded-xl px-3 font-medium transition-all duration-300 ease-in-out group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2"
                   >
                     <Link href={item.url} className="flex items-center gap-3">
-                      <item.icon className="size-4" />
-                      <span>{item.title}</span>
+                      <item.icon className="size-4 shrink-0" />
+                      <span className="group-data-[collapsible=icon]:hidden">{item.title}</span>
                     </Link>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

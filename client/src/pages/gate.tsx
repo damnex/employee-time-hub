@@ -3,11 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import type { Employee } from "@shared/schema";
 import { fetchLiveFaceRecognition, useScanRFID } from "@/hooks/use-gate";
 import { useEmployees } from "@/hooks/use-employees";
+import { useGateEvents } from "@/hooks/use-gate-events";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
@@ -19,13 +21,13 @@ import {
   ArrowLeftRight,
   Camera,
   CheckCircle2,
+  Clock,
   KeyRound,
   Loader2,
-  MoveHorizontal,
   RefreshCcw,
   ScanLine,
   ShieldCheck,
-  UserCircle2,
+  Users,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -231,24 +233,6 @@ function getCaptureMessage(progress: number) {
   }
 
   return "Hold steady for the final verification frames.";
-}
-
-function getFaceBoxStyle(
-  faceBox: FaceBox | null | undefined,
-  frameSize: { width: number; height: number } | null | undefined,
-) {
-  if (!faceBox || !frameSize || !frameSize.width || !frameSize.height) {
-    return null;
-  }
-
-  const width = faceBox.right - faceBox.left;
-  const height = faceBox.bottom - faceBox.top;
-  return {
-    left: `${(faceBox.left / frameSize.width) * 100}%`,
-    top: `${(faceBox.top / frameSize.height) * 100}%`,
-    width: `${(width / frameSize.width) * 100}%`,
-    height: `${(height / frameSize.height) * 100}%`,
-  };
 }
 
 function mapRectToViewport(
@@ -487,6 +471,7 @@ export default function GateTerminal() {
     sourceDeviceId: string;
   } | null>(null);
   const [lastResult, setLastResult] = useState<GateDisplayResult | null>(null);
+  const [manualTriggerOpen, setManualTriggerOpen] = useState(false);
   const lastProcessedReaderDetectionRef = useRef<number>(0);
 
   const busy = isCapturingFrames || scanMutation.isPending;
@@ -494,26 +479,24 @@ export default function GateTerminal() {
   const busyRef = useRef(busy);
   const readerConnected = Boolean(readerTagsQuery.data?.connected && readerTagsQuery.data?.running);
   const readerEndpointLabel = readerTagsQuery.data?.port ?? "UHFReader18";
+  const now = new Date();
+  const todayString = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const gateEventsTodayQuery = useGateEvents({ date: todayString, deviceId: GATE_DEVICE_ID });
+  const matchesToday = (gateEventsTodayQuery.data ?? []).filter((event) => {
+    return event?.decision === "ENTRY" || event?.decision === "EXIT";
+  }).length;
+  const comPortLabel = readerTagsQuery.data?.port ?? "COM3";
   const normalizedRfidUid = rfidUid.trim().toUpperCase();
   const selectedBadgeOwner = employees?.find((employee) => {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const latestEmployee = lastResult?.employee ?? lastResult?.badgeOwner ?? selectedBadgeOwner;
-  const [hasProfilePhoto, setHasProfilePhoto] = useState<boolean | null>(null);
   const [profileNonce, setProfileNonce] = useState<number>(0);
   const latestProfileImage = latestEmployee
     ? `/api/employees/${latestEmployee.id}/photo${profileNonce ? `?t=${profileNonce}` : ""}`
     : lastResult?.previewImage ?? null;
-  const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
   const activeReaderTags = readerActiveTagsQuery.data?.active_tags ?? [];
-  const pythonRosterCount = (employees ?? []).filter((employee) => {
-    return Boolean(getPythonFaceMeta(employee.faceDescriptor));
-  }).length;
-  const pythonTrainedCount = (employees ?? []).filter((employee) => {
-    return getPythonFaceMeta(employee.faceDescriptor)?.status === "trained";
-  }).length;
   const lastDetectedDisplay = liveDetectedUid ?? (normalizedRfidUid || "--");
-  const detectedFaceBoxStyle = getFaceBoxStyle(lastResult?.detectedFaceBox, lastResult?.previewFrameSize);
   const stableRecognitionAssignments = liveRecognitionAssignments.filter((assignment) => {
     return Date.now() - assignment.lastSeenAt <= LIVE_RECOGNITION_TTL_MS
       && assignment.stableHits >= LIVE_RECOGNITION_STABLE_HITS;
@@ -557,9 +540,14 @@ export default function GateTerminal() {
   }, []);
 
   useEffect(() => {
+    const handleOpen = () => setManualTriggerOpen(true);
+    window.addEventListener("gate:open-manual-trigger", handleOpen);
+    return () => window.removeEventListener("gate:open-manual-trigger", handleOpen);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     if (!latestEmployee?.id) {
-      setHasProfilePhoto(null);
       return;
     }
 
@@ -571,12 +559,10 @@ export default function GateTerminal() {
         }
         const data = await res.json();
         if (!cancelled) {
-          setHasProfilePhoto(Boolean(data?.hasProfilePhoto));
           setProfileNonce(Date.now());
         }
       } catch {
         if (!cancelled) {
-          setHasProfilePhoto(false);
           setProfileNonce(Date.now());
         }
       }
@@ -1073,7 +1059,9 @@ export default function GateTerminal() {
     const badgeOwner = employees?.find((employee) => {
       return employee.rfidUid.toUpperCase() === normalizedUid;
     });
-    const requestDeviceId = sourceDeviceId ?? readerSourceDeviceId ?? GATE_DEVICE_ID;
+    // Keep backend events consistent per terminal; COM port stays a UI/detail concern.
+    const requestDeviceId = GATE_DEVICE_ID;
+    const sourceLabel = sourceDeviceId ?? comPortLabel ?? GATE_DEVICE_ID;
     const scanStartedAt = performance.now();
     const visibleFaceCount = liveTrackerAvailable === false
       ? pythonTrackedFaces.length
@@ -1121,10 +1109,10 @@ export default function GateTerminal() {
         faceFrames: frames,
       });
 
-      setReaderSourceDeviceId(requestDeviceId);
+      setReaderSourceDeviceId(sourceLabel);
       setReaderMessage(
         source === "reader"
-          ? `UHF reader event received from ${requestDeviceId}. Python verification completed.`
+          ? `UHF reader event received from ${sourceLabel}. Python verification completed.`
           : `Manual verification sent through ${requestDeviceId}.`,
       );
       setLastResult({
@@ -1157,11 +1145,11 @@ export default function GateTerminal() {
     busy,
     cameraActive,
     cameraError,
+    comPortLabel,
     captureFrameBurst,
     employees,
     liveTrackerAvailable,
     pythonTrackedFaces,
-    readerSourceDeviceId,
     scanMutation,
     scanTechnology,
   ]);
@@ -1223,317 +1211,365 @@ export default function GateTerminal() {
 
   const handleManualSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void handleScan(normalizedRfidUid, "manual");
+    if (busy || !normalizedRfidUid || !cameraActive) {
+      return;
+    }
+
+    void handleScan(normalizedRfidUid, "manual").finally(() => {
+      setManualTriggerOpen(false);
+    });
   };
 
   const cameraFrameTone = !cameraActive
-    ? "border-slate-300 shadow-none"
+    ? "border-border/70 shadow-none"
     : lastResult?.ignored
-      ? "border-amber-300 shadow-[0_0_0_1px_rgba(253,224,71,0.82),0_0_28px_rgba(253,224,71,0.24)]"
+      ? "border-amber-500/60 shadow-[0_0_0_1px_rgba(245,158,11,0.35),0_0_42px_rgba(245,158,11,0.12)]"
     : lastResult?.success
-      ? "border-emerald-400 shadow-[0_0_0_1px_rgba(74,222,128,0.82),0_0_28px_rgba(74,222,128,0.28)]"
+      ? "border-primary/60 shadow-[0_0_0_1px_rgba(34,197,94,0.45),0_0_60px_rgba(34,197,94,0.16)]"
       : lastResult
-        ? "border-rose-400 shadow-[0_0_0_1px_rgba(251,113,133,0.82),0_0_28px_rgba(251,113,133,0.24)]"
+        ? "border-rose-500/60 shadow-[0_0_0_1px_rgba(244,63,94,0.38),0_0_46px_rgba(244,63,94,0.14)]"
         : busy
-          ? "border-amber-300 shadow-[0_0_0_1px_rgba(253,224,71,0.78),0_0_24px_rgba(253,224,71,0.22)]"
-          : "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.78),0_0_24px_rgba(34,211,238,0.22)]";
+          ? "border-amber-500/50 shadow-[0_0_0_1px_rgba(245,158,11,0.26),0_0_40px_rgba(245,158,11,0.1)]"
+          : "border-primary/45 shadow-[0_0_0_1px_rgba(34,197,94,0.18),0_0_36px_rgba(34,197,94,0.08)]";
   const lastResultTone = !lastResult
-    ? "border-slate-200 bg-white/90"
+    ? "border-border bg-card/95"
     : lastResult.ignored
-      ? "border-amber-200 bg-amber-50/90"
+      ? "border-amber-500/35 bg-amber-500/10"
     : lastResult.success
-      ? "border-emerald-200 bg-emerald-50/90"
-      : "border-rose-200 bg-rose-50/90";
+      ? "border-primary/35 bg-primary/10"
+      : "border-rose-500/35 bg-rose-500/10";
+
+  const handleReadyForNext = () => {
+    setLastResult(null);
+    setRfidUid("");
+    setReaderMessage(null);
+    setLiveDetectedUid(null);
+    setPendingReaderScan(null);
+  };
 
   return (
-    <div className="flex h-[calc(100vh-60px)] flex-col gap-2 px-6 md:px-8 lg:px-10 xl:px-12 py-3 animate-in fade-in duration-300 overflow-hidden">
-      <Card className="overflow-hidden border-border/60 bg-white/90 shadow-sm">
-        <CardContent className="flex flex-wrap items-center justify-between gap-2 p-3">
-          <div className="flex items-baseline gap-2">
-            <h1 className="text-2xl font-semibold tracking-tight text-foreground">Gate Monitor</h1>
-            <p className="text-sm text-muted-foreground">Continuous UHF RFID + live face verification in one view.</p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge
-              variant={readerConnected ? "secondary" : "outline"}
-              className={cn(
-                readerConnected
-                  ? "bg-emerald-100 text-emerald-800 border-emerald-200"
-                  : "border-slate-300 text-slate-600",
+    <div className="relative h-full min-h-0 overflow-hidden p-2 md:p-3">
+      <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-3">
+        <div className="min-h-0 overflow-hidden">
+          <div className="flex min-w-0 gap-3 overflow-x-auto pb-1 hide-scrollbar">
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className={cn(
+                "flex h-9 w-9 items-center justify-center rounded-xl border border-border",
+                readerConnected ? "bg-primary/10 text-primary" : "bg-rose-500/10 text-rose-300",
               )}
-            >
-              {readerConnected ? "Reader Online" : "Reader Offline"}
-            </Badge>
-            <Badge
-              variant={cameraActive ? "secondary" : "outline"}
-              className={cn(
-                cameraActive ? "bg-cyan-100 text-cyan-800" : "border-slate-300 text-slate-600",
-              )}
-            >
-              {cameraActive ? "Camera Ready" : "Camera Blocked"}
-            </Badge>
-            <Badge variant="outline" className="border-slate-200 text-slate-700">
-              {pythonTrainedCount} trained / {pythonRosterCount} enrolled
-            </Badge>
-          </div>
-        </CardContent>
-      </Card>
-
-      <div className="grid flex-1 min-h-0 gap-2 xl:grid-cols-[1.65fr_0.85fr]">
-        <Card className="h-full overflow-hidden border-border/60 shadow-sm">
-          <CardContent className="flex h-full flex-col gap-2 p-3">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <h2 className="text-xl font-semibold text-foreground">Live gate camera</h2>
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                {readerConnected ? <Wifi className="size-4 text-emerald-600" /> : <WifiOff className="size-4" />}
-                <span>{readerSourceDeviceId ?? readerEndpointLabel}</span>
+              >
+                {readerConnected ? <Wifi className="size-4.5" /> : <WifiOff className="size-4.5" />}
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Reader State</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{readerConnected ? "Online" : "Offline"}</p>
               </div>
             </div>
 
-            <div className="relative flex-1 overflow-hidden rounded-[1.6rem] border border-border/60 bg-slate-950 min-h-[320px]">
-              <div ref={cameraViewportRef} className="h-full w-full overflow-hidden">
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  muted
-                  playsInline
-                  className={`h-full w-full object-cover transition-opacity duration-300 ${
-                    cameraActive ? "opacity-100" : "opacity-0"
-                  }`}
-                />
-                {!cameraActive && (
-                  <div className="absolute inset-0 flex h-full items-center justify-center px-6 text-center text-white/80">
-                    <div className="space-y-3">
-                      <Camera className="mx-auto size-8 text-white/65" />
-                      <p>{cameraError ?? "Starting the webcam preview..."}</p>
-                      {cameraError && (
-                        <Button type="button" variant="secondary" onClick={() => setCameraRetryToken((value) => value + 1)}>
-                          <RefreshCcw className="mr-2 size-4" />
-                          Retry Camera
-                        </Button>
-                      )}
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className={cn(
+                "flex h-9 w-9 items-center justify-center rounded-xl border border-border",
+                cameraActive ? "bg-primary/10 text-primary" : "bg-rose-500/10 text-rose-300",
+              )}
+              >
+                <Camera className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Camera Status</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{cameraActive ? "Live" : "Blocked"}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-sky-500/10 text-sky-300">
+                <ShieldCheck className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Gate State</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{busy ? "Verifying" : sensorWindowActive ? "Active" : "Ready"}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-violet-500/10 text-violet-300">
+                <Clock className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Last Detection</p>
+                <p className="mt-1 truncate font-mono text-base font-semibold text-foreground">{lastDetectedDisplay}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-amber-500/10 text-amber-300">
+                <Users className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">People in View</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{liveTrackedFaces.length}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-primary/10 text-primary">
+                <CheckCircle2 className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Matches Today</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{gateEventsTodayQuery.isLoading ? "--" : matchesToday}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid min-h-0 grid-cols-[minmax(0,7fr)_minmax(0,3fr)] gap-4">
+          <div className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-3">
+            <Card className="panel-card min-h-0 overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+              <CardContent className="flex h-full min-h-0 flex-col gap-2 p-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Live Gate View</p>
+                  <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                    <span className={cn("h-2 w-2 rounded-full", cameraActive ? "bg-primary" : "bg-muted-foreground/60")} />
+                    {cameraActive ? "Streaming" : "Offline"}
+                  </div>
+                </div>
+
+                <div className={cn("relative min-h-0 flex-1 overflow-hidden rounded-xl border bg-black", cameraFrameTone)}>
+                  <div ref={cameraViewportRef} className="h-full w-full overflow-hidden">
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      className={`h-full w-full object-cover transition-opacity duration-300 ${
+                        cameraActive ? "opacity-100" : "opacity-0"
+                      }`}
+                    />
+                    {!cameraActive && (
+                      <div className="absolute inset-0 flex h-full items-center justify-center px-6 text-center text-white/80">
+                        <div className="grid gap-3">
+                          <Camera className="mx-auto size-8 text-white/65" />
+                          <p>{cameraError ?? "Starting the webcam preview..."}</p>
+                          {cameraError && (
+                            <Button type="button" variant="secondary" onClick={() => setCameraRetryToken((value) => value + 1)}>
+                              <RefreshCcw className="mr-2 size-4" />
+                              Retry Camera
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    <canvas ref={canvasRef} className="hidden" />
+                  </div>
+
+                  <div className="pointer-events-none absolute inset-0">
+                    {liveTrackedFaces.map((face) => (
+                      <div
+                        key={`track-${face.trackId}`}
+                        className={cn(
+                          "absolute rounded-xl border-[3px] transition-all duration-150",
+                          face.verified || face.source === "python"
+                            ? "border-primary shadow-[0_0_0_1px_rgba(34,197,94,0.35),0_0_24px_rgba(34,197,94,0.16)]"
+                            : "border-sky-300 shadow-[0_0_0_1px_rgba(125,211,252,0.25),0_0_20px_rgba(56,189,248,0.12)]",
+                        )}
+                        style={{
+                          left: `${face.leftPct}%`,
+                          top: `${face.topPct}%`,
+                          width: `${face.widthPct}%`,
+                          height: `${face.heightPct}%`,
+                        }}
+                      >
+                        <div className="absolute left-0 top-0 max-w-[calc(100%+7rem)] -translate-y-[calc(100%+0.42rem)] rounded-full bg-black/75 px-3 py-1 text-[10px] font-semibold tracking-[0.14em] text-white shadow-lg">
+                          {face.verified || face.source === "python"
+                            ? `${face.label}${face.employeeCode ? ` ${face.employeeCode}` : ""} ${face.movement}${typeof face.confidence === "number" ? ` ${formatPercent(face.confidence)}` : ""}`
+                            : `TRACK ${String(face.trackId).padStart(2, "0")} ${face.movement}`}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {cameraActive && (
+                    <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-2 rounded-lg bg-black/60 px-3 py-2 text-xs font-semibold text-white/90">
+                      <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
+                      REC
+                    </div>
+                  )}
+
+                  <div className="pointer-events-none absolute right-2 top-2 flex items-center gap-2">
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-semibold text-white/90">{comPortLabel}</div>
+                    <div className="flex items-center gap-2 rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-semibold text-white/90">
+                      <span className={cn("h-2.5 w-2.5 rounded-full", cameraActive ? "bg-primary" : "bg-muted-foreground/60")} />
+                      Live
                     </div>
                   </div>
+
+                  <div className="pointer-events-none absolute bottom-2 left-2 flex items-center gap-2">
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">Mode: Normal</div>
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">Tags: {activeReaderTags.length}</div>
+                  </div>
+
+                  <div className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-2">
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">People: {liveTrackedFaces.length}</div>
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">Matches: {liveMatchedCount}</div>
+                  </div>
+
+                  {busy && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/42 backdrop-blur-[2px]">
+                      <div className="rounded-2xl bg-black/70 px-5 py-4 text-center text-sm text-white shadow-lg">
+                        <div className="flex items-center justify-center gap-2">
+                          <Loader2 className="size-4 animate-spin" />
+                          <span>
+                            {isCapturingFrames
+                              ? `Capturing frame ${captureProgress} / ${GATE_FRAME_COUNT}`
+                              : "Sending frames to Python verifier"}
+                          </span>
+                        </div>
+                        {isCapturingFrames && (
+                          <p className="mt-2 text-xs text-white/70">{getCaptureMessage(captureProgress)}</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {!cameraActive && cameraError && (
+                  <Alert className="rounded-xl border-amber-500/30 bg-amber-500/10">
+                    <AlertCircle className="size-4 text-amber-200" />
+                    <AlertTitle>Camera access is required</AlertTitle>
+                    <AlertDescription>{cameraError}</AlertDescription>
+                  </Alert>
                 )}
-                <canvas ref={canvasRef} className="hidden" />
-              </div>
+              </CardContent>
+            </Card>
 
-              <div className="pointer-events-none absolute inset-0">
-                {liveTrackedFaces.map((face) => (
-                  <div
-                    key={`track-${face.trackId}`}
-                    className={cn(
-                      "absolute rounded-[1.35rem] border-[3px] shadow-[0_0_0_1px_rgba(255,255,255,0.18),0_0_22px_rgba(15,23,42,0.14)] transition-all duration-150",
-                      face.verified || face.source === "python"
-                        ? "border-emerald-300 shadow-[0_0_0_1px_rgba(110,231,183,0.5),0_0_24px_rgba(16,185,129,0.2)]"
-                        : "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.45),0_0_22px_rgba(34,211,238,0.18)]",
-                    )}
-                    style={{
-                      left: `${face.leftPct}%`,
-                      top: `${face.topPct}%`,
-                      width: `${face.widthPct}%`,
-                      height: `${face.heightPct}%`,
-                    }}
-                  >
-                    <div className="absolute left-0 top-0 max-w-[calc(100%+7rem)] -translate-y-[calc(100%+0.42rem)] rounded-full bg-black/80 px-3 py-1 text-[10px] font-semibold tracking-[0.12em] text-white shadow-lg">
-                      {face.verified || face.source === "python"
-                        ? `${face.label}${face.employeeCode ? ` ${face.employeeCode}` : ""} ${face.movement}${typeof face.confidence === "number" ? ` ${formatPercent(face.confidence)}` : ""}`
-                        : `TRACK ${String(face.trackId).padStart(2, "0")} ${face.movement}`}
-                    </div>
-                  </div>
-                ))}
-                <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
-                  {liveRecognitionMode === "python"
-                    ? "FAST TRACKER + PYTHON NAMES"
-                    : liveTrackerAvailable === false
-                      ? "PYTHON LIVE RECOGNITION"
-                      : "FAST LIVE FACE TRACKER"}
+            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_140px_140px]">
+              <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                  <span className="font-semibold uppercase tracking-[0.14em]">Scan Progress</span>
+                  <span className="font-mono">{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "Idle"}</span>
+                </div>
+                <div className="mt-2">
+                  <Progress
+                    className="h-1"
+                    value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0}
+                  />
                 </div>
               </div>
 
-              {busy && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-[2px]">
-                  <div className="rounded-2xl bg-black/70 px-5 py-4 text-center text-sm text-white shadow-lg">
-                    <div className="flex items-center justify-center gap-2">
-                      <Loader2 className="size-4 animate-spin" />
-                      <span>
-                        {isCapturingFrames
-                          ? `Capturing frame ${captureProgress} / ${GATE_FRAME_COUNT}`
-                          : "Sending frames to Python verifier"}
-                      </span>
-                    </div>
-                    {isCapturingFrames && (
-                      <p className="mt-2 text-xs text-white/70">{getCaptureMessage(captureProgress)}</p>
-                    )}
-                  </div>
-                </div>
-              )}
+              <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">People</p>
+                <p className="mt-1 text-xl font-semibold text-foreground">{liveTrackedFaces.length}</p>
+              </div>
+
+              <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Matches</p>
+                <p className="mt-1 text-xl font-semibold text-foreground">{liveMatchedCount}</p>
+              </div>
             </div>
+          </div>
 
-            <div className="space-y-2 text-xs text-muted-foreground overflow-auto">
+          <Card className={cn("panel-card min-h-0 overflow-hidden rounded-xl border border-border bg-card shadow-sm", lastResultTone)}>
+            <CardContent className="flex h-full min-h-0 flex-col p-4">
               <div className="flex items-center justify-between">
-                <span>Scan progress</span>
-                <span>{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "Idle"}</span>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Current Verification</p>
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "rounded-full px-3 py-1.5",
+                    !lastResult
+                      ? "border-border bg-background/10 text-muted-foreground"
+                      : lastResult.ignored
+                        ? "border-amber-500/35 bg-amber-500/10 text-amber-200"
+                        : lastResult.success
+                          ? "border-primary/35 bg-primary/10 text-primary"
+                          : "border-rose-500/35 bg-rose-500/10 text-rose-200",
+                  )}
+                >
+                  {lastResult
+                    ? lastResult.ignored
+                      ? "Ignored"
+                      : lastResult.success
+                        ? lastResult.action ?? "Approved"
+                        : "Denied"
+                    : "Idle"}
+                </Badge>
               </div>
-              <Progress
-                className="h-1"
-                value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0}
-              />
-              <p>
-                {liveTrackerAvailable === false
-                  ? `${liveRecognitionMessage ?? "Python live recognition is active."} Faces: ${liveTrackedFaces.length}, names: ${liveMatchedCount}.`
-                  : liveRecognitionMode === "python"
-                    ? `${liveRecognitionMessage ?? "Tracking with Python names."} Tracks: ${browserTrackedFaces.length}, names: ${liveMatchedCount}.`
-                    : `${liveRecognitionMessage ?? "Tracking locally while Python samples frames."} Tracks: ${browserTrackedFaces.length}, names: ${liveMatchedCount}.`}
-              </p>
-            </div>
 
-            <div className="grid gap-2 sm:grid-cols-3">
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Detection</p>
-                <p className="mt-1 font-mono text-sm text-foreground">{lastDetectedDisplay}</p>
-              </div>
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Queue</p>
-                <p className="mt-1 text-sm text-foreground">
-                  {pendingReaderScan ? `Waiting ${pendingReaderScan.rfidUid}` : "No queued UHF tag"}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Reader Channel</p>
-                <p className="mt-1 text-sm text-foreground">{readerConnected ? `Live (${activeReaderTags.length} active)` : "Offline"}</p>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-border/60 bg-muted/15 px-3 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Active Reader Tags</p>
-                <Badge variant="outline">{activeReaderTags.length}</Badge>
-              </div>
-              {!activeReaderTags.length ? (
-                <p className="mt-2 text-sm text-muted-foreground">No active UHF tags in the read zone.</p>
-              ) : (
-                <div className="mt-2 space-y-2">
-                  {activeReaderTags.slice(0, 4).map((tag) => (
-                    <div
-                      key={tag.epc}
-                      className="flex items-center justify-between gap-3 rounded-xl border border-border/50 bg-white/80 px-3 py-2"
-                    >
-                      <p className="min-w-0 truncate font-mono text-xs text-foreground">{tag.epc}</p>
-                      <p className="shrink-0 text-[11px] text-muted-foreground">{tag.idle_seconds.toFixed(1)}s idle</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-
-        <div className="space-y-3 w-full xl:max-w-[360px] xl:justify-self-end min-h-0 overflow-auto hide-scrollbar">
-          <Card className={cn("border shadow-sm", lastResultTone)}>
-            <CardContent className="space-y-2 p-3">
-              <div className="flex items-start gap-4 md:gap-5">
-                <Avatar className="size-28 rounded-[2rem] border border-white/60 shadow-sm">
-                  <AvatarImage src={latestProfileImage ?? undefined} alt={latestEmployee?.name ?? "Latest gate preview"} />
-                  <AvatarFallback className="rounded-[2rem] bg-slate-200 text-lg font-semibold text-slate-700">
+              <div className="mt-4 flex items-center gap-4">
+                <Avatar className="size-16 rounded-full border border-border shadow-sm">
+                  <AvatarImage src={latestProfileImage ?? undefined} alt={latestEmployee?.name ?? "Current verification"} />
+                  <AvatarFallback className="rounded-full bg-background/30 text-base font-semibold text-foreground">
                     {getEmployeeInitials(latestEmployee)}
                   </AvatarFallback>
                 </Avatar>
-
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                        Latest Verification
-                      </p>
-                      <h2 className="truncate text-lg font-semibold text-foreground leading-tight">
-                        {latestEmployee?.name ?? "Waiting for the next UHF detection"}
-                      </h2>
-                      <p className="truncate text-sm text-muted-foreground">
-                        {latestEmployee
-                          ? `${latestEmployee.employeeCode} - ${latestEmployee.department}`
-                          : "Present a UHF tag or enter an EPC manually to start the Python face scan."}
-                      </p>
-                    </div>
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        "shrink-0",
-                        !lastResult
-                          ? "border-slate-300 text-slate-600"
-                          : lastResult.ignored
-                            ? "border-amber-300 bg-amber-100 text-amber-700"
-                          : lastResult.success
-                            ? "border-emerald-300 bg-emerald-100 text-emerald-700"
-                            : "border-rose-300 bg-rose-100 text-rose-700",
-                      )}
-                    >
-                      {lastResult
-                        ? lastResult.ignored
-                          ? "IGNORED"
-                          : lastResult.success
-                          ? lastResult.action ?? "MATCHED"
-                          : "REJECTED"
-                        : "IDLE"}
-                    </Badge>
+                  <p className="text-xl font-semibold text-foreground">
+                    {latestEmployee?.name ?? "Waiting for a scan"}
+                  </p>
+                  <p className="mt-1 truncate text-sm text-muted-foreground">
+                    {latestEmployee
+                      ? `${latestEmployee.employeeCode} - ${latestEmployee.department}`
+                      : "Present a badge or use Manual Trigger."}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 overflow-hidden rounded-xl border border-border bg-background/5">
+                <div className="grid grid-cols-2">
+                  <div className="border-b border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Badge ID</p>
+                    <p className="mt-2 font-mono text-sm text-foreground">
+                      {(lastResult?.badgeOwner?.rfidUid ?? normalizedRfidUid) || "--"}
+                    </p>
+                  </div>
+                  <div className="border-b border-l border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Latency</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{lastResult ? `${lastResult.latencyMs} ms` : "--"}</p>
                   </div>
 
-                  <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Badge</p>
-                      <p className="mt-1 font-mono text-foreground">
-                        {(lastResult?.badgeOwner?.rfidUid ?? normalizedRfidUid) || "--"}
-                      </p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Latency</p>
-                      <p className="mt-1 font-mono text-foreground">
-                        {lastResult ? `${lastResult.latencyMs} ms` : "--"}
-                      </p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Match</p>
-                      <p className="mt-1 font-mono text-foreground">{formatPercent(lastResult?.matchConfidence)}</p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Direction</p>
-                      <p className="mt-1 font-mono text-foreground">
-                        {lastResult?.movementDirection ?? "--"} {lastResult ? `(${formatPercent(lastResult.movementConfidence)})` : ""}
-                      </p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Verified At</p>
-                      <p className="mt-1 font-mono text-foreground">{lastResult?.verifiedAt ?? "--"}</p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Source</p>
-                      <p className="mt-1 font-mono text-foreground">{lastResult?.source ?? "--"}</p>
-                    </div>
+                  <div className="border-b border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Direction</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{lastResult?.movementDirection ?? "--"}</p>
+                  </div>
+                  <div className="border-b border-l border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Face Match</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{formatPercent(lastResult?.matchConfidence)}</p>
+                  </div>
+
+                  <div className="border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Verified At</p>
+                    <p className="mt-2 text-sm font-semibold text-foreground">{lastResult?.verifiedAt ?? "--"}</p>
+                  </div>
+                  <div className="border-l border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Source</p>
+                    <p className="mt-2 text-sm font-semibold capitalize text-foreground">{lastResult?.source ?? "--"}</p>
                   </div>
                 </div>
               </div>
 
               <Alert className={cn(
+                "mt-4 rounded-xl border",
                 !lastResult
-                  ? "border-slate-200 bg-white/75"
+                  ? "border-border bg-background/10"
                   : lastResult.ignored
-                    ? "border-amber-200 bg-amber-50"
-                  : lastResult.success
-                    ? "border-emerald-200 bg-emerald-50"
-                    : "border-rose-200 bg-rose-50",
-              )}>
+                    ? "border-amber-500/30 bg-amber-500/10"
+                    : lastResult.success
+                      ? "border-primary/30 bg-primary/10"
+                      : "border-rose-500/30 bg-rose-500/10",
+              )}
+              >
                 {lastResult ? (
                   lastResult.ignored ? (
-                    <AlertCircle className="size-4 text-amber-700" />
+                    <AlertCircle className="size-4 text-amber-200" />
                   ) : lastResult.success ? (
-                    <CheckCircle2 className="size-4 text-emerald-600" />
+                    <CheckCircle2 className="size-4 text-primary" />
                   ) : (
-                    <AlertCircle className="size-4 text-rose-600" />
+                    <AlertCircle className="size-4 text-rose-200" />
                   )
                 ) : (
-                  <ShieldCheck className="size-4 text-slate-500" />
+                  <ShieldCheck className="size-4 text-muted-foreground" />
                 )}
-                <AlertTitle>
+                <AlertTitle className="text-foreground">
                   {lastResult?.ignored
                     ? "Duplicate ignored"
                     : lastResult?.success
@@ -1542,130 +1578,83 @@ export default function GateTerminal() {
                         ? "Access denied"
                         : "Ready for next employee"}
                 </AlertTitle>
-                {lastResult?.message && (
-                  <AlertDescription>{lastResult.message}</AlertDescription>
-                )}
+                {lastResult?.message && <AlertDescription className="text-muted-foreground">{lastResult.message}</AlertDescription>}
               </Alert>
 
-              {lastResult?.matchDetails && (
-                <div className="rounded-2xl border border-border/60 bg-white/75 px-4 py-3 font-mono text-[11px] leading-6 text-muted-foreground">
-                  Primary {formatPercent(lastResult.matchDetails.primaryConfidence)} | Anchor avg {formatPercent(lastResult.matchDetails.anchorAverage)} | Stable {formatPercent(lastResult.matchDetails.liveConsistency)}
-                </div>
-              )}
-
-              {latestFaceMeta && (
-                <div className="rounded-2xl border border-border/60 bg-white/70 px-4 py-3 text-sm">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="font-medium text-foreground">Roster profile</span>
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        latestFaceMeta.status === "trained"
-                          ? "border-emerald-300 bg-emerald-100 text-emerald-700"
-                          : latestFaceMeta.status === "training"
-                            ? "border-sky-300 bg-sky-100 text-sky-700"
-                            : "border-amber-300 bg-amber-100 text-amber-700",
-                      )}
-                    >
-                      {latestFaceMeta.status}
-                    </Badge>
-                  </div>
-                  <p className="mt-2 text-muted-foreground">
-                    {latestFaceMeta.datasetSampleCount} dataset photos enrolled for this employee.
-                  </p>
-                  {latestFaceMeta.lastTrainingMessage && (
-                    <p className="mt-1 text-xs text-muted-foreground">{latestFaceMeta.lastTrainingMessage}</p>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/60 shadow-sm">
-            <CardContent className="space-y-3 p-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                  Manual Trigger
-                </p>
-                <h2 className="mt-1 text-xl font-semibold text-foreground">UHF event + face burst</h2>
-              </div>
-
-              <form className="space-y-4" onSubmit={handleManualSubmit}>
-                <div className="space-y-2">
-                  <Label htmlFor="gate-scan-technology">RFID Technology</Label>
-                  <div
-                    id="gate-scan-technology"
-                    className="flex min-h-10 items-center rounded-md border border-border/70 bg-muted/20 px-3 text-sm font-medium text-foreground"
-                  >
-                    UHF RFID continuous stream
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="gate-rfid" className="flex items-center gap-2">
-                    <KeyRound className="size-4" />
-                    RFID UID
-                  </Label>
-                  <Input
-                    id="gate-rfid"
-                    placeholder="Present a tag or type the EPC..."
-                    className="font-mono uppercase tracking-[0.2em]"
-                    value={rfidUid}
-                    onChange={(event) => setRfidUid(event.target.value.toUpperCase())}
-                    disabled={busy}
-                  />
-                </div>
-
-                {!!readerMessage && (
-                  <div className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
-                    <div className="flex items-start gap-2">
-                      <ScanLine className="mt-0.5 size-4 shrink-0" />
-                      <div className="space-y-1">
-                        <p>{readerMessage}</p>
-                        <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          Source: {readerSourceDeviceId ?? readerEndpointLabel}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                <Button
-                  type="submit"
-                  size="lg"
-                  className="w-full"
-                  disabled={busy || !normalizedRfidUid || !cameraActive}
-                >
-                  {isCapturingFrames ? (
-                    <>
-                      <Loader2 className="mr-2 size-4 animate-spin" />
-                      Capturing Frames...
-                    </>
-                  ) : scanMutation.isPending ? (
-                    <>
-                      <Loader2 className="mr-2 size-4 animate-spin" />
-                      Verifying in Python...
-                    </>
-                  ) : (
-                    <>
-                      <ArrowLeftRight className="mr-2 size-4" />
-                      Scan Badge and Verify Face
-                    </>
-                  )}
+              <div className="mt-auto pt-4">
+                <Button type="button" size="lg" className="w-full rounded-xl" onClick={handleReadyForNext}>
+                  Ready for next employee
                 </Button>
-              </form>
+              </div>
             </CardContent>
           </Card>
-
-          {!cameraActive && cameraError && (
-            <Alert className="border-amber-200 bg-amber-50">
-              <AlertCircle className="size-4 text-amber-700" />
-              <AlertTitle>Camera access is required</AlertTitle>
-              <AlertDescription>{cameraError}</AlertDescription>
-            </Alert>
-          )}
         </div>
       </div>
+
+      <Dialog open={manualTriggerOpen} onOpenChange={setManualTriggerOpen}>
+        <DialogContent className="max-w-md rounded-xl border-border bg-card p-0 text-foreground shadow-[0_30px_120px_rgba(0,0,0,0.65)]">
+          <div className="border-b border-border px-5 py-4">
+            <DialogHeader className="space-y-1 text-left">
+              <DialogTitle className="text-lg font-semibold text-foreground">Manual Trigger</DialogTitle>
+              <DialogDescription className="text-sm text-muted-foreground">
+                Enter a badge ID to run verification on demand.
+              </DialogDescription>
+            </DialogHeader>
+          </div>
+          <div className="px-5 py-5">
+            <form className="grid gap-4" onSubmit={handleManualSubmit}>
+              <div className="grid gap-2">
+                <Label htmlFor="gate-rfid" className="flex items-center gap-2">
+                  <KeyRound className="size-4" />
+                  RFID UID
+                </Label>
+                <Input
+                  id="gate-rfid"
+                  placeholder="Type badge ID"
+                  className="h-11 font-mono uppercase tracking-[0.18em]"
+                  value={rfidUid}
+                  onChange={(event) => setRfidUid(event.target.value.toUpperCase())}
+                  disabled={busy}
+                />
+              </div>
+
+              {!!readerMessage && (
+                <div className="rounded-xl border border-dashed border-border bg-background/10 px-4 py-3 text-sm text-muted-foreground">
+                  <div className="flex items-start gap-2">
+                    <ScanLine className="mt-0.5 size-4 shrink-0" />
+                    <p>{readerMessage}</p>
+                  </div>
+                </div>
+              )}
+
+              <Button
+                type="submit"
+                size="lg"
+                className="w-full rounded-xl"
+                disabled={busy || !normalizedRfidUid || !cameraActive}
+              >
+                {isCapturingFrames ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    Capturing Frames...
+                  </>
+                ) : scanMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    Verifying in Python...
+                  </>
+                ) : (
+                  <>
+                    <ArrowLeftRight className="mr-2 size-4" />
+                    Verify Badge and Face
+                  </>
+                )}
+              </Button>
+            </form>
+          </div>
+        </DialogContent>
+      </Dialog>
+
     </div>
   );
 }
