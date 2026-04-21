@@ -30,7 +30,7 @@ export function AppSidebar() {
           <Building2 className="size-4" />
         </div>
         <div className="flex min-w-0 flex-col gap-1 leading-none transition-opacity duration-200 group-data-[collapsible=icon]:hidden">
-          <span className="font-semibold tracking-tight text-sidebar-foreground">CorpGuard</span>
+          <span className="font-semibold tracking-tight text-sidebar-foreground">Syncronize</span>
           <span className="text-xs text-sidebar-foreground/60">Access Control Platform</span>
         </div>
       </SidebarHeader>

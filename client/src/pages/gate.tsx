@@ -1442,7 +1442,7 @@ export default function GateTerminal() {
               </CardContent>
             </Card>
 
-            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_140px_140px]">
+            <div className="grid gap-3 lg:grid-cols-[minmax(260px,420px)_140px_140px]">
               <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
                 <div className="flex items-center justify-between text-[11px] text-muted-foreground">
                   <span className="font-semibold uppercase tracking-[0.14em]">Scan Progress</span>
