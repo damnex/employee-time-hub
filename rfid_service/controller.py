@@ -214,9 +214,13 @@ class RFIDController:
             self._sync_runtime_state_locked()
             reader = self._require_reader()
             reader.set_power(level)
-            self._state.current_power = level
+            reader_info = reader.get_reader_info()
+            if reader_info.power != level:
+                raise RuntimeError(f"Reader reported power {reader_info.power} after setting {level}.")
+            self._reader_info = reader_info
+            self._state.current_power = reader_info.power
             self._state.last_error = None
-            LOGGER.info("Power changed to %s", level)
+            LOGGER.info("Power changed to %s", reader_info.power)
             return self.get_status()
 
     def set_mode(self, mode: str) -> dict[str, object]:
@@ -417,6 +421,7 @@ class RFIDController:
 
     def _apply_runtime_configuration_locked(self) -> None:
         reader = self._require_reader()
+        self._stop_answer_polling_locked()
         reader.set_work_mode(
             self._work_mode_for(
                 self._state.current_mode,
@@ -424,12 +429,37 @@ class RFIDController:
                 self._state.buzzer_enabled,
             )
         )
-        self._processor.set_mode(self._state.current_mode)
         reader.set_power(self._state.current_power)
+        work_mode = reader.get_work_mode()
+        reader_info = reader.get_reader_info()
+        verified_transport = self._transport_mode_from_work_mode(work_mode)
+        verified_mode = self._mode_from_work_mode(work_mode)
+        verified_buzzer = work_mode.buzzer_enabled
+        if verified_transport != self._state.transport_mode:
+            raise RuntimeError(
+                f"Reader transport verification failed: expected {self._state.transport_mode}, got {verified_transport}."
+            )
+        if verified_mode != self._state.current_mode:
+            raise RuntimeError(
+                f"Reader mode verification failed: expected {self._state.current_mode}, got {verified_mode}."
+            )
+        if verified_buzzer != self._state.buzzer_enabled:
+            raise RuntimeError(
+                f"Reader buzzer verification failed: expected {self._state.buzzer_enabled}, got {verified_buzzer}."
+            )
+        if reader_info.power != self._state.current_power:
+            raise RuntimeError(
+                f"Reader power verification failed: expected {self._state.current_power}, got {reader_info.power}."
+            )
+
+        self._state.transport_mode = verified_transport
+        self._state.current_mode = verified_mode
+        self._state.buzzer_enabled = verified_buzzer
+        self._state.current_power = reader_info.power
+        self._reader_info = reader_info
+        self._processor.set_mode(self._state.current_mode)
         if self._state.transport_mode == "answer" and self._state.running:
             self._ensure_answer_polling_locked()
-        else:
-            self._stop_answer_polling_locked()
         self._needs_runtime_sync = False
         LOGGER.info(
             "Reader runtime synchronized: mode=%s transport=%s buzzer=%s power=%s",

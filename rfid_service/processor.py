@@ -45,15 +45,18 @@ class TagProcessor:
         registration_stable_hits: int = 5,
         registration_window_seconds: float = 1.5,
         registration_gap_seconds: float = 1.0,
+        duplicate_suppression_seconds: float = 0.2,
         recent_history_limit: int = 100,
     ) -> None:
         self.exit_timeout_seconds = exit_timeout_seconds
         self.registration_stable_hits = registration_stable_hits
         self.registration_window_seconds = registration_window_seconds
         self.registration_gap_seconds = registration_gap_seconds
+        self.duplicate_suppression_seconds = duplicate_suppression_seconds
         self._recent_observations: deque[TagObservation] = deque(maxlen=recent_history_limit)
         self._registration_observations: deque[tuple[str, float]] = deque()
         self.last_seen: dict[str, float] = {}
+        self._last_processed_seen: dict[str, float] = {}
         self.active_tags: dict[str, ActiveTagState] = {}
         self.registration = RegistrationState(stable_threshold=registration_stable_hits)
         self.last_detected_tag: str | None = None
@@ -105,6 +108,14 @@ class TagProcessor:
             self.last_detected_at = now
             self.last_packet_hex = raw_hex
             for tag in unique_tags:
+                previous_processed_at = self._last_processed_seen.get(tag)
+                if (
+                    previous_processed_at is not None
+                    and (now - previous_processed_at) < self.duplicate_suppression_seconds
+                ):
+                    continue
+
+                self._last_processed_seen[tag] = now
                 self.last_seen[tag] = now
                 active_state = self.active_tags.get(tag)
                 if active_state is None:
@@ -125,6 +136,7 @@ class TagProcessor:
                 LOGGER.info("EXIT %s (%s)", active_state.epc, reason)
             self.active_tags.clear()
             self.last_seen.clear()
+            self._last_processed_seen.clear()
 
     def get_recent_tags(self, limit: int = 20) -> list[dict[str, object]]:
         with self._lock:

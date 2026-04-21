@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import os
+import json
 import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +69,8 @@ class FaceRecognitionService:
         min_face_box_size = int(os.getenv("FACE_MIN_BOX_SIZE", "40"))
         min_face_score = float(os.getenv("FACE_MIN_SCORE", "0.45"))
         self._recognize_every_n_frames = max(1, int(os.getenv("FACE_RECOGNIZE_EVERY_N_FRAMES", "5")))
+        self._unknown_log_path = Path(os.getenv("FACE_UNKNOWN_LOG_PATH", "face_service/data/unknown_faces.jsonl"))
+        self._unknown_log_path.parent.mkdir(parents=True, exist_ok=True)
         self._database = FaceDatabase(
             FaceDatabaseConfig(
                 path=os.getenv("FACE_DB_PATH", "face_service/data/faces.json"),
@@ -90,6 +94,7 @@ class FaceRecognitionService:
         self._matcher = FaceMatcher(similarity_threshold=similarity_threshold)
         self._cache_lock = threading.Lock()
         self._track_cache: dict[str, TrackCacheEntry] = {}
+        self._unknown_log_lock = threading.Lock()
 
     def get_status(self) -> dict[str, object]:
         return {
@@ -153,6 +158,8 @@ class FaceRecognitionService:
         }
 
     def recognize(self, request: RecognizeRequest) -> dict[str, object]:
+        now_utc = datetime.now(UTC)
+        timestamp_ms = int(now_utc.timestamp() * 1000)
         frame = decode_image(request.frame)
         tracks = [
             TrackedPersonInput(track_id=track.track_id, bbox=tuple(int(value) for value in track.bbox))
@@ -190,7 +197,11 @@ class FaceRecognitionService:
                 results.append(self._strip_internal_fields(result))
                 continue
 
-            match = self._matcher.match(detection.embedding, employees)
+            match = self._matcher.match(
+                detection.embedding,
+                employees,
+                face_score=detection.face_score,
+            )
             result = {
                 "track_id": track.track_id,
                 "bbox": list(track.bbox),
@@ -200,14 +211,24 @@ class FaceRecognitionService:
                 "rfid_tag": match.rfid_tag,
                 "confidence": match.confidence,
                 "similarity": match.similarity,
+                "threshold": match.threshold,
+                "face_score": round(detection.face_score, 4),
                 "matched": match.matched,
                 "last_recognized_frame": request.frame_index,
             }
+            if not match.matched:
+                self._log_unknown_face(
+                    stream_id=request.stream_id,
+                    track_id=track.track_id,
+                    frame_index=request.frame_index,
+                    result=result,
+                )
             self._store_cached_result(request.stream_id, track.track_id, request.frame_index, result)
             results.append(self._strip_internal_fields(result))
 
         return {
-            "timestamp": datetime.now(UTC).isoformat(),
+            "timestamp": now_utc.isoformat(),
+            "timestamp_ms": timestamp_ms,
             "stream_id": request.stream_id,
             "tracks": results,
         }
@@ -241,6 +262,36 @@ class FaceRecognitionService:
         output = dict(result)
         output.pop("last_recognized_frame", None)
         return output
+
+    def _log_unknown_face(
+        self,
+        *,
+        stream_id: str,
+        track_id: int,
+        frame_index: int,
+        result: dict[str, object],
+    ) -> None:
+        record = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "stream_id": stream_id,
+            "track_id": track_id,
+            "frame_index": frame_index,
+            "similarity": result.get("similarity"),
+            "threshold": result.get("threshold"),
+            "confidence": result.get("confidence"),
+            "face_score": result.get("face_score"),
+            "face_bbox": result.get("face_bbox"),
+        }
+        with self._unknown_log_lock:
+            with self._unknown_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+        LOGGER.info(
+            "Unknown face logged for stream=%s track=%s similarity=%s threshold=%s",
+            stream_id,
+            track_id,
+            record["similarity"],
+            record["threshold"],
+        )
 
 
 service = FaceRecognitionService()

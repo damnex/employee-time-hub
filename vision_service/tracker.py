@@ -37,10 +37,12 @@ class VisionServiceConfig:
     max_det: int = 100
     device: str | int | None = None
     half: bool | None = None
+    max_processing_fps: float = 25.0
     line_position_fraction: float = 0.5
-    line_deadband_px: int = 16
+    line_deadband_px: int = 32
     direction_cooldown_ms: int = 1500
     state_ttl_ms: int = 5000
+    stable_track_min_frames: int = 10
     show_debug: bool = False
     debug_window_name: str = "vision-service"
 
@@ -56,6 +58,8 @@ class VisionStatus:
     frame_width: int = 0
     frame_height: int = 0
     line_x: int = 0
+    entry_zone_max_x: int = 0
+    exit_zone_min_x: int = 0
     fps: float = 0.0
     inference_ms: float = 0.0
     detected_people: int = 0
@@ -105,10 +109,12 @@ def build_config_from_env() -> VisionServiceConfig:
         max_det=int(os.getenv("VISION_MAX_DET", "100")),
         device=os.getenv("VISION_DEVICE"),
         half=_parse_bool(os.getenv("VISION_HALF"), default=False) if os.getenv("VISION_HALF") is not None else None,
+        max_processing_fps=float(os.getenv("VISION_MAX_PROCESS_FPS", "25")),
         line_position_fraction=float(os.getenv("VISION_LINE_POSITION_FRACTION", "0.5")),
-        line_deadband_px=int(os.getenv("VISION_LINE_DEADBAND_PX", "16")),
+        line_deadband_px=int(os.getenv("VISION_LINE_DEADBAND_PX", "32")),
         direction_cooldown_ms=int(os.getenv("VISION_DIRECTION_COOLDOWN_MS", "1500")),
         state_ttl_ms=int(os.getenv("VISION_STATE_TTL_MS", "5000")),
+        stable_track_min_frames=int(os.getenv("VISION_STABLE_TRACK_MIN_FRAMES", "10")),
         show_debug=_parse_bool(os.getenv("VISION_SHOW_DEBUG"), default=False),
         debug_window_name=os.getenv("VISION_DEBUG_WINDOW_NAME", "vision-service"),
     )
@@ -135,6 +141,7 @@ class VisionService:
                 deadband_px=config.line_deadband_px,
                 event_cooldown_ms=config.direction_cooldown_ms,
                 state_ttl_ms=config.state_ttl_ms,
+                stable_track_min_frames=config.stable_track_min_frames,
             )
         )
         self._lock = threading.Lock()
@@ -154,6 +161,7 @@ class VisionService:
             debug_window=config.show_debug,
         )
         self._last_processed_at = 0.0
+        self._last_processing_started_at = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -245,25 +253,29 @@ class VisionService:
                     self._ready.clear()
                     break
 
-                timestamp_ms = int(time.time() * 1000)
-                timestamp_iso = datetime.now(UTC).isoformat()
+                now_utc = datetime.now(UTC)
+                timestamp_ms = int(now_utc.timestamp() * 1000)
+                timestamp_iso = now_utc.isoformat()
+                self._limit_processing_rate()
                 inference_started = time.perf_counter()
 
                 try:
                     assert self._detector is not None
                     detections, tracks = self._detector.detect_and_track(frame)
                     inference_ms = round((time.perf_counter() - inference_started) * 1000, 2)
-                    line_x, direction_map = self._direction_engine.update(tracks, frame.shape[1], timestamp_ms)
-                    payload = self._build_payload(timestamp_iso, tracks, direction_map)
+                    direction_update = self._direction_engine.update(tracks, frame.shape[1], timestamp_ms)
+                    payload = self._build_payload(timestamp_iso, timestamp_ms, tracks, direction_update)
 
                     if self._config.show_debug:
-                        self._show_debug_frame(frame, tracks, direction_map, line_x)
+                        self._show_debug_frame(frame, tracks, direction_update)
 
                     self._update_metrics(
                         timestamp_iso=timestamp_iso,
                         frame_width=int(frame.shape[1]),
                         frame_height=int(frame.shape[0]),
-                        line_x=line_x,
+                        line_x=direction_update.line_x,
+                        entry_zone_max_x=direction_update.entry_zone_max_x,
+                        exit_zone_min_x=direction_update.exit_zone_min_x,
                         detected_people=len(detections),
                         tracked_people=len(tracks),
                         inference_ms=inference_ms,
@@ -291,6 +303,8 @@ class VisionService:
         frame_width: int,
         frame_height: int,
         line_x: int,
+        entry_zone_max_x: int,
+        exit_zone_min_x: int,
         detected_people: int,
         tracked_people: int,
         inference_ms: float,
@@ -311,6 +325,8 @@ class VisionService:
             self._status.frame_width = frame_width
             self._status.frame_height = frame_height
             self._status.line_x = line_x
+            self._status.entry_zone_max_x = entry_zone_max_x
+            self._status.exit_zone_min_x = exit_zone_min_x
             self._status.detected_people = detected_people
             self._status.tracked_people = tracked_people
             self._status.inference_ms = inference_ms
@@ -323,18 +339,23 @@ class VisionService:
     def _build_payload(
         self,
         timestamp_iso: str,
+        timestamp_ms: int,
         tracks: list[TrackedPerson],
-        direction_map: dict[int, str | None],
+        direction_update,
     ) -> dict[str, object]:
         return {
             "timestamp": timestamp_iso,
+            "timestamp_ms": timestamp_ms,
             "tracks": [
                 {
                     "track_id": track.track_id,
                     "bbox": list(track.bbox),
                     "center": list(track.center),
                     "confidence": track.confidence,
-                    "direction": direction_map.get(track.track_id),
+                    "direction": direction_update.decisions.get(track.track_id).direction,
+                    "zone": direction_update.decisions.get(track.track_id).zone,
+                    "age_frames": direction_update.decisions.get(track.track_id).age_frames,
+                    "stable": direction_update.decisions.get(track.track_id).stable,
                 }
                 for track in tracks
             ],
@@ -344,19 +365,44 @@ class VisionService:
         self,
         frame: np.ndarray,
         tracks: list[TrackedPerson],
-        direction_map: dict[int, str | None],
-        line_x: int,
+        direction_update,
     ) -> None:
         annotated = frame.copy()
-        cv2.line(annotated, (line_x, 0), (line_x, annotated.shape[0]), (0, 255, 255), 2)
+        cv2.line(
+            annotated,
+            (direction_update.entry_zone_max_x, 0),
+            (direction_update.entry_zone_max_x, annotated.shape[0]),
+            (0, 180, 255),
+            2,
+        )
+        cv2.line(
+            annotated,
+            (direction_update.exit_zone_min_x, 0),
+            (direction_update.exit_zone_min_x, annotated.shape[0]),
+            (0, 180, 255),
+            2,
+        )
+        cv2.rectangle(
+            annotated,
+            (direction_update.entry_zone_max_x, 0),
+            (direction_update.exit_zone_min_x, annotated.shape[0]),
+            (255, 220, 120),
+            1,
+        )
         for track in tracks:
             x1, y1, x2, y2 = track.bbox
-            direction = direction_map.get(track.track_id)
+            decision = direction_update.decisions.get(track.track_id)
+            direction = decision.direction if decision else None
+            zone = decision.zone if decision else "buffer"
+            stable = decision.stable if decision else False
+            age_frames = decision.age_frames if decision else 0
             color = (0, 200, 0) if direction == "ENTRY" else (0, 0, 220) if direction == "EXIT" else (255, 170, 0)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            label = f"#{track.track_id} {track.confidence:.2f}"
+            label = f"#{track.track_id} {track.confidence:.2f} {zone} f={age_frames}"
             if direction:
                 label = f"{label} {direction}"
+            if not stable:
+                label = f"{label} warmup"
             cv2.putText(
                 annotated,
                 label,
@@ -377,6 +423,19 @@ class VisionService:
             self._config.show_debug = False
             with self._lock:
                 self._status.debug_window = False
+
+    def _limit_processing_rate(self) -> None:
+        if self._config.max_processing_fps <= 0:
+            return
+
+        min_interval = 1.0 / self._config.max_processing_fps
+        now = time.perf_counter()
+        if self._last_processing_started_at > 0:
+            remaining = min_interval - (now - self._last_processing_started_at)
+            if remaining > 0:
+                time.sleep(remaining)
+                now = time.perf_counter()
+        self._last_processing_started_at = now
 
     def _release_capture(self) -> None:
         capture = self._capture

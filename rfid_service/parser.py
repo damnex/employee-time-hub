@@ -10,7 +10,7 @@ INVENTORY_RESPONSE = 0x01
 INVENTORY_SINGLE_RESPONSE = 0x0F
 SUCCESS_STATUSES = {0x00, 0x01, 0x02, 0x03, 0x04}
 MIN_EPC_BYTES = 4
-MAX_EPC_BYTES = 30
+MAX_EPC_BYTES = 4
 MIN_EPC_HEX_LENGTH = MIN_EPC_BYTES * 2
 MAX_EPC_HEX_LENGTH = MAX_EPC_BYTES * 2
 
@@ -58,6 +58,8 @@ def build_command_frame(address: int, command: int, payload: bytes = b"") -> byt
 def decode_packet(raw_packet: bytes) -> ReaderPacket:
     if not verify_packet_crc(raw_packet):
         raise ValueError("Packet CRC mismatch.")
+    if len(raw_packet) != raw_packet[0] + 1:
+        raise ValueError("Packet length byte does not match the raw packet size.")
     length = raw_packet[0]
     payload = raw_packet[1:-2]
     if len(payload) < 3:
@@ -77,6 +79,8 @@ def is_valid_epc(epc: str) -> bool:
         return False
     if len(epc) % 2 != 0:
         return False
+    if not epc.startswith("E2"):
+        return False
     return all(character in "0123456789ABCDEF" for character in epc)
 
 
@@ -89,60 +93,63 @@ def _normalize_epc(candidate: bytes) -> str | None:
     return epc
 
 
-def _parse_declared_epcs(payload: bytes, *, starts_with_count: bool) -> list[str]:
+def _parse_declared_epcs(payload: bytes, *, starts_with_count: bool) -> list[str] | None:
     tags: list[str] = []
     seen: set[str] = set()
-    cursor = 1 if starts_with_count and payload else 0
+    cursor = 0
+    expected_count: int | None = None
+
+    if starts_with_count:
+      if not payload:
+          return None
+      expected_count = payload[0]
+      cursor = 1
 
     while cursor < len(payload):
         epc_length = payload[cursor]
         cursor += 1
         if epc_length <= 0:
-            continue
+            return None
         if cursor + epc_length > len(payload):
-            break
+            return None
 
         candidate = _normalize_epc(payload[cursor:cursor + epc_length])
         cursor += epc_length
-        if candidate and candidate not in seen:
+        if not candidate:
+            return None
+        if candidate not in seen:
             seen.add(candidate)
             tags.append(candidate)
 
-    return tags
-
-
-def _scan_for_embedded_epcs(payload: bytes) -> list[str]:
-    tags: list[str] = []
-    seen: set[str] = set()
-    cursor = 0
-
-    while cursor < len(payload):
-        declared_length = payload[cursor]
-        if declared_length < MIN_EPC_BYTES or declared_length > MAX_EPC_BYTES:
-            cursor += 1
-            continue
-
-        start = cursor + 1
-        end = start + declared_length
-        if end > len(payload):
-            cursor += 1
-            continue
-
-        candidate = _normalize_epc(payload[start:end])
-        if candidate and candidate not in seen:
-            seen.add(candidate)
-            tags.append(candidate)
-            cursor = end
-            continue
-
-        cursor += 1
+    if cursor != len(payload):
+        return None
+    if expected_count is not None and expected_count != len(tags):
+        return None
 
     return tags
 
-
-def _parse_direct_epc(payload: bytes) -> list[str]:
+def _parse_direct_epc(payload: bytes) -> list[str] | None:
     candidate = _normalize_epc(payload)
-    return [candidate] if candidate else []
+    return [candidate] if candidate else None
+
+
+def _has_valid_packet_structure(packet: ReaderPacket) -> bool:
+    if packet.response_code == SPONTANEOUS_TAG_RESPONSE:
+        if len(packet.data) == MIN_EPC_BYTES:
+            return True
+        return (
+            _parse_declared_epcs(packet.data, starts_with_count=True) is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=False) is not None
+        )
+
+    if packet.response_code in {INVENTORY_RESPONSE, INVENTORY_SINGLE_RESPONSE}:
+        return (
+            _parse_declared_epcs(packet.data, starts_with_count=True) is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=False) is not None
+            or _parse_direct_epc(packet.data) is not None
+        )
+
+    return False
 
 
 def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
@@ -152,17 +159,19 @@ def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
     if packet.response_code not in {INVENTORY_RESPONSE, INVENTORY_SINGLE_RESPONSE, SPONTANEOUS_TAG_RESPONSE}:
         return []
 
+    if not _has_valid_packet_structure(packet):
+        return []
+
     if packet.response_code == SPONTANEOUS_TAG_RESPONSE:
         parsers = [
             lambda: _parse_direct_epc(packet.data),
-            lambda: _scan_for_embedded_epcs(packet.data),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
             lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
         ]
     else:
         parsers = [
             lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
             lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
-            lambda: _scan_for_embedded_epcs(packet.data),
             lambda: _parse_direct_epc(packet.data),
         ]
 

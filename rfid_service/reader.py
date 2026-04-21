@@ -4,6 +4,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -245,6 +246,7 @@ class SerialRFIDReader:
         self._command_lock = threading.Lock()
         self._pending_response_code: int | None = None
         self._pending_response_queue: queue.Queue[ReaderPacket] | None = None
+        self._recent_packet_cache: deque[tuple[bytes, float]] = deque(maxlen=16)
 
     @property
     def config(self) -> ReaderConfig:
@@ -316,6 +318,8 @@ class SerialRFIDReader:
         response_queue: queue.Queue[ReaderPacket] = queue.Queue(maxsize=1)
         effective_timeout = timeout or self._config.command_timeout
 
+        # All host-issued commands flow through a single lock so polling,
+        # configuration writes, and manual commands cannot overlap on the wire.
         with self._command_lock:
             self._pending_response_code = command
             self._pending_response_queue = response_queue
@@ -430,6 +434,12 @@ class SerialRFIDReader:
         return packets
 
     def _dispatch_packet(self, packet: ReaderPacket) -> None:
+        now = time.monotonic()
+        for cached_raw, cached_at in list(self._recent_packet_cache):
+            if packet.raw == cached_raw and (now - cached_at) <= 0.075:
+                return
+        self._recent_packet_cache.append((packet.raw, now))
+
         if self._pending_response_code is not None and packet.response_code == self._pending_response_code:
             response_queue = self._pending_response_queue
             if response_queue is not None:

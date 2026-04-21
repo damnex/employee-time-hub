@@ -33,8 +33,8 @@ interface RejectedEvent {
   score: number;
 }
 
-const SCORE_THRESHOLD = 80;
-const DUPLICATE_COOLDOWN_MS = 4000;
+const SCORE_THRESHOLD = 70;
+const DUPLICATE_COOLDOWN_MS = 5000;
 
 function toIso(timestampMs: number) {
   return new Date(timestampMs).toISOString();
@@ -53,14 +53,19 @@ function normalizeDirection(direction?: string | null): MovementDirection {
 
 export class DecisionEngine {
   private readonly matchingEngine = new MatchingEngine({
-    matchWindowMs: Number(process.env.INTEGRATION_MATCH_WINDOW_MS ?? "1000"),
+    matchWindowMs: Number(process.env.INTEGRATION_MATCH_WINDOW_MS ?? "1500"),
+    minBufferMs: Number(process.env.INTEGRATION_MIN_BUFFER_MS ?? "250"),
     pendingTtlMs: Number(process.env.INTEGRATION_PENDING_TTL_MS ?? "2000"),
-    faceTtlMs: Number(process.env.INTEGRATION_FACE_TTL_MS ?? "1500"),
-    visionTtlMs: Number(process.env.INTEGRATION_VISION_TTL_MS ?? "1500"),
+    faceTtlMs: Number(process.env.INTEGRATION_FACE_TTL_MS ?? "2000"),
+    visionTtlMs: Number(process.env.INTEGRATION_VISION_TTL_MS ?? "2000"),
+    trackCooldownMs: Number(process.env.INTEGRATION_TRACK_COOLDOWN_MS ?? "1500"),
+    minStableTrackAgeFrames: Number(process.env.INTEGRATION_MIN_STABLE_TRACK_FRAMES ?? "10"),
+    entryZoneMaxFraction: Number(process.env.INTEGRATION_ENTRY_ZONE_MAX ?? "0.4"),
+    exitZoneMinFraction: Number(process.env.INTEGRATION_EXIT_ZONE_MIN ?? "0.6"),
     gateAnchorXFraction: Number(process.env.INTEGRATION_GATE_ANCHOR_X ?? "0.5"),
     gateAnchorYFraction: Number(process.env.INTEGRATION_GATE_ANCHOR_Y ?? "0.5"),
   });
-  private readonly lastEventByTagDirection = new Map<string, number>();
+  private readonly lastEventByTag = new Map<string, number>();
   private readonly finalizedEvents: FinalEvent[] = [];
   private readonly rejectedEvents: RejectedEvent[] = [];
 
@@ -126,6 +131,7 @@ export class DecisionEngine {
   private async resolvePending(deviceId: string) {
     const resolved: FinalEvent[] = [];
     const pending = this.matchingEngine.getPendingRfid(deviceId);
+    const nowMs = Date.now();
 
     for (const rfid of pending) {
       const employee = await storage.getEmployeeByRfid(rfid.rfidTag);
@@ -135,9 +141,13 @@ export class DecisionEngine {
           deviceId: rfid.deviceId,
           timestamp: toIso(rfid.timestampMs),
           reason: "Unknown RFID tag.",
-          score: 40,
+          score: 50,
         });
         this.matchingEngine.consumeRfid(rfid.id);
+        continue;
+      }
+
+      if (!this.matchingEngine.isReadyToResolve(rfid, nowMs)) {
         continue;
       }
 
@@ -149,10 +159,24 @@ export class DecisionEngine {
       });
 
       if (!candidate) {
+        if (this.matchingEngine.hasExpired(rfid, nowMs)) {
+          this.rejectedEvents.unshift({
+            rfidTag: rfid.rfidTag,
+            deviceId: rfid.deviceId,
+            timestamp: toIso(rfid.timestampMs),
+            reason: "No stable vision candidate reached the matching window in time.",
+            score: 50,
+          });
+          this.matchingEngine.consumeRfid(rfid.id);
+        }
         continue;
       }
 
       if (candidate.score < SCORE_THRESHOLD) {
+        if (this.matchingEngine.hasExpired(rfid, nowMs)) {
+          this.pushRejected(candidate, "Candidate evidence stayed below the required score before the match window expired.");
+          this.matchingEngine.consumeRfid(rfid.id);
+        }
         continue;
       }
 
@@ -167,16 +191,16 @@ export class DecisionEngine {
   }
 
   private async finalizeCandidate(employee: Employee, candidate: CandidateMatch) {
-    const direction = normalizeDirection(candidate.track.direction);
+    const direction = normalizeDirection(candidate.resolvedDirection);
     if (direction !== "ENTRY" && direction !== "EXIT") {
       this.pushRejected(candidate, "Direction was not valid.");
       return null;
     }
 
-    const duplicateKey = `${candidate.rfid.rfidTag}:${direction}`;
-    const duplicateAt = this.lastEventByTagDirection.get(duplicateKey);
+    const duplicateKey = candidate.rfid.rfidTag;
+    const duplicateAt = this.lastEventByTag.get(duplicateKey);
     if (duplicateAt && (candidate.rfid.timestampMs - duplicateAt) < DUPLICATE_COOLDOWN_MS) {
-      this.pushRejected(candidate, `Duplicate ${direction} blocked by cooldown.`);
+      this.pushRejected(candidate, `Duplicate tag ${candidate.rfid.rfidTag} blocked by cooldown.`);
       return null;
     }
 
@@ -197,7 +221,9 @@ export class DecisionEngine {
       scanTechnology: candidate.rfid.scanTechnology,
       decision: direction as GateDecision,
       verificationStatus: direction,
-      eventMessage: `${direction} validated by RFID + face + direction fusion.`,
+      eventMessage: candidate.faceMatched
+        ? `${direction} validated by RFID + direction with face confirmation.`
+        : `${direction} validated by RFID + direction with face optional.`,
       movementDirection: direction,
       movementAxis: "horizontal",
       movementConfidence: 1,
@@ -207,7 +233,8 @@ export class DecisionEngine {
       faceCaptureMode: null,
     });
 
-    this.lastEventByTagDirection.set(duplicateKey, candidate.rfid.timestampMs);
+    this.lastEventByTag.set(duplicateKey, candidate.rfid.timestampMs);
+    this.matchingEngine.reserveTrack(candidate.track.deviceId, candidate.track.trackId, candidate.rfid.timestampMs);
 
     const event: FinalEvent = {
       name: employee.name,

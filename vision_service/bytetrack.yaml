@@ -3,9 +3,9 @@
 # Local copy of the official ByteTrack defaults so the service keeps a stable
 # tracker configuration even if the Python environment changes.
 tracker_type: bytetrack
-track_high_thresh: 0.25
+track_high_thresh: 0.50
 track_low_thresh: 0.10
-new_track_thresh: 0.25
+new_track_thresh: 0.50
 track_buffer: 30
 match_thresh: 0.80
 fuse_score: true
