@@ -44,6 +44,10 @@ class SetTransportModeRequest(BaseModel):
     mode: str = Field(min_length=1)
 
 
+class SetBuzzerRequest(BaseModel):
+    enabled: bool
+
+
 class DetectPortRequest(BaseModel):
     baudrate: int = Field(default=57600, ge=1200, le=921600)
     debug_raw: bool = False
@@ -114,6 +118,14 @@ def set_mode(payload: SetModeRequest) -> dict[str, object]:
 def set_transport_mode(payload: SetTransportModeRequest) -> dict[str, object]:
     try:
         return controller.set_transport_mode(payload.mode)
+    except Exception as exc:  # noqa: BLE001
+        raise _service_error(exc) from exc
+
+
+@app.post("/set-buzzer")
+def set_buzzer(payload: SetBuzzerRequest) -> dict[str, object]:
+    try:
+        return controller.set_buzzer(payload.enabled)
     except Exception as exc:  # noqa: BLE001
         raise _service_error(exc) from exc
 

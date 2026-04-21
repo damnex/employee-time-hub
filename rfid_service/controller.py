@@ -35,6 +35,7 @@ class ControllerState:
     running: bool = False
     current_mode: str = "normal"
     transport_mode: str = "scan"
+    buzzer_enabled: bool = False
     current_power: int = 30
     debug_raw: bool = False
     last_error: str | None = None
@@ -245,6 +246,15 @@ class RFIDController:
             LOGGER.info("Transport mode changed to %s.", normalized_mode)
             return self.get_status()
 
+    def set_buzzer(self, enabled: bool) -> dict[str, object]:
+        with self._lock:
+            self._state.buzzer_enabled = enabled
+            self._state.last_error = None
+            if self._state.connected:
+                self._apply_runtime_configuration_locked()
+            LOGGER.info("Buzzer changed to %s.", "enabled" if enabled else "disabled")
+            return self.get_status()
+
     def get_tags(self) -> dict[str, object]:
         with self._lock:
             self._sync_runtime_state_locked()
@@ -353,6 +363,7 @@ class RFIDController:
                 work_mode = reader.get_work_mode()
                 self._state.transport_mode = self._transport_mode_from_work_mode(work_mode)
                 self._state.current_mode = self._mode_from_work_mode(work_mode)
+                self._state.buzzer_enabled = work_mode.buzzer_enabled
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Unable to read work mode during startup: %s", exc)
 
@@ -384,12 +395,15 @@ class RFIDController:
             LOGGER.warning("RFID auto-detect failed: %s", exc)
             return None
 
-    def _work_mode_for(self, mode: str, transport_mode: str) -> WorkModeConfig:
+    def _work_mode_for(self, mode: str, transport_mode: str, buzzer_enabled: bool) -> WorkModeConfig:
         if transport_mode == "answer":
-            return WorkModeConfig.answer_mode(mem_inven=0x05 if mode == "registration" else 0x04)
+            return WorkModeConfig.answer_mode(
+                mem_inven=0x05 if mode == "registration" else 0x04,
+                buzzer_enabled=buzzer_enabled,
+            )
         if mode == "registration":
-            return WorkModeConfig.registration_scan()
-        return WorkModeConfig.normal_scan()
+            return WorkModeConfig.registration_scan(buzzer_enabled=buzzer_enabled)
+        return WorkModeConfig.normal_scan(buzzer_enabled=buzzer_enabled)
 
     def _transport_mode_from_work_mode(self, mode: WorkModeConfig) -> str:
         if mode.read_mode == 0x00:
@@ -403,7 +417,13 @@ class RFIDController:
 
     def _apply_runtime_configuration_locked(self) -> None:
         reader = self._require_reader()
-        reader.set_work_mode(self._work_mode_for(self._state.current_mode, self._state.transport_mode))
+        reader.set_work_mode(
+            self._work_mode_for(
+                self._state.current_mode,
+                self._state.transport_mode,
+                self._state.buzzer_enabled,
+            )
+        )
         self._processor.set_mode(self._state.current_mode)
         reader.set_power(self._state.current_power)
         if self._state.transport_mode == "answer" and self._state.running:
@@ -412,9 +432,10 @@ class RFIDController:
             self._stop_answer_polling_locked()
         self._needs_runtime_sync = False
         LOGGER.info(
-            "Reader runtime synchronized: mode=%s transport=%s power=%s",
+            "Reader runtime synchronized: mode=%s transport=%s buzzer=%s power=%s",
             self._state.current_mode,
             self._state.transport_mode,
+            "enabled" if self._state.buzzer_enabled else "disabled",
             self._state.current_power,
         )
 

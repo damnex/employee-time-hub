@@ -86,20 +86,43 @@ class WorkModeConfig:
             ]
         )
 
+    @property
+    def buzzer_enabled(self) -> bool:
+        # Mode_state bit2: 0 = buzzer on, 1 = buzzer off.
+        return (self.mode_state & 0x04) == 0
+
     @classmethod
-    def answer_mode(cls, *, mem_inven: int = 0x04) -> "WorkModeConfig":
+    def answer_mode(cls, *, mem_inven: int = 0x04, buzzer_enabled: bool = False) -> "WorkModeConfig":
         # Answer Mode keeps the host in control of inventory polling.
-        return cls(read_mode=0x00, mode_state=0x06, mem_inven=mem_inven, word_num=0x06, tag_time=0x00)
+        return cls(
+            read_mode=0x00,
+            mode_state=0x02 if buzzer_enabled else 0x06,
+            mem_inven=mem_inven,
+            word_num=0x06,
+            tag_time=0x00,
+        )
 
     @classmethod
-    def normal_scan(cls) -> "WorkModeConfig":
-        # Scan Mode + RS232 output + no buzzer + inventory multiple.
-        return cls(read_mode=0x01, mode_state=0x06, mem_inven=0x04, word_num=0x06, tag_time=0x00)
+    def normal_scan(cls, *, buzzer_enabled: bool = False) -> "WorkModeConfig":
+        # Scan Mode + RS232 output + inventory multiple, with buzzer controlled by mode_state bit2.
+        return cls(
+            read_mode=0x01,
+            mode_state=0x02 if buzzer_enabled else 0x06,
+            mem_inven=0x04,
+            word_num=0x06,
+            tag_time=0x00,
+        )
 
     @classmethod
-    def registration_scan(cls) -> "WorkModeConfig":
-        # Scan Mode + RS232 output + no buzzer + inventory single.
-        return cls(read_mode=0x01, mode_state=0x06, mem_inven=0x05, word_num=0x06, tag_time=0x00)
+    def registration_scan(cls, *, buzzer_enabled: bool = False) -> "WorkModeConfig":
+        # Scan Mode + RS232 output + inventory single, with buzzer controlled by mode_state bit2.
+        return cls(
+            read_mode=0x01,
+            mode_state=0x02 if buzzer_enabled else 0x06,
+            mem_inven=0x05,
+            word_num=0x06,
+            tag_time=0x00,
+        )
 
     @classmethod
     def from_response(cls, payload: bytes) -> "WorkModeConfig":

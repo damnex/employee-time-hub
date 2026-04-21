@@ -33,6 +33,7 @@ export interface RfidStatus {
   running: boolean;
   current_mode: RfidMode;
   transport_mode: RfidTransportMode;
+  buzzer_enabled: boolean;
   current_power: number;
   debug_raw: boolean;
   last_error: string | null;
@@ -172,5 +173,10 @@ export async function setRfidMode(mode: RfidMode) {
 
 export async function setRfidTransportMode(mode: RfidTransportMode) {
   const response = await apiRequest("POST", "/api/rfid/set-transport-mode", { mode });
+  return response.json() as Promise<RfidStatus>;
+}
+
+export async function setRfidBuzzer(enabled: boolean) {
+  const response = await apiRequest("POST", "/api/rfid/set-buzzer", { enabled });
   return response.json() as Promise<RfidStatus>;
 }

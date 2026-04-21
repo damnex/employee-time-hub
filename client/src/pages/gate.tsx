@@ -1375,7 +1375,10 @@ export default function GateTerminal() {
                 <span>Scan progress</span>
                 <span>{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "Idle"}</span>
               </div>
-              <Progress value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0} />
+              <Progress
+                className="h-1"
+                value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0}
+              />
               <p>
                 {liveTrackerAvailable === false
                   ? `${liveRecognitionMessage ?? "Python live recognition is active."} Faces: ${liveTrackedFaces.length}, names: ${liveMatchedCount}.`

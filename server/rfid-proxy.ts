@@ -107,6 +107,14 @@ export function registerRfidProxyRoutes(app: Express) {
     });
   };
 
+  const setBuzzerHandler = async (req: Request, res: Response) => {
+    return proxyJsonRequest(res, {
+      method: "POST",
+      path: "set-buzzer",
+      body: req.body ?? {},
+    });
+  };
+
   const tagsHandler = async (_req: unknown, res: Response) => {
     return proxyJsonRequest(res, {
       method: "GET",
@@ -144,6 +152,9 @@ export function registerRfidProxyRoutes(app: Express) {
 
   app.post("/api/rfid/set-transport-mode", setTransportModeHandler);
   app.post("/api/set-transport-mode", setTransportModeHandler);
+
+  app.post("/api/rfid/set-buzzer", setBuzzerHandler);
+  app.post("/api/set-buzzer", setBuzzerHandler);
 
   app.get("/api/rfid/tags", tagsHandler);
   app.get("/api/tags", tagsHandler);

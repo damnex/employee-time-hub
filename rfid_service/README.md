@@ -43,6 +43,7 @@ rfid_service/
 - `POST /set-power`
 - `POST /set-mode`
 - `POST /set-transport-mode`
+- `POST /set-buzzer`
 - `GET /tags`
 - `GET /active-tags`
 - `GET /registration-tag`
@@ -54,5 +55,6 @@ rfid_service/
 - `registration` mode applies scan mode + inventory single + power `8`.
 - `scan` transport uses the reader's continuous `0xEE` output stream.
 - `answer` transport keeps the reader in host-driven answer mode and polls with `0x01` or `0x0F`.
+- The buzzer toggle maps to the UHFReader18 work-mode `Mode_state` bit 2 (`0 = on`, `1 = off`).
 - `POST /connect` opens the serial connection first. `POST /start` begins continuous UHF processing.
 - If you need raw packet logging, pass `debug_raw: true` in `POST /connect` or `POST /start`.

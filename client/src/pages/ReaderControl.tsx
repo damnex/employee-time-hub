@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
+import { Switch } from "@/components/ui/switch";
 import { useToast } from "@/hooks/use-toast";
 import {
   detectRfidPort,
@@ -28,6 +29,7 @@ import {
   type RfidTransportMode,
   rfidQueryKeys,
   setRfidMode,
+  setRfidBuzzer,
   setRfidPower,
   setRfidTransportMode,
   startRfidReader,
@@ -42,6 +44,7 @@ export default function ReaderControl() {
   const [powerValue, setPowerValue] = useState([30]);
   const [selectedMode, setSelectedMode] = useState<RfidMode>("normal");
   const [selectedTransportMode, setSelectedTransportMode] = useState<RfidTransportMode>("scan");
+  const [selectedBuzzerEnabled, setSelectedBuzzerEnabled] = useState(false);
 
   const statusQuery = useQuery({
     queryKey: rfidQueryKeys.status,
@@ -59,8 +62,10 @@ export default function ReaderControl() {
     setPowerValue([statusQuery.data.current_power]);
     setSelectedMode(statusQuery.data.current_mode);
     setSelectedTransportMode(statusQuery.data.transport_mode);
+    setSelectedBuzzerEnabled(statusQuery.data.buzzer_enabled);
   }, [
     statusQuery.data?.baudrate,
+    statusQuery.data?.buzzer_enabled,
     statusQuery.data?.current_mode,
     statusQuery.data?.current_power,
     statusQuery.data?.port,
@@ -220,6 +225,24 @@ export default function ReaderControl() {
     },
   });
 
+  const buzzerMutation = useMutation({
+    mutationFn: () => setRfidBuzzer(selectedBuzzerEnabled),
+    onSuccess: async () => {
+      await refreshRfidQueries();
+      toast({
+        title: "Buzzer updated",
+        description: `Reader buzzer ${selectedBuzzerEnabled ? "enabled" : "disabled"}.`,
+      });
+    },
+    onError: (error) => {
+      toast({
+        title: "Unable to set buzzer",
+        description: error instanceof Error ? error.message : "Buzzer update failed.",
+        variant: "destructive",
+      });
+    },
+  });
+
   const status = statusQuery.data;
   const serviceOffline = statusQuery.isError;
   const isConnected = Boolean(status?.connected);
@@ -232,8 +255,10 @@ export default function ReaderControl() {
       || stopMutation.isPending
       || powerMutation.isPending
       || modeMutation.isPending
+      || buzzerMutation.isPending
       || transportModeMutation.isPending;
   }, [
+    buzzerMutation.isPending,
     detectPortMutation.isPending,
     connectMutation.isPending,
     disconnectMutation.isPending,
@@ -250,7 +275,7 @@ export default function ReaderControl() {
         <div>
           <h1 className="text-3xl font-bold text-foreground">UHF Reader Control</h1>
           <p className="mt-1 text-muted-foreground">
-            Connect the reader, choose the required mode and transport, then start or stop live reading.
+            Connect the reader, choose the required mode, transport, and buzzer behavior, then start or stop live reading.
           </p>
         </div>
         <Button
@@ -381,6 +406,14 @@ export default function ReaderControl() {
               <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Power</p>
               <p className="mt-2 text-lg font-semibold text-foreground">{status?.current_power ?? powerValue[0]}</p>
             </div>
+            <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Buzzer</p>
+              <div className="mt-2">
+                <Badge variant={(status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "secondary" : "outline"}>
+                  {(status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "Enabled" : "Disabled"}
+                </Badge>
+              </div>
+            </div>
           </CardContent>
         </Card>
       </div>
@@ -422,7 +455,7 @@ export default function ReaderControl() {
               Mode Selection
             </CardTitle>
             <CardDescription>
-              Use normal or registration for business behavior, then choose scan or answer for how the reader sends data.
+              Use normal or registration for business behavior, then choose scan or answer transport and buzzer behavior.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
@@ -459,6 +492,22 @@ export default function ReaderControl() {
             <Button onClick={() => transportModeMutation.mutate()} disabled={!isConnected || isBusy}>
               Apply Transport
             </Button>
+            <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/20 p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <Label htmlFor="reader-buzzer">Buzzer</Label>
+                </div>
+                <Switch
+                  id="reader-buzzer"
+                  checked={selectedBuzzerEnabled}
+                  onCheckedChange={setSelectedBuzzerEnabled}
+                  disabled={!isConnected || isBusy}
+                />
+              </div>
+              <Button onClick={() => buzzerMutation.mutate()} disabled={!isConnected || isBusy}>
+                Apply Buzzer
+              </Button>
+            </div>
           </CardContent>
         </Card>
       </div>
