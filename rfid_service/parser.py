@@ -9,8 +9,9 @@ SPONTANEOUS_TAG_RESPONSE = 0xEE
 INVENTORY_RESPONSE = 0x01
 INVENTORY_SINGLE_RESPONSE = 0x0F
 SUCCESS_STATUSES = {0x00, 0x01, 0x02, 0x03, 0x04}
+MAX_EPC_WORDS = 15
 MIN_EPC_BYTES = 4
-MAX_EPC_BYTES = 4
+MAX_EPC_BYTES = MAX_EPC_WORDS * 2
 MIN_EPC_HEX_LENGTH = MIN_EPC_BYTES * 2
 MAX_EPC_HEX_LENGTH = MAX_EPC_BYTES * 2
 
@@ -79,8 +80,6 @@ def is_valid_epc(epc: str) -> bool:
         return False
     if len(epc) % 2 != 0:
         return False
-    if not epc.startswith("E2"):
-        return False
     return all(character in "0123456789ABCDEF" for character in epc)
 
 
@@ -93,22 +92,40 @@ def _normalize_epc(candidate: bytes) -> str | None:
     return epc
 
 
-def _parse_declared_epcs(payload: bytes, *, starts_with_count: bool) -> list[str] | None:
+def _declared_length_to_bytes(declared_length: int, *, length_units: str) -> int | None:
+    if declared_length <= 0:
+        return None
+    if length_units == "words":
+        declared_length *= 2
+    if declared_length < MIN_EPC_BYTES or declared_length > MAX_EPC_BYTES:
+        return None
+    return declared_length
+
+
+def _parse_declared_epcs(
+    payload: bytes,
+    *,
+    starts_with_count: bool,
+    length_units: str,
+) -> list[str] | None:
     tags: list[str] = []
     seen: set[str] = set()
     cursor = 0
     expected_count: int | None = None
+    parsed_count = 0
 
     if starts_with_count:
-      if not payload:
-          return None
-      expected_count = payload[0]
-      cursor = 1
+        if not payload:
+            return None
+        expected_count = payload[0]
+        cursor = 1
+        if expected_count == 0 and cursor == len(payload):
+            return []
 
     while cursor < len(payload):
-        epc_length = payload[cursor]
+        epc_length = _declared_length_to_bytes(payload[cursor], length_units=length_units)
         cursor += 1
-        if epc_length <= 0:
+        if epc_length is None:
             return None
         if cursor + epc_length > len(payload):
             return None
@@ -117,13 +134,14 @@ def _parse_declared_epcs(payload: bytes, *, starts_with_count: bool) -> list[str
         cursor += epc_length
         if not candidate:
             return None
+        parsed_count += 1
         if candidate not in seen:
             seen.add(candidate)
             tags.append(candidate)
 
     if cursor != len(payload):
         return None
-    if expected_count is not None and expected_count != len(tags):
+    if expected_count is not None and expected_count != parsed_count:
         return None
 
     return tags
@@ -135,17 +153,20 @@ def _parse_direct_epc(payload: bytes) -> list[str] | None:
 
 def _has_valid_packet_structure(packet: ReaderPacket) -> bool:
     if packet.response_code == SPONTANEOUS_TAG_RESPONSE:
-        if len(packet.data) == MIN_EPC_BYTES:
-            return True
         return (
-            _parse_declared_epcs(packet.data, starts_with_count=True) is not None
-            or _parse_declared_epcs(packet.data, starts_with_count=False) is not None
+            _parse_direct_epc(packet.data) is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=True, length_units="words") is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=False, length_units="words") is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=True, length_units="bytes") is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=False, length_units="bytes") is not None
         )
 
     if packet.response_code in {INVENTORY_RESPONSE, INVENTORY_SINGLE_RESPONSE}:
         return (
-            _parse_declared_epcs(packet.data, starts_with_count=True) is not None
-            or _parse_declared_epcs(packet.data, starts_with_count=False) is not None
+            _parse_declared_epcs(packet.data, starts_with_count=True, length_units="words") is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=False, length_units="words") is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=True, length_units="bytes") is not None
+            or _parse_declared_epcs(packet.data, starts_with_count=False, length_units="bytes") is not None
             or _parse_direct_epc(packet.data) is not None
         )
 
@@ -165,13 +186,17 @@ def extract_epcs_from_packet(packet: ReaderPacket) -> list[str]:
     if packet.response_code == SPONTANEOUS_TAG_RESPONSE:
         parsers = [
             lambda: _parse_direct_epc(packet.data),
-            lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
-            lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True, length_units="words"),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False, length_units="words"),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True, length_units="bytes"),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False, length_units="bytes"),
         ]
     else:
         parsers = [
-            lambda: _parse_declared_epcs(packet.data, starts_with_count=True),
-            lambda: _parse_declared_epcs(packet.data, starts_with_count=False),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True, length_units="words"),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False, length_units="words"),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=True, length_units="bytes"),
+            lambda: _parse_declared_epcs(packet.data, starts_with_count=False, length_units="bytes"),
             lambda: _parse_direct_epc(packet.data),
         ]
 
