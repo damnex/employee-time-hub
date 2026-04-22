@@ -10,7 +10,7 @@ Standalone FastAPI service for a `UHFReader18` serial reader.
 - Background reader thread with reconnection.
 - Rolling buffer management for fragmented, concatenated, and noisy serial traffic.
 - ENTRY / EXIT event processing using `last_seen` and `active_tags`.
-- Registration mode that requires one stable tag repeated at least 5 times.
+- Registration mode that requires one stable tag repeated at least 7 times.
 - Reader power control and work mode control.
 
 ## Run
@@ -52,7 +52,7 @@ rfid_service/
 ## Notes
 
 - `normal` mode applies scan mode + inventory multiple + power `30`.
-- `registration` mode applies scan mode + inventory single + power `8`.
+- `registration` mode applies scan mode + inventory single + power `1`.
 - `scan` transport uses the reader's continuous `0xEE` output stream.
 - `answer` transport keeps the reader in host-driven answer mode and polls with `0x01` or `0x0F`.
 - The buzzer toggle maps to the UHFReader18 work-mode `Mode_state` bit 2 (`0 = on`, `1 = off`).

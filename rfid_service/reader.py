@@ -281,16 +281,19 @@ class SerialRFIDReader:
 
     def get_reader_info(self) -> ReaderInfo:
         response = self.send_command(0x21)
-        if response.status != 0x00 or len(response.data) < 7:
+        if response.status != 0x00 or len(response.data) < 8:
             raise RuntimeError("Reader information response was incomplete.")
+
+        # The UHFReader18 returns two firmware-version bytes first, so all
+        # remaining reader info fields start at offset 2.
         return ReaderInfo(
             version=response.data[0],
-            reader_type=response.data[1],
-            protocol_mask=response.data[2],
-            max_frequency=response.data[3],
-            min_frequency=response.data[4],
-            power=response.data[5],
-            scan_time=response.data[6],
+            reader_type=response.data[2],
+            protocol_mask=response.data[3],
+            max_frequency=response.data[4],
+            min_frequency=response.data[5],
+            power=response.data[6],
+            scan_time=response.data[7],
         )
 
     def inventory(self) -> ReaderPacket:

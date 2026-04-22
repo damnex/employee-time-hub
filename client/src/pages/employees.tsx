@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/table";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import {
   Dialog,
@@ -217,6 +218,11 @@ export default function Employees() {
     enabled: isDialogOpen && registrationModeEnabled,
     refetchInterval: isDialogOpen && registrationModeEnabled ? 1200 : false,
   });
+  const registrationState = registrationTagQuery.data?.registration;
+  const registrationPower = registrationTagQuery.data?.current_power ?? readerStatusQuery.data?.current_power ?? null;
+  const registrationProgress = registrationState
+    ? Math.min(100, (registrationState.candidate_hits / Math.max(1, registrationState.stable_threshold)) * 100)
+    : 0;
 
   const enableRegistrationModeMutation = useMutation({
     mutationFn: async () => {
@@ -749,7 +755,7 @@ export default function Employees() {
                           <ShieldCheck className="mt-0.5 size-4 shrink-0" />
                           <div className="space-y-1">
                             <p>
-                              {rfidReaderMessage ?? "Registration mode starts automatically. Keep one UHF tag near the reader or type the EPC manually."}
+                              {rfidReaderMessage ?? "Registration mode starts automatically. Keep one UHF tag very close to the reader or type the EPC manually."}
                             </p>
                             <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
                               Source: {rfidSourceDeviceId ?? "RFID Service"}
@@ -757,6 +763,40 @@ export default function Employees() {
                           </div>
                         </div>
                       </div>
+
+                      {registrationModeEnabled && registrationState && (
+                        <div className="rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80">
+                                Registration Lock
+                              </p>
+                              <p className="mt-1 text-sm text-foreground">
+                                Close-range single-badge enrollment only.
+                              </p>
+                            </div>
+                            <div className="flex flex-wrap items-center justify-end gap-2">
+                              <Badge variant={registrationState.selected_tag ? "secondary" : "outline"}>
+                                {registrationState.multiple_tags_detected
+                                  ? "Multiple Tags"
+                                  : registrationState.selected_tag
+                                    ? "Locked"
+                                    : "Stabilizing"}
+                              </Badge>
+                              {registrationPower !== null && (
+                                <Badge variant="outline">Power {registrationPower}</Badge>
+                              )}
+                            </div>
+                          </div>
+                          <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                            <span>
+                              Stability {registrationState.candidate_hits}/{registrationState.stable_threshold}
+                            </span>
+                            <span>Hold one tag very close</span>
+                          </div>
+                          <Progress className="mt-2 h-2" value={registrationProgress} />
+                        </div>
+                      )}
 
                       <div className="rounded-xl bg-muted/30 p-4 space-y-3">
                         <div className="flex items-center justify-between gap-3">

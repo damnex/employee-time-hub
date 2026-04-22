@@ -31,7 +31,7 @@ class RegistrationState:
     selected_tag: str | None = None
     candidate_tag: str | None = None
     candidate_hits: int = 0
-    stable_threshold: int = 5
+    stable_threshold: int = 7
     multiple_tags_detected: bool = False
     message: str = "Registration mode inactive."
     selected_at: float | None = None
@@ -42,7 +42,7 @@ class TagProcessor:
     def __init__(
         self,
         exit_timeout_seconds: float = 5.0,
-        registration_stable_hits: int = 5,
+        registration_stable_hits: int = 7,
         registration_window_seconds: float = 1.5,
         registration_gap_seconds: float = 1.0,
         duplicate_suppression_seconds: float = 0.2,
@@ -92,7 +92,7 @@ class TagProcessor:
             self.registration.selected_at = None
             self.registration.last_seen_at = None
             self.registration.message = (
-                "Keep only one tag near the reader."
+                "Keep one tag very close to the reader."
                 if mode == "registration"
                 else "Registration mode inactive."
             )
@@ -219,7 +219,7 @@ class TagProcessor:
             self.registration.candidate_hits = 0
             self.registration.last_seen_at = now
             self.registration.multiple_tags_detected = True
-            self.registration.message = "Multiple tags detected. Keep only one tag near the reader."
+            self.registration.message = "Multiple tags detected. Keep one tag very close to the reader."
             return
 
         tag = tags[0]
@@ -239,8 +239,8 @@ class TagProcessor:
         if self.registration.candidate_hits >= self.registration_stable_hits:
             self.registration.selected_tag = tag
             self.registration.selected_at = now
-            self.registration.message = f"Stable registration tag selected: {tag}"
+            self.registration.message = f"Close-range registration tag locked: {tag}"
         else:
             self.registration.message = (
-                f"Reading a single tag... stability {self.registration.candidate_hits}/{self.registration_stable_hits}"
+                f"Close-range lock {self.registration.candidate_hits}/{self.registration_stable_hits}"
             )

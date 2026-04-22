@@ -173,11 +173,14 @@ export default function ReaderControl() {
 
   const powerMutation = useMutation({
     mutationFn: () => setRfidPower(powerValue[0] ?? 30),
-    onSuccess: async () => {
+    onSuccess: async (data) => {
       await refreshRfidQueries();
       toast({
         title: "Power updated",
-        description: `Reader power set to ${powerValue[0] ?? 30}.`,
+        description:
+          data.current_power === (powerValue[0] ?? 30)
+            ? `Reader power set to ${data.current_power}.`
+            : `Reader kept power ${data.current_power} after requesting ${powerValue[0] ?? 30}.`,
       });
     },
     onError: (error) => {
@@ -247,6 +250,8 @@ export default function ReaderControl() {
   const serviceOffline = statusQuery.isError;
   const isConnected = Boolean(status?.connected);
   const isRunning = Boolean(status?.running);
+  const effectiveTransportMode = status?.transport_mode ?? selectedTransportMode;
+  const buzzerSupported = effectiveTransportMode !== "answer";
   const isBusy = useMemo(() => {
     return detectPortMutation.isPending
       || connectMutation.isPending
@@ -409,8 +414,16 @@ export default function ReaderControl() {
             <div className="rounded-2xl border border-border/60 bg-muted/20 p-4">
               <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Buzzer</p>
               <div className="mt-2">
-                <Badge variant={(status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "secondary" : "outline"}>
-                  {(status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "Enabled" : "Disabled"}
+                <Badge
+                  variant={
+                    buzzerSupported
+                      ? ((status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "secondary" : "outline")
+                      : "outline"
+                  }
+                >
+                  {buzzerSupported
+                    ? ((status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "Enabled" : "Disabled")
+                    : "Ignored in Answer"}
                 </Badge>
               </div>
             </div>
@@ -425,7 +438,7 @@ export default function ReaderControl() {
               <SlidersHorizontal className="size-4 text-primary" />
               Power Control
             </CardTitle>
-            <CardDescription>Use 30 for normal detection and 5-10 for registration mode.</CardDescription>
+            <CardDescription>Use 30 for normal detection and 1 for ultra-close registration mode.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-5">
             <div className="space-y-4">
@@ -455,7 +468,7 @@ export default function ReaderControl() {
               Mode Selection
             </CardTitle>
             <CardDescription>
-              Use normal or registration for business behavior, then choose scan or answer transport and buzzer behavior.
+              Use normal for open gate reading. Use registration for close-range single-badge enrollment, then choose scan or answer transport. Buzzer control works only in scan transport on this reader.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
@@ -474,6 +487,19 @@ export default function ReaderControl() {
             <Button onClick={() => modeMutation.mutate()} disabled={!isConnected || isBusy}>
               Apply Mode
             </Button>
+            {selectedMode === "registration" && (
+              <div className="rounded-2xl border border-primary/20 bg-primary/5 p-4 text-sm">
+                <p className="font-medium text-foreground">Registration profile</p>
+                <p className="mt-1 text-muted-foreground">
+                  Uses lower power for a shorter read range and waits for a stable single badge before enrollment.
+                </p>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Badge variant="outline">Target Power 1</Badge>
+                  <Badge variant="outline">Stable Hits 7</Badge>
+                  <Badge variant="outline">Single Tag Only</Badge>
+                </div>
+              </div>
+            )}
             <div className="space-y-2">
               <Label htmlFor="reader-transport-mode">Transport Mode</Label>
               <Select
@@ -496,15 +522,20 @@ export default function ReaderControl() {
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <Label htmlFor="reader-buzzer">Buzzer</Label>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {buzzerSupported
+                      ? "Available while the reader is using scan transport."
+                      : "Answer transport ignores buzzer settings. Switch to scan transport first."}
+                  </p>
                 </div>
                 <Switch
                   id="reader-buzzer"
                   checked={selectedBuzzerEnabled}
                   onCheckedChange={setSelectedBuzzerEnabled}
-                  disabled={!isConnected || isBusy}
+                  disabled={!isConnected || isBusy || !buzzerSupported}
                 />
               </div>
-              <Button onClick={() => buzzerMutation.mutate()} disabled={!isConnected || isBusy}>
+              <Button onClick={() => buzzerMutation.mutate()} disabled={!isConnected || isBusy || !buzzerSupported}>
                 Apply Buzzer
               </Button>
             </div>

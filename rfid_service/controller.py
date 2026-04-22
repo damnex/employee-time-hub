@@ -21,7 +21,7 @@ LOGGER = logging.getLogger("rfid_service.controller")
 
 MODE_DEFAULT_POWER = {
     "normal": 30,
-    "registration": 8,
+    "registration": 1,
 }
 ANSWER_MODE_RETRY_SECONDS = 0.2
 ANSWER_MODE_IDLE_SECONDS = 0.05
@@ -49,6 +49,7 @@ class RFIDController:
         self._reader_info: ReaderInfo | None = None
         self._lock = threading.RLock()
         self._needs_runtime_sync = False
+        self._supports_work_mode_readback = True
         self._answer_poll_thread: threading.Thread | None = None
         self._answer_poll_stop_event: threading.Event | None = None
         self._answer_poll_generation = 0
@@ -158,6 +159,7 @@ class RFIDController:
             self._state.connected = False
             self._state.running = False
             self._needs_runtime_sync = False
+            self._supports_work_mode_readback = True
             return self.get_status()
 
     def detect_port(
@@ -213,13 +215,11 @@ class RFIDController:
         with self._lock:
             self._sync_runtime_state_locked()
             reader = self._require_reader()
-            reader.set_power(level)
-            reader_info = reader.get_reader_info()
-            if reader_info.power != level:
-                raise RuntimeError(f"Reader reported power {reader_info.power} after setting {level}.")
-            self._reader_info = reader_info
-            self._state.current_power = reader_info.power
-            self._state.last_error = None
+            reader_info = self._set_power_and_refresh_locked(
+                reader,
+                level,
+                context="manual power update",
+            )
             LOGGER.info("Power changed to %s", reader_info.power)
             return self.get_status()
 
@@ -252,6 +252,12 @@ class RFIDController:
 
     def set_buzzer(self, enabled: bool) -> dict[str, object]:
         with self._lock:
+            if self._state.connected and self._state.transport_mode == "answer":
+                self._state.last_error = (
+                    "Buzzer control is only supported in Scan transport. "
+                    "Switch transport from Answer to Scan and apply again."
+                )
+                raise RuntimeError(self._state.last_error)
             self._state.buzzer_enabled = enabled
             self._state.last_error = None
             if self._state.connected:
@@ -352,6 +358,7 @@ class RFIDController:
         try:
             reader.start()
             self._reader = reader
+            self._supports_work_mode_readback = True
             self._processor.set_mode(self._state.current_mode)
             self._state.running = False
             self._state.connected = reader.connected
@@ -363,13 +370,14 @@ class RFIDController:
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Unable to read reader info during startup: %s", exc)
 
-            try:
-                work_mode = reader.get_work_mode()
+            work_mode = self._get_work_mode_if_available_locked(
+                reader,
+                context="startup",
+            )
+            if work_mode is not None:
                 self._state.transport_mode = self._transport_mode_from_work_mode(work_mode)
                 self._state.current_mode = self._mode_from_work_mode(work_mode)
                 self._state.buzzer_enabled = work_mode.buzzer_enabled
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning("Unable to read work mode during startup: %s", exc)
 
             self._sync_runtime_state_locked()
             return self.get_status()
@@ -380,7 +388,28 @@ class RFIDController:
             self._state.connected = False
             self._state.running = False
             self._needs_runtime_sync = False
+            self._supports_work_mode_readback = True
             raise
+
+    def _get_work_mode_if_available_locked(
+        self,
+        reader: SerialRFIDReader,
+        *,
+        context: str,
+    ) -> WorkModeConfig | None:
+        if not self._supports_work_mode_readback:
+            return None
+
+        try:
+            return reader.get_work_mode()
+        except Exception as exc:  # noqa: BLE001
+            self._supports_work_mode_readback = False
+            LOGGER.warning(
+                "Unable to read work mode during %s: %s. Continuing without work-mode readback verification.",
+                context,
+                exc,
+            )
+            return None
 
     def _auto_detect_port_locked(
         self,
@@ -429,45 +458,70 @@ class RFIDController:
                 self._state.buzzer_enabled,
             )
         )
-        reader.set_power(self._state.current_power)
-        work_mode = reader.get_work_mode()
-        reader_info = reader.get_reader_info()
-        verified_transport = self._transport_mode_from_work_mode(work_mode)
-        verified_mode = self._mode_from_work_mode(work_mode)
-        verified_buzzer = work_mode.buzzer_enabled
-        if verified_transport != self._state.transport_mode:
-            raise RuntimeError(
-                f"Reader transport verification failed: expected {self._state.transport_mode}, got {verified_transport}."
-            )
-        if verified_mode != self._state.current_mode:
-            raise RuntimeError(
-                f"Reader mode verification failed: expected {self._state.current_mode}, got {verified_mode}."
-            )
-        if verified_buzzer != self._state.buzzer_enabled:
-            raise RuntimeError(
-                f"Reader buzzer verification failed: expected {self._state.buzzer_enabled}, got {verified_buzzer}."
-            )
-        if reader_info.power != self._state.current_power:
-            raise RuntimeError(
-                f"Reader power verification failed: expected {self._state.current_power}, got {reader_info.power}."
-            )
+        work_mode = self._get_work_mode_if_available_locked(
+            reader,
+            context="runtime synchronization",
+        )
+        requested_power = self._state.current_power
+        reader_info = self._set_power_and_refresh_locked(
+            reader,
+            requested_power,
+            context="runtime synchronization",
+        )
+        if work_mode is not None:
+            verified_transport = self._transport_mode_from_work_mode(work_mode)
+            verified_mode = self._mode_from_work_mode(work_mode)
+            verified_buzzer = work_mode.buzzer_enabled
+            if verified_transport != self._state.transport_mode:
+                raise RuntimeError(
+                    f"Reader transport verification failed: expected {self._state.transport_mode}, got {verified_transport}."
+                )
+            if verified_mode != self._state.current_mode:
+                raise RuntimeError(
+                    f"Reader mode verification failed: expected {self._state.current_mode}, got {verified_mode}."
+                )
+            if verified_buzzer != self._state.buzzer_enabled:
+                raise RuntimeError(
+                    f"Reader buzzer verification failed: expected {self._state.buzzer_enabled}, got {verified_buzzer}."
+                )
+            self._state.transport_mode = verified_transport
+            self._state.current_mode = verified_mode
+            self._state.buzzer_enabled = verified_buzzer
 
-        self._state.transport_mode = verified_transport
-        self._state.current_mode = verified_mode
-        self._state.buzzer_enabled = verified_buzzer
-        self._state.current_power = reader_info.power
-        self._reader_info = reader_info
         self._processor.set_mode(self._state.current_mode)
         if self._state.transport_mode == "answer" and self._state.running:
             self._ensure_answer_polling_locked()
         self._needs_runtime_sync = False
         LOGGER.info(
-            "Reader runtime synchronized: mode=%s transport=%s buzzer=%s power=%s",
+            "Reader runtime synchronized: mode=%s transport=%s buzzer=%s power=%s%s",
             self._state.current_mode,
             self._state.transport_mode,
             "enabled" if self._state.buzzer_enabled else "disabled",
             self._state.current_power,
+            " (work mode readback unavailable)" if work_mode is None else "",
         )
+
+    def _set_power_and_refresh_locked(
+        self,
+        reader: SerialRFIDReader,
+        requested_power: int,
+        *,
+        context: str,
+    ) -> ReaderInfo:
+        reader.set_power(requested_power)
+        reader_info = reader.get_reader_info()
+        self._reader_info = reader_info
+        self._state.current_power = reader_info.power
+
+        if reader_info.power != requested_power:
+            self._state.last_error = (
+                f"Reader kept power {reader_info.power} after requesting {requested_power} during {context}."
+            )
+            LOGGER.warning(self._state.last_error)
+        else:
+            self._state.last_error = None
+
+        return reader_info
 
     def _sync_runtime_state_locked(self) -> None:
         if not self._needs_runtime_sync or not self._state.connected:
