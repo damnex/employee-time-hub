@@ -275,74 +275,109 @@ export default function ReaderControl() {
   ]);
 
   return (
-    <div className="flex h-full min-h-full flex-col gap-4 p-4 md:p-5 animate-in fade-in duration-500">
-      <div className="flex flex-col gap-3 xl:flex-row xl:items-end xl:justify-between">
-        <div className="space-y-1">
+    <div className="flex h-full min-h-full min-w-0 flex-col gap-3 overflow-y-auto p-4 md:p-5 animate-in fade-in duration-500">
+      <div className="grid gap-3 xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)_auto] xl:items-start">
+        <div className="min-w-0 space-y-1">
           <h1 className="text-3xl font-bold tracking-tight text-foreground">UHF Reader Control</h1>
-          <p className="max-w-3xl text-sm text-muted-foreground md:text-base">
-            Connect the reader, set the operating profile, and keep live reading ready without wasting viewport space.
+          <p className="max-w-3xl text-sm text-muted-foreground">
+            Quick setup for connection, power, mode, transport, and buzzer behavior.
           </p>
         </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge variant={isConnected ? "secondary" : "outline"} className="h-9 px-3 text-[11px] uppercase tracking-[0.16em]">
-            {isConnected ? "Connection Ready" : "Disconnected"}
-          </Badge>
-          <Badge variant={isRunning ? "secondary" : "outline"} className="h-9 px-3 text-[11px] uppercase tracking-[0.16em]">
-            {isRunning ? "Reader Live" : "Reader Stopped"}
-          </Badge>
-          <Button
-            variant="outline"
-            className="h-10 px-4"
-            onClick={() => {
-              void refreshRfidQueries();
-            }}
-            disabled={isBusy}
-          >
-            <RefreshCcw className="mr-2 size-4" />
-            Refresh
-          </Button>
+        <div className="min-w-0 xl:flex xl:justify-center">
+          {status?.last_error && (
+            <Alert className="w-full max-w-[560px] border-rose-500/35 bg-rose-500/10 py-2.5 text-rose-950 dark:bg-rose-500/12 dark:text-rose-100">
+              <AlertTriangle className="size-4 text-rose-700 dark:text-rose-200" />
+              <AlertTitle className="text-rose-950 dark:text-rose-100">Reader warning</AlertTitle>
+              <AlertDescription className="text-rose-800 dark:text-rose-100/80">{status.last_error}</AlertDescription>
+            </Alert>
+          )}
         </div>
+        <Button
+          variant="outline"
+          className="h-10 px-4 self-start xl:self-auto"
+          onClick={() => {
+            void refreshRfidQueries();
+          }}
+          disabled={isBusy}
+        >
+          <RefreshCcw className="mr-2 size-4" />
+          Refresh
+        </Button>
       </div>
 
       {serviceOffline && (
-        <Alert className="shrink-0 border-amber-500/30 bg-amber-500/10 py-3 text-amber-100">
-          <AlertTriangle className="size-4 text-amber-200" />
-          <AlertTitle className="text-amber-100">RFID service is not reachable</AlertTitle>
-          <AlertDescription className="text-amber-100/80">
-            The backend could not reach the UHF reader service. If this stays visible, install
-            <span className="mx-1 font-mono">rfid_service/requirements.txt</span>
-            and restart the server.
+        <Alert className="shrink-0 border-amber-500/35 bg-amber-500/10 py-2.5 text-amber-950 dark:bg-amber-500/12 dark:text-amber-100">
+          <AlertTriangle className="size-4 text-amber-700 dark:text-amber-200" />
+          <AlertTitle className="text-amber-950 dark:text-amber-100">RFID service is not reachable</AlertTitle>
+          <AlertDescription className="text-amber-800 dark:text-amber-100/80">
+            Install <span className="mx-1 font-mono">rfid_service/requirements.txt</span> and restart the server if this stays visible.
           </AlertDescription>
         </Alert>
       )}
 
-      <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(320px,0.95fr)]">
-        <Card className="border-border/50 shadow-sm">
-          <CardHeader className="space-y-1 p-5 pb-3">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-6">
+        <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Connection</p>
+          <div className="mt-2">
+            <Badge variant={isConnected ? "secondary" : "outline"}>
+              {isConnected ? "Connected" : "Disconnected"}
+            </Badge>
+          </div>
+        </div>
+        <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Reader</p>
+          <div className="mt-2">
+            <Badge variant={isRunning ? "secondary" : "outline"}>
+              {isRunning ? "Running" : "Stopped"}
+            </Badge>
+          </div>
+        </div>
+        <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Mode</p>
+          <p className="mt-2 text-lg font-semibold capitalize text-foreground">{status?.current_mode ?? selectedMode}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Transport</p>
+          <p className="mt-2 text-lg font-semibold capitalize text-foreground">{status?.transport_mode ?? selectedTransportMode}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Power</p>
+          <p className="mt-2 text-lg font-semibold text-foreground">{status?.current_power ?? powerValue[0]}</p>
+        </div>
+        <div className="rounded-xl border border-border bg-card px-3 py-2.5 shadow-sm">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">Buzzer</p>
+          <div className="mt-2">
+            <Badge
+              variant={
+                buzzerSupported
+                  ? ((status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "secondary" : "outline")
+                  : "outline"
+              }
+            >
+              {buzzerSupported
+                ? ((status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "Enabled" : "Disabled")
+                : "Ignored in Answer"}
+            </Badge>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid min-h-0 flex-1 gap-3">
+        <div className="grid min-h-0 gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] xl:items-stretch">
+        <Card className="flex min-w-0 flex-col border-border/50 shadow-sm">
+          <CardHeader className="space-y-1 p-4 pb-2.5">
             <CardTitle className="flex items-center gap-2 text-lg">
               <Cable className="size-4 text-primary" />
               Connection
             </CardTitle>
-            <CardDescription className="text-[13px] leading-snug">
-              Use COM3 and 57600 by default, then connect before starting live scan or answer polling.
+            <CardDescription className="text-[12px] leading-snug">
+              COM3 / 57600 is the default baseline for this reader.
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-4 p-5 pt-0">
-            <div className="grid gap-3 md:grid-cols-2">
+          <CardContent className="flex flex-1 flex-col gap-2.5 p-4 pt-0">
+            <div className="grid gap-2.5 md:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] md:items-end">
               <div className="space-y-1.5">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="reader-port">COM Port</Label>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    className="h-8 px-2.5"
-                    onClick={() => detectPortMutation.mutate()}
-                    disabled={isConnected || isBusy}
-                  >
-                    Auto Detect
-                  </Button>
-                </div>
+                <Label htmlFor="reader-port">COM Port</Label>
                 <Input
                   id="reader-port"
                   className="h-10"
@@ -352,6 +387,16 @@ export default function ReaderControl() {
                   disabled={isConnected || isBusy}
                 />
               </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-10 px-3.5 md:min-w-[122px] md:self-end"
+                onClick={() => detectPortMutation.mutate()}
+                disabled={isConnected || isBusy}
+              >
+                Auto Detect
+              </Button>
               <div className="space-y-1.5">
                 <Label htmlFor="reader-baudrate">Baud Rate</Label>
                 <Input
@@ -365,162 +410,71 @@ export default function ReaderControl() {
               </div>
             </div>
 
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="grid gap-2 sm:grid-cols-2">
               <Button className="h-10" onClick={() => connectMutation.mutate()} disabled={isConnected || isBusy}>
                 <Play className="mr-2 size-4" />
                 Connect
               </Button>
-              <Button
-                variant="outline"
-                className="h-10"
-                onClick={() => disconnectMutation.mutate()}
-                disabled={!isConnected || isBusy}
-              >
+              <Button variant="outline" className="h-10" onClick={() => disconnectMutation.mutate()} disabled={!isConnected || isBusy}>
                 <Square className="mr-2 size-4" />
                 Disconnect
               </Button>
-              <Button
-                variant="outline"
-                className="h-10"
-                onClick={() => startMutation.mutate()}
-                disabled={!isConnected || isRunning || isBusy}
-              >
+              <Button variant="outline" className="h-10" onClick={() => startMutation.mutate()} disabled={!isConnected || isRunning || isBusy}>
                 <Play className="mr-2 size-4" />
                 Start Reader
               </Button>
-              <Button
-                variant="outline"
-                className="h-10"
-                onClick={() => stopMutation.mutate()}
-                disabled={!isRunning || isBusy}
-              >
+              <Button variant="outline" className="h-10" onClick={() => stopMutation.mutate()} disabled={!isRunning || isBusy}>
                 <Square className="mr-2 size-4" />
                 Stop Reader
               </Button>
             </div>
 
-            <div className="flex flex-wrap gap-2 rounded-xl border border-border/60 bg-muted/20 p-3">
-              <Badge variant="outline" className="px-2.5 py-1">Default Port {status?.port ?? port}</Badge>
-              <Badge variant="outline" className="px-2.5 py-1">Baud {status?.baudrate ?? Number(baudrate)}</Badge>
-              <Badge variant="outline" className="px-2.5 py-1 capitalize">
-                {status?.transport_mode ?? selectedTransportMode} transport
-              </Badge>
+            <div className="mt-auto grid gap-2 sm:grid-cols-3">
+              <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Port</p>
+                <p className="mt-1 font-semibold text-foreground">{status?.port ?? port}</p>
+              </div>
+              <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Baud</p>
+                <p className="mt-1 font-semibold text-foreground">{status?.baudrate ?? Number(baudrate)}</p>
+              </div>
+              <div className="rounded-lg border border-border/60 bg-muted/20 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-[0.14em] text-muted-foreground">Transport</p>
+                <p className="mt-1 font-semibold capitalize text-foreground">{status?.transport_mode ?? selectedTransportMode}</p>
+              </div>
             </div>
           </CardContent>
         </Card>
 
-        <Card className="border-border/50 shadow-sm">
-          <CardHeader className="space-y-1 p-5 pb-3">
-            <CardTitle className="flex items-center gap-2 text-lg">
-              <Settings2 className="size-4 text-primary" />
-              Current Status
+        <Card className="flex min-w-0 flex-col overflow-hidden border-border/50 shadow-sm">
+          <CardHeader className="space-y-1 p-3.5 pb-2.5">
+            <CardTitle className="flex items-center gap-2 text-[1.1rem]">
+              <SlidersHorizontal className="size-4 text-primary" />
+              Reader Profile
             </CardTitle>
-            <CardDescription className="text-[13px] leading-snug">
-              Live reader state for connection, registration, and gate operation.
+            <CardDescription className="text-[11px] leading-snug">
+              Compact controls for mode, transport, and buzzer.
             </CardDescription>
           </CardHeader>
-          <CardContent className="grid gap-3 p-5 pt-0 sm:grid-cols-2">
-            <div className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Connection</p>
-              <div className="mt-2">
-                <Badge variant={isConnected ? "secondary" : "outline"}>
-                  {isConnected ? "Connected" : "Disconnected"}
-                </Badge>
-              </div>
-            </div>
-            <div className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Reader</p>
-              <div className="mt-2">
-                <Badge variant={isRunning ? "secondary" : "outline"}>
-                  {isRunning ? "Running" : "Stopped"}
-                </Badge>
-              </div>
-            </div>
-            <div className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Mode</p>
-              <p className="mt-2 text-lg font-semibold capitalize text-foreground">{status?.current_mode ?? selectedMode}</p>
-            </div>
-            <div className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Transport</p>
-              <p className="mt-2 text-lg font-semibold capitalize text-foreground">
-                {status?.transport_mode ?? selectedTransportMode}
-              </p>
-            </div>
-            <div className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Power</p>
-              <p className="mt-2 text-lg font-semibold text-foreground">{status?.current_power ?? powerValue[0]}</p>
-            </div>
-            <div className="rounded-xl border border-border/60 bg-muted/20 px-3 py-2.5">
-              <p className="text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Buzzer</p>
-              <div className="mt-2">
-                <Badge
-                  variant={
-                    buzzerSupported
-                      ? ((status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "secondary" : "outline")
-                      : "outline"
-                  }
-                >
-                  {buzzerSupported
-                    ? ((status?.buzzer_enabled ?? selectedBuzzerEnabled) ? "Enabled" : "Disabled")
-                    : "Ignored in Answer"}
-                </Badge>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="border-border/50 shadow-sm xl:col-span-2">
-          <CardHeader className="flex flex-col gap-2 border-b border-border/60 p-5 pb-4 md:flex-row md:items-end md:justify-between">
-            <div className="space-y-1">
-              <CardTitle className="flex items-center gap-2 text-lg">
-                <SlidersHorizontal className="size-4 text-primary" />
-                Power, Mode & Transport
-              </CardTitle>
-              <CardDescription className="text-[13px] leading-snug">
-                Keep the core tuning controls together so setup, registration, and buzzer behavior stay visible in one pass.
-              </CardDescription>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Badge variant="outline" className="px-2.5 py-1">Power {powerValue[0]}</Badge>
-              <Badge variant="outline" className="px-2.5 py-1 capitalize">{selectedMode}</Badge>
-              <Badge variant="outline" className="px-2.5 py-1 capitalize">{selectedTransportMode}</Badge>
-            </div>
-          </CardHeader>
-          <CardContent className="grid gap-4 p-5 pt-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1fr)_minmax(0,1fr)]">
-            <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/20 p-4">
-              <div className="flex items-center justify-between text-sm">
-                <span className="font-medium text-foreground">Power Control</span>
-                <span className="rounded-md bg-background/80 px-2 py-1 text-base font-semibold text-foreground">
-                  {powerValue[0]}
-                </span>
-              </div>
-              <p className="text-[13px] leading-snug text-muted-foreground">
-                Use 30 for normal detection and 1 for ultra-close registration mode.
-              </p>
-              <Slider
-                min={0}
-                max={30}
-                step={1}
-                value={powerValue}
-                onValueChange={setPowerValue}
-                disabled={!isConnected || isBusy}
-              />
-              <Button className="h-10 w-full" onClick={() => powerMutation.mutate()} disabled={!isConnected || isBusy}>
-                Apply Power
-              </Button>
-            </div>
-
-            <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/20 p-4">
+          <CardContent className="grid min-w-0 gap-2 p-3.5 pt-0">
+            <div className="grid min-w-0 gap-2 rounded-xl border border-border/60 bg-muted/20 p-2.5 xl:grid-cols-[112px_minmax(0,1fr)_148px] xl:items-end">
               <div className="space-y-1">
-                <p className="text-sm font-medium text-foreground">Operating Mode</p>
-                <p className="text-[13px] leading-snug text-muted-foreground">
-                  Use normal for open gate reading or registration for close-range single-badge enrollment.
+                <p className="text-sm font-semibold text-foreground">Mode</p>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Gate or registration.
                 </p>
               </div>
-              <div className="space-y-1.5">
-                <Label htmlFor="reader-mode">Mode</Label>
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="reader-mode">Operating Mode</Label>
+                  {selectedMode === "registration" && (
+                    <p className="text-[11px] font-medium text-primary/90">
+                      P1 / H7
+                    </p>
+                  )}
+                </div>
                 <Select value={selectedMode} onValueChange={(value) => setSelectedMode(value as RfidMode)}>
-                  <SelectTrigger id="reader-mode" className="h-10">
+                  <SelectTrigger id="reader-mode" className="h-9 w-full min-w-0">
                     <SelectValue placeholder="Choose mode" />
                   </SelectTrigger>
                   <SelectContent>
@@ -529,38 +483,25 @@ export default function ReaderControl() {
                   </SelectContent>
                 </Select>
               </div>
-              <Button className="h-10 w-full" onClick={() => modeMutation.mutate()} disabled={!isConnected || isBusy}>
+              <Button className="h-9 w-full" onClick={() => modeMutation.mutate()} disabled={!isConnected || isBusy}>
                 Apply Mode
               </Button>
-              {selectedMode === "registration" && (
-                <div className="rounded-xl border border-primary/20 bg-primary/5 p-3 text-sm">
-                  <p className="font-medium text-foreground">Registration profile</p>
-                  <p className="mt-1 text-[13px] leading-snug text-muted-foreground">
-                    Lower power, shorter range, and stable single-tag detection before enrollment.
-                  </p>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    <Badge variant="outline">Target Power 1</Badge>
-                    <Badge variant="outline">Stable Hits 7</Badge>
-                    <Badge variant="outline">Single Tag Only</Badge>
-                  </div>
-                </div>
-              )}
             </div>
 
-            <div className="space-y-3 rounded-2xl border border-border/60 bg-muted/20 p-4">
+            <div className="grid min-w-0 gap-2 rounded-xl border border-border/60 bg-muted/20 p-2.5 xl:grid-cols-[112px_minmax(0,1fr)_148px] xl:items-end">
               <div className="space-y-1">
-                <p className="text-sm font-medium text-foreground">Transport & Buzzer</p>
-                <p className="text-[13px] leading-snug text-muted-foreground">
-                  Scan is best for live reads. Answer transport ignores buzzer settings on this reader.
+                <p className="text-sm font-semibold text-foreground">Transport</p>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  Scan for live reads.
                 </p>
               </div>
-              <div className="space-y-1.5">
+              <div className="min-w-0 space-y-1.5">
                 <Label htmlFor="reader-transport-mode">Transport Mode</Label>
                 <Select
                   value={selectedTransportMode}
                   onValueChange={(value) => setSelectedTransportMode(value as RfidTransportMode)}
                 >
-                  <SelectTrigger id="reader-transport-mode" className="h-10">
+                  <SelectTrigger id="reader-transport-mode" className="h-9 w-full min-w-0">
                     <SelectValue placeholder="Choose transport mode" />
                   </SelectTrigger>
                   <SelectContent>
@@ -569,46 +510,77 @@ export default function ReaderControl() {
                   </SelectContent>
                 </Select>
               </div>
-              <Button className="h-10 w-full" onClick={() => transportModeMutation.mutate()} disabled={!isConnected || isBusy}>
+              <Button className="h-9 w-full" onClick={() => transportModeMutation.mutate()} disabled={!isConnected || isBusy}>
                 Apply Transport
               </Button>
-              <div className="space-y-3 rounded-xl border border-border/70 bg-background/60 p-3">
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <Label htmlFor="reader-buzzer">Buzzer</Label>
-                    <p className="mt-1 text-[12px] leading-snug text-muted-foreground">
-                      {buzzerSupported
-                        ? "Available while using scan transport."
-                        : "Switch back to scan transport to manage buzzer behavior."}
-                    </p>
-                  </div>
-                  <Switch
-                    id="reader-buzzer"
-                    checked={selectedBuzzerEnabled}
-                    onCheckedChange={setSelectedBuzzerEnabled}
-                    disabled={!isConnected || isBusy || !buzzerSupported}
-                  />
-                </div>
-                <Button
-                  className="h-10 w-full"
-                  onClick={() => buzzerMutation.mutate()}
-                  disabled={!isConnected || isBusy || !buzzerSupported}
-                >
-                  Apply Buzzer
-                </Button>
+            </div>
+
+            <div className="grid min-w-0 gap-1.5 rounded-xl border border-border/60 bg-muted/20 p-2.5 xl:grid-cols-[96px_minmax(0,1fr)_148px] xl:items-center">
+              <div className="space-y-1">
+                <p className="text-sm font-semibold text-foreground">Buzzer</p>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  {buzzerSupported ? "Available in scan transport." : "Switch to scan to control buzzer."}
+                </p>
               </div>
+              <div className="flex min-w-0 items-center justify-between rounded-lg border border-border/70 bg-background/60 px-3 py-2">
+                <div className="space-y-0.5 pr-3">
+                  <Label htmlFor="reader-buzzer">Toggle</Label>
+                  <p className="text-[11px] text-muted-foreground">
+                    {selectedBuzzerEnabled ? "Enabled" : "Disabled"}
+                  </p>
+                </div>
+                <Switch
+                  id="reader-buzzer"
+                  checked={selectedBuzzerEnabled}
+                  onCheckedChange={setSelectedBuzzerEnabled}
+                  disabled={!isConnected || isBusy || !buzzerSupported}
+                />
+              </div>
+              <Button
+                className="h-9 w-full"
+                onClick={() => buzzerMutation.mutate()}
+                disabled={!isConnected || isBusy || !buzzerSupported}
+              >
+                Apply Buzzer
+              </Button>
             </div>
           </CardContent>
         </Card>
-      </div>
+        </div>
 
-      {status?.last_error && (
-        <Alert className="shrink-0 border-rose-500/30 bg-rose-500/10 py-3 text-rose-100">
-          <AlertTriangle className="size-4 text-rose-200" />
-          <AlertTitle className="text-rose-100">Reader warning</AlertTitle>
-          <AlertDescription className="text-rose-100/80">{status.last_error}</AlertDescription>
-        </Alert>
-      )}
+        <Card className="min-w-0 border-border/50 shadow-sm">
+          <CardContent className="grid min-w-0 gap-3 p-3.5 xl:grid-cols-[220px_minmax(0,1fr)_160px] xl:items-center">
+            <div className="space-y-1">
+              <div className="flex items-center gap-2">
+                <Settings2 className="size-4 text-primary" />
+                <p className="text-base font-semibold text-foreground">Power Control</p>
+                <span className="rounded-md bg-background/80 px-2.5 py-0.5 text-base font-semibold text-foreground">{powerValue[0]}</span>
+              </div>
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                30 for normal detection, 1 for close registration.
+              </p>
+            </div>
+            <div className="min-w-0 space-y-2">
+              <div className="flex items-center justify-between text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                <span>Power Level</span>
+                <span>{powerValue[0]}</span>
+              </div>
+              <Slider
+                className="w-full"
+                min={0}
+                max={30}
+                step={1}
+                value={powerValue}
+                onValueChange={setPowerValue}
+                disabled={!isConnected || isBusy}
+              />
+            </div>
+            <Button className="h-10 w-full xl:w-[160px]" onClick={() => powerMutation.mutate()} disabled={!isConnected || isBusy}>
+              Apply Power
+            </Button>
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }
