@@ -611,22 +611,24 @@ export default function Employees() {
               <Plus className="mr-2 size-4" /> Add Employee
             </Button>
           </DialogTrigger>
-          <DialogContent className="sm:max-w-[820px] max-h-[90vh] overflow-y-auto">
-            <DialogHeader>
+          <DialogContent className="left-0 top-0 h-[100dvh] w-screen max-w-none translate-x-0 translate-y-0 gap-0 overflow-hidden rounded-none border-0 p-0 sm:rounded-none">
+            <DialogHeader className="shrink-0 border-b border-border/70 px-4 py-3 text-left sm:px-5">
               <DialogTitle>Register New Employee</DialogTitle>
-              <DialogDescription>
+              <DialogDescription className="text-sm">
                 Fill the employee details, register the RFID badge, and capture a dataset for Python training.
               </DialogDescription>
             </DialogHeader>
 
             <Form {...form}>
-              <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6 py-4">
-                <div className="grid gap-4 md:grid-cols-2">
+              <form onSubmit={form.handleSubmit(onSubmit)} className="flex h-full min-h-0 flex-col">
+                <div className="flex-1 overflow-y-auto px-4 py-3 sm:px-5">
+                  <div className="space-y-3">
+                    <div className="grid gap-2.5 md:grid-cols-2 xl:grid-cols-4">
                   <FormField
                     control={form.control}
                     name="name"
                     render={({ field }) => (
-                      <FormItem>
+                      <FormItem className="space-y-1.5">
                         <FormLabel>Full Name</FormLabel>
                         <FormControl>
                           <Input placeholder="Jane Doe" {...field} />
@@ -639,7 +641,7 @@ export default function Employees() {
                     control={form.control}
                     name="employeeCode"
                     render={({ field }) => (
-                      <FormItem>
+                      <FormItem className="space-y-1.5">
                         <FormLabel>Employee Code</FormLabel>
                         <FormControl>
                           <Input placeholder="EMP-1042" {...field} />
@@ -652,7 +654,7 @@ export default function Employees() {
                     control={form.control}
                     name="department"
                     render={({ field }) => (
-                      <FormItem>
+                      <FormItem className="space-y-1.5">
                         <FormLabel>Department</FormLabel>
                         <FormControl>
                           <Input placeholder="Operations" {...field} />
@@ -665,7 +667,7 @@ export default function Employees() {
                     control={form.control}
                     name="email"
                     render={({ field }) => (
-                      <FormItem>
+                      <FormItem className="space-y-1.5">
                         <FormLabel>Email (Optional)</FormLabel>
                         <FormControl>
                           <Input placeholder="jane@company.com" {...field} value={field.value || ""} />
@@ -676,21 +678,21 @@ export default function Employees() {
                   />
                 </div>
 
-                <div className="space-y-5 border-t pt-5">
-                  <div className="space-y-1">
+                <div className="space-y-3 border-t pt-3">
+                  <div className="space-y-0.5">
                     <h4 className="text-sm font-semibold tracking-wide">Access Credentials</h4>
-                    <p className="text-sm text-muted-foreground">
+                    <p className="text-[13px] leading-snug text-muted-foreground">
                       Register the card and capture many dataset images so Python can train the face model well.
                     </p>
                   </div>
 
-                  <div className="grid gap-5 lg:grid-cols-[0.82fr_1.18fr]">
-                    <div className="space-y-4">
+                  <div className="grid gap-3 lg:grid-cols-[340px_minmax(0,1fr)]">
+                    <div className="space-y-2.5">
                       <FormField
                         control={form.control}
                         name="rfidUid"
                         render={({ field }) => (
-                          <FormItem>
+                          <FormItem className="space-y-1.5">
                             <div className="flex items-center justify-between gap-3">
                               <FormLabel>RFID UID</FormLabel>
                               <Badge
@@ -707,7 +709,7 @@ export default function Employees() {
                             <FormControl>
                               <Input
                                 placeholder="Present one UHF tag or type the EPC..."
-                                className="font-mono uppercase tracking-[0.2em]"
+                                className="font-mono uppercase tracking-[0.14em]"
                                 {...field}
                                 onChange={(event) => {
                                   field.onChange(event.target.value.toUpperCase());
@@ -719,9 +721,10 @@ export default function Employees() {
                         )}
                       />
 
-                      <div className="flex flex-wrap items-center gap-3">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         <Button
                           type="button"
+                          size="sm"
                           variant="outline"
                           onClick={() => enableRegistrationModeMutation.mutate()}
                           disabled={enableRegistrationModeMutation.isPending}
@@ -750,7 +753,7 @@ export default function Employees() {
                         </Badge>
                       </div>
 
-                      <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm">
+                      <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 px-2.5 py-2 text-sm">
                         <div className="flex items-start gap-2 text-muted-foreground">
                           <ShieldCheck className="mt-0.5 size-4 shrink-0" />
                           <div className="space-y-1">
@@ -765,7 +768,7 @@ export default function Employees() {
                       </div>
 
                       {registrationModeEnabled && registrationState && (
-                        <div className="rounded-xl border border-primary/20 bg-primary/5 px-4 py-3">
+                        <div className="rounded-xl border border-primary/20 bg-primary/5 px-2.5 py-2">
                           <div className="flex items-start justify-between gap-3">
                             <div>
                               <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-primary/80">
@@ -788,7 +791,7 @@ export default function Employees() {
                               )}
                             </div>
                           </div>
-                          <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                          <div className="mt-2.5 flex items-center justify-between text-[11px] text-muted-foreground">
                             <span>
                               Stability {registrationState.candidate_hits}/{registrationState.stable_threshold}
                             </span>
@@ -798,11 +801,11 @@ export default function Employees() {
                         </div>
                       )}
 
-                      <div className="rounded-xl bg-muted/30 p-4 space-y-3">
+                      <div className="space-y-2 rounded-xl bg-muted/30 p-2.5">
                         <div className="flex items-center justify-between gap-3">
                           <div>
                             <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Dataset Target</p>
-                            <p className="text-sm text-foreground">Capture more samples for better Python training coverage.</p>
+                            <p className="text-[13px] leading-snug text-foreground">Capture more samples for stronger Python training coverage.</p>
                           </div>
                           <Input
                             type="number"
@@ -812,19 +815,19 @@ export default function Employees() {
                             onChange={(event) => {
                               setDatasetSamplesTarget(clamp(Number(event.target.value) || DEFAULT_DATASET_SAMPLES, MIN_DATASET_SAMPLES, MAX_DATASET_SAMPLES));
                             }}
-                            className="w-24 text-center"
+                            className="h-8 w-[72px] px-2 text-center text-sm"
                             disabled={isCapturingDataset}
                           />
                         </div>
-                        <p className="text-xs text-muted-foreground">
+                        <p className="text-[11px] leading-relaxed text-muted-foreground">
                           Ask the employee to look front, slightly left, slightly right, and move naturally while the dataset is being captured.
                         </p>
                       </div>
                     </div>
 
-                    <div className="space-y-4">
-                      <div className="relative overflow-hidden rounded-[1.9rem] border border-border/70 bg-black">
-                        <div className="aspect-[4/3] overflow-hidden">
+                    <div className="grid gap-2.5 xl:grid-cols-[minmax(0,1fr)_260px] xl:items-start">
+                      <div className="relative overflow-hidden rounded-[1.5rem] border border-border/70 bg-black xl:row-span-5">
+                        <div className="aspect-[16/9] overflow-hidden xl:aspect-[2/1]">
                           <video
                             ref={videoRef}
                             autoPlay
@@ -844,9 +847,9 @@ export default function Employees() {
                           )}
                           <canvas ref={canvasRef} className="hidden" />
                           <div className="pointer-events-none absolute inset-0">
-                            <div className="absolute inset-5 rounded-[1.8rem] border border-white/20" />
-                            <div className="absolute inset-x-[22%] inset-y-[12%] rounded-[2rem] border-[3px] border-emerald-300/70 shadow-[0_0_0_1px_rgba(110,231,183,0.35),0_0_24px_rgba(16,185,129,0.18)]" />
-                            <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
+                            <div className="absolute inset-4 rounded-[1.35rem] border border-white/20" />
+                            <div className="absolute inset-x-[24%] inset-y-[14%] rounded-[1.75rem] border-[3px] border-emerald-300/70 shadow-[0_0_0_1px_rgba(110,231,183,0.35),0_0_18px_rgba(16,185,129,0.16)]" />
+                            <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-black/65 px-3 py-1 text-[10px] font-semibold tracking-[0.24em] text-white/90">
                               PYTHON DATASET
                             </div>
                           </div>
@@ -855,7 +858,7 @@ export default function Employees() {
                               <div className="rounded-2xl bg-black/80 px-4 py-3 text-center text-sm font-medium text-white shadow-xl backdrop-blur-md">
                                 Capturing sample {captureProgress} / {datasetSamplesTarget}
                               </div>
-                              <div className="rounded-2xl bg-primary/95 px-6 py-4 text-center text-xl font-bold text-primary-foreground shadow-2xl animate-in zoom-in duration-300">
+                              <div className="rounded-2xl bg-primary/95 px-5 py-3 text-center text-lg font-bold text-primary-foreground shadow-2xl animate-in zoom-in duration-300">
                                 {captureProgress / datasetSamplesTarget < 0.2 && "Look straight at the camera"}
                                 {captureProgress / datasetSamplesTarget >= 0.2 && captureProgress / datasetSamplesTarget < 0.4 && "Turn head slightly left"}
                                 {captureProgress / datasetSamplesTarget >= 0.4 && captureProgress / datasetSamplesTarget < 0.6 && "Turn head slightly right"}
@@ -867,7 +870,7 @@ export default function Employees() {
                         </div>
                       </div>
 
-                      <div className="space-y-2 rounded-xl border border-dashed border-border/70 bg-muted/20 p-3">
+                      <div className="space-y-1.5 rounded-xl border border-dashed border-border/70 bg-muted/20 p-2.5 xl:col-start-2">
                         <div className="flex items-center justify-between gap-3">
                           <div>
                             <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Profile photo (optional)</p>
@@ -877,39 +880,40 @@ export default function Employees() {
                             <img
                               src={profilePhoto}
                               alt="Profile preview"
-                              className="h-14 w-14 rounded-2xl object-cover border border-border/70 shadow-sm"
+                              className="h-10 w-10 rounded-xl object-cover border border-border/70 shadow-sm"
                             />
                           )}
                         </div>
-                        <Input type="file" accept="image/*" onChange={handleProfilePhotoChange} />
+                        <Input className="h-9 text-sm" type="file" accept="image/*" onChange={handleProfilePhotoChange} />
                       </div>
 
-                      <div className="grid gap-3 sm:grid-cols-3">
-                        <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Captured</p>
-                          <p className="text-lg font-semibold text-foreground">{datasetPhotos.length}</p>
+                      <div className="space-y-2 rounded-xl bg-muted/30 p-2.5 xl:col-start-2">
+                        <div className="grid grid-cols-3 gap-1.5">
+                          <div className="rounded-lg bg-background/60 px-2 py-1.5">
+                            <p className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Captured</p>
+                            <p className="text-sm font-semibold text-foreground">{datasetPhotos.length}</p>
+                          </div>
+                          <div className="rounded-lg bg-background/60 px-2 py-1.5">
+                            <p className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Minimum</p>
+                            <p className="text-sm font-semibold text-foreground">{MIN_DATASET_SAMPLES}</p>
+                          </div>
+                          <div className="rounded-lg bg-background/60 px-2 py-1.5">
+                            <p className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">Training</p>
+                            <p className="text-sm font-semibold text-foreground">{datasetReady ? "Ready" : "Pending"}</p>
+                          </div>
                         </div>
-                        <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Minimum</p>
-                          <p className="text-lg font-semibold text-foreground">{MIN_DATASET_SAMPLES}</p>
-                        </div>
-                        <div className="rounded-xl bg-muted/30 px-3 py-2">
-                          <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Training</p>
-                          <p className="text-lg font-semibold text-foreground">{datasetReady ? "Ready" : "Pending"}</p>
+                        <div className="h-1.5 overflow-hidden rounded-full bg-background/70">
+                          <div
+                            className="h-full rounded-full bg-primary transition-all duration-300"
+                            style={{ width: `${(datasetPhotos.length / Math.max(1, datasetSamplesTarget)) * 100}%` }}
+                          />
                         </div>
                       </div>
 
-                      <div className="h-2 overflow-hidden rounded-full bg-muted">
-                        <div
-                          className="h-full rounded-full bg-primary transition-all duration-300"
-                          style={{ width: `${(datasetPhotos.length / Math.max(1, datasetSamplesTarget)) * 100}%` }}
-                        />
-                      </div>
-
-                      <div className="flex flex-col gap-2 sm:flex-row">
+                      <div className="flex flex-col gap-1.5 sm:flex-row xl:col-start-2 xl:flex-col">
                         <Button
                           type="button"
-                          className="flex-1"
+                          className="h-10 flex-1 text-sm"
                           onClick={handleCaptureDataset}
                           disabled={!cameraActive || isCapturingDataset}
                         >
@@ -933,6 +937,7 @@ export default function Employees() {
                         <Button
                           type="button"
                           variant="outline"
+                          className="h-10 text-sm"
                           onClick={datasetPhotos.length ? handleClearDataset : () => setCameraRetryToken((value) => value + 1)}
                           disabled={isCapturingDataset}
                         >
@@ -950,7 +955,7 @@ export default function Employees() {
                         </Button>
                       </div>
 
-                      <div className="rounded-xl border border-dashed border-border/80 bg-muted/20 px-4 py-3 text-sm">
+                      <div className="rounded-xl border border-dashed border-border/80 bg-muted/20 px-2.5 py-2 text-[13px] leading-snug xl:col-start-2">
                         {datasetReady ? (
                           <div className="flex items-start gap-2 text-emerald-700">
                             <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
@@ -970,17 +975,21 @@ export default function Employees() {
                       </div>
 
                       {datasetError && (
-                        <p className="text-sm font-medium text-destructive">{datasetError}</p>
+                        <p className="text-xs font-medium text-destructive xl:col-start-2">{datasetError}</p>
                       )}
                     </div>
                   </div>
                 </div>
 
-                <DialogFooter className="pt-2">
-                  <Button type="button" variant="ghost" onClick={() => handleDialogChange(false)}>
+                  </div>
+                </div>
+
+                <DialogFooter className="shrink-0 border-t border-border/70 bg-background/95 px-4 py-2.5 sm:px-5">
+                  <Button className="h-10 px-4" type="button" variant="ghost" onClick={() => handleDialogChange(false)}>
                     Cancel
                   </Button>
                   <Button
+                    className="h-10 px-4"
                     type="submit"
                     disabled={pythonEnrollEmployee.isPending || isCapturingDataset || !datasetReady || !rfidReady}
                   >

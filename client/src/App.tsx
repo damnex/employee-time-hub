@@ -48,7 +48,7 @@ function App() {
               <AppSidebar />
               <div className="flex min-w-0 flex-1 flex-col">
                 <header className="flex h-16 items-center gap-4 border-b border-border/60 bg-background/92 px-6 shadow-sm backdrop-blur shrink-0 z-10">
-                  <SidebarTrigger className="-ml-1 h-10 w-10 rounded-xl border border-border/70 bg-background/80 shadow-sm" />
+                  <SidebarTrigger className="-ml-1 h-11 w-11 rounded-2xl bg-background/90 shadow-[0_10px_28px_rgba(15,23,42,0.08)]" />
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-semibold text-foreground">Syncronize</p>
                     <p className="text-xs text-muted-foreground">Access Control Platform</p>

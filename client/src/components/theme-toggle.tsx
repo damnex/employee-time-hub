@@ -12,7 +12,7 @@ export function ThemeToggle() {
       type="button"
       variant="outline"
       size="icon"
-      className="h-10 w-10 rounded-xl"
+      className="h-11 w-11 rounded-2xl border-border/70 bg-background/90 text-foreground shadow-[0_10px_28px_rgba(15,23,42,0.08)] hover:bg-accent hover:text-accent-foreground [&_svg]:size-5"
       onClick={() => setTheme(nextTheme)}
     >
       {resolvedTheme === "dark" ? <SunMedium /> : <Moon />}
