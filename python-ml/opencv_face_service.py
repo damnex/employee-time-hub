@@ -18,6 +18,13 @@ from typing import Any
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
+from opencv_face_backend import (
+    GRAY_NN_MODEL_TYPE,
+    LBPH_MODEL_TYPE,
+    create_lbph_recognizer,
+    load_gray_nn_model,
+    resolve_prediction,
+)
 
 DATA_URL_PATTERN = re.compile(r"^data:image/[a-zA-Z0-9.+-]+;base64,(.+)$")
 
@@ -478,11 +485,19 @@ def predict_face_box(
     labels: dict[int, LabelRecord],
     image_size: int,
     distance_threshold: float,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
 ) -> FramePrediction:
     prepared_face, output_box, center_x, area_ratio = prepare_face_crop(gray_frame, face_box, image_size)
-    predicted_label_id, distance = recognizer.predict(prepared_face)
+    predicted_label_id, distance, accepted = resolve_prediction(
+        recognizer,
+        prepared_face,
+        distance_threshold,
+        score_margin_threshold,
+        centroid_margin_threshold,
+    )
     label = labels.get(int(predicted_label_id))
-    if label is None or not label.included_in_training or float(distance) > distance_threshold:
+    if label is None or not label.included_in_training or not accepted:
         return FramePrediction(
             label=None,
             distance=float(distance),
@@ -508,6 +523,8 @@ def predict_frame(
     labels: dict[int, LabelRecord],
     image_size: int,
     distance_threshold: float,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
 ) -> FramePrediction:
     image = normalize_lighting(decode_frame(frame_payload))
@@ -528,6 +545,8 @@ def predict_frame(
             labels,
             image_size,
             distance_threshold,
+            score_margin_threshold,
+            centroid_margin_threshold,
         )
         if prediction.box is None:
             continue
@@ -650,6 +669,25 @@ def build_response(
     chosen_predictions = [
         prediction for prediction in verified_predictions if prediction.label and prediction.label.folder_name == best_folder_name  # type: ignore
     ]
+    min_verified_votes = max(2, min(3, max(1, len(predictions) // 2)))
+    if len(chosen_predictions) < min_verified_votes:
+        best_distance = min(
+            (prediction.distance for prediction in predictions if prediction.distance is not None),
+            default=None,
+        )
+        return {
+            "verified": False,
+            "employee": None,
+            "matchConfidence": 0.0,
+            "bestDistance": round_float(best_distance, 3) if best_distance is not None else None,
+            "distanceThreshold": distance_threshold,
+            "movementDirection": direction,
+            "movementAxis": axis,
+            "movementConfidence": direction_confidence,
+            "framesProcessed": len(predictions),
+            "framesWithFace": len([prediction for prediction in predictions if prediction.box is not None]),
+            "bestBox": None,
+        }
     best_prediction = min(
         chosen_predictions,
         key=lambda prediction: prediction.distance if prediction.distance is not None else float("inf"),
@@ -698,6 +736,8 @@ def recognize_faces_in_image(
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
     max_faces: int,
 ) -> tuple[list[LiveRecognitionFace], int, int]:
@@ -718,6 +758,8 @@ def recognize_faces_in_image(
             labels,
             image_size,
             distance_threshold,
+            score_margin_threshold,
+            centroid_margin_threshold,
         )
         if prediction.box is None:
             continue
@@ -771,6 +813,8 @@ def recognize_face(
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
     max_faces: int,
 ) -> dict[str, Any]:
@@ -782,6 +826,8 @@ def recognize_face(
         labels,
         distance_threshold,
         image_size,
+        score_margin_threshold,
+        centroid_margin_threshold,
         args,
         max_faces,
     )
@@ -855,6 +901,8 @@ def handle_verify_burst(
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     frames = request.get("frames", [])
@@ -862,7 +910,18 @@ def handle_verify_burst(
         raise ValueError("No frames were provided for verification.")
 
     predictions = [
-        predict_frame(str(frame_payload), recognizer, detector, eye_detector, labels, image_size, distance_threshold, args)
+        predict_frame(
+            str(frame_payload),
+            recognizer,
+            detector,
+            eye_detector,
+            labels,
+            image_size,
+            distance_threshold,
+            score_margin_threshold,
+            centroid_margin_threshold,
+            args,
+        )
         for frame_payload in frames
     ]
 
@@ -882,6 +941,8 @@ def handle_recognize_frame(
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     frame_payload = request.get("frame")
@@ -897,6 +958,8 @@ def handle_recognize_frame(
         labels,
         distance_threshold,
         image_size,
+        score_margin_threshold,
+        centroid_margin_threshold,
         args,
         max_faces,
     )
@@ -934,6 +997,8 @@ def handle_recognize_live_camera(
     labels: dict[int, LabelRecord],
     distance_threshold: float,
     image_size: int,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     trigger_timestamp_ms = int(request.get("timestamp") or 0)
@@ -961,6 +1026,8 @@ def handle_recognize_live_camera(
             labels,
             distance_threshold,
             image_size,
+            score_margin_threshold,
+            centroid_margin_threshold,
             args,
             max_faces,
         )
@@ -989,19 +1056,38 @@ def emit_response(payload: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
-    if not hasattr(cv2, "face"):
-        print("OpenCV face module is unavailable.", file=sys.stderr)
-        return 1
 
     labels, labels_payload = load_labels(args.labels)
+    model_type = str(labels_payload.get("modelType") or LBPH_MODEL_TYPE)
+    image_size = int(labels_payload.get("imageSize", 200))
+    labels_threshold = float(labels_payload.get("threshold", 65.0 if model_type == LBPH_MODEL_TYPE else 0.28))
+    score_margin_threshold = (
+        float(labels_payload["scoreMarginThreshold"])
+        if labels_payload.get("scoreMarginThreshold") is not None
+        else None
+    )
+    centroid_margin_threshold = (
+        float(labels_payload["centroidMarginThreshold"])
+        if labels_payload.get("centroidMarginThreshold") is not None
+        else None
+    )
+    recognizer: Any
+    if model_type == LBPH_MODEL_TYPE:
+        recognizer = create_lbph_recognizer()
+        recognizer.read(str(args.model.resolve()))
+    elif model_type == GRAY_NN_MODEL_TYPE:
+        recognizer, stored_threshold, stored_image_size = load_gray_nn_model(args.model.resolve())
+        labels_threshold = stored_threshold
+        image_size = stored_image_size
+    else:
+        print(f"Unsupported face model type: {model_type}", file=sys.stderr)
+        return 1
+
     distance_threshold = (
         float(args.distance_threshold)
         if args.distance_threshold is not None
-        else float(labels_payload.get("threshold", 65.0))
+        else labels_threshold
     )
-    image_size = int(labels_payload.get("imageSize", 200))
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.read(str(args.model.resolve()))
     detector = create_detector()
     eye_detector = create_eye_detector()
     camera = LatestFrameCamera(args)
@@ -1026,6 +1112,8 @@ def main() -> int:
                         labels,
                         distance_threshold,
                         image_size,
+                        score_margin_threshold,
+                        centroid_margin_threshold,
                         args,
                     )
                 elif action == "recognize_frame":
@@ -1037,6 +1125,8 @@ def main() -> int:
                         labels,
                         distance_threshold,
                         image_size,
+                        score_margin_threshold,
+                        centroid_margin_threshold,
                         args,
                     )
                 elif action == "recognize_live_camera":
@@ -1049,6 +1139,8 @@ def main() -> int:
                         labels,
                         distance_threshold,
                         image_size,
+                        score_margin_threshold,
+                        centroid_margin_threshold,
                         args,
                     )
                 else:

@@ -2,7 +2,7 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { promises as fs } from "fs";
 import { storage } from "./storage";
-import { allowInsecureFaceFallback, useTriggeredCameraFaceRecognition } from "./env";
+import { allowInsecureFaceFallback, allowPythonGateFrameAppend, useTriggeredCameraFaceRecognition } from "./env";
 import { api } from "@shared/routes";
 import {
   faceProfileSchema,
@@ -43,6 +43,8 @@ import { stopManagedRfidService, warmRfidService } from "./rfid-service";
 import { handleRfidIntegration } from "./rfid-handler";
 import { handleVisionIntegration } from "./vision-handler";
 import { handleFaceIntegration } from "./face-handler";
+import { addRFID } from "./buffer";
+import { refreshScoreMatrix } from "./score-matrix";
 import { decisionEngine } from "./decision-engine";
 const SESSION_TIMEOUT_SWEEP_MS = 1000;
 type AttendanceAction = "ENTRY" | "EXIT";
@@ -1031,8 +1033,8 @@ async function processPythonRfidScan(args: {
       });
     }
 
-    // Enrich training data with the latest gate frames for this employee (non-blocking to avoid latency).
-    if (verification.employee.folderName) {
+    // Only opt in to live gate frame enrichment when explicitly enabled.
+    if (allowPythonGateFrameAppend() && verification.employee.folderName) {
       void appendEmployeeDatasetFrames({
         folderName: verification.employee.folderName,
         frames: input.faceFrames,
@@ -2118,6 +2120,14 @@ export async function registerRoutes(
       }).parse(req.body);
 
       const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
+      const timestampMs = Date.now();
+
+      addRFID({
+        tag: normalizedRfidUid,
+        timestamp: timestampMs,
+      });
+      refreshScoreMatrix(timestampMs);
+
       const detection = gateMatchingEngine.recordRfidDetection({
         deviceId: input.deviceId,
         rfidUid: normalizedRfidUid,
@@ -2127,6 +2137,7 @@ export async function registerRoutes(
       const fusion = await decisionEngine.ingestRfid({
         deviceId: input.deviceId,
         rfidTag: normalizedRfidUid,
+        timestampMs,
         scanTechnology: input.scanTechnology ?? "UHF_RFID",
       });
       const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
@@ -2223,5 +2234,7 @@ export async function registerRoutes(
 
   return httpServer;
 }
+
+
 
 

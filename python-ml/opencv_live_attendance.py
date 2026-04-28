@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run live attendance using OpenCV LBPH with webcam first and RTSP later."""
+"""Run live attendance using the trained OpenCV face model."""
 
 from __future__ import annotations
 
@@ -16,6 +16,13 @@ from typing import Any
 
 import cv2
 import numpy as np
+from opencv_face_backend import (
+    GRAY_NN_MODEL_TYPE,
+    LBPH_MODEL_TYPE,
+    create_lbph_recognizer,
+    load_gray_nn_model,
+    resolve_prediction,
+)
 
 EVENT_FIELDS = [
     "timestamp",
@@ -71,7 +78,7 @@ class SessionAttendance:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run laptop-webcam or RTSP attendance using an OpenCV LBPH model. "
+            "Run laptop-webcam or RTSP attendance using the trained OpenCV face model. "
             "Use --source 0 for the laptop webcam now."
         )
     )
@@ -222,6 +229,8 @@ def recognize_frame(
     labels: dict[int, LabelRecord],
     image_size: int,
     threshold: float,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
     args: argparse.Namespace,
 ) -> list[DetectionResult]:
     working_frame, scale_factor = resize_frame(frame, args.resize_width)
@@ -232,9 +241,15 @@ def recognize_frame(
     detections: list[DetectionResult] = []
     for index, box in enumerate(scaled_boxes):
         prepared_face = prepare_face_crop(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), box, image_size)
-        label_id, distance = recognizer.predict(prepared_face)
+        label_id, distance, accepted = resolve_prediction(
+            recognizer,
+            prepared_face,
+            threshold,
+            score_margin_threshold,
+            centroid_margin_threshold,
+        )
         label_record = labels.get(int(label_id))
-        verified = label_record is not None and distance <= threshold and label_record.included_in_training
+        verified = label_record is not None and accepted and label_record.included_in_training
         detections.append(
             DetectionResult(
                 face_index=index,
@@ -392,12 +407,13 @@ def write_session_summary(
     threshold: float,
     session_started_at: str,
     session_attendance: dict[str, SessionAttendance],
+    model_type: str,
 ) -> None:
     payload = {
         "sessionStartedAt": session_started_at,
         "sessionEndedAt": datetime.now(UTC).isoformat(),
         "source": source_label,
-        "modelType": "opencv-lbph",
+        "modelType": model_type,
         "threshold": threshold,
         "rosterSize": roster_size,
         "attendanceMarked": len(session_attendance),
@@ -420,17 +436,32 @@ def write_session_summary(
 
 def main() -> int:
     args = parse_args()
-    if not hasattr(cv2, "face"):
-        print(
-            "OpenCV face module is unavailable. Install requirements-webcam.txt with opencv-contrib-python.",
-            file=sys.stderr,
-        )
-        return 1
-
+    labels_payload = json.loads(args.labels.resolve().read_text(encoding="utf-8"))
+    model_type = str(labels_payload.get("modelType") or LBPH_MODEL_TYPE)
     labels, trained_threshold, image_size = load_labels(args.labels)
     threshold = float(args.distance_threshold) if args.distance_threshold is not None else trained_threshold
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.read(str(args.model.resolve()))
+    score_margin_threshold = (
+        float(labels_payload["scoreMarginThreshold"])
+        if labels_payload.get("scoreMarginThreshold") is not None
+        else None
+    )
+    centroid_margin_threshold = (
+        float(labels_payload["centroidMarginThreshold"])
+        if labels_payload.get("centroidMarginThreshold") is not None
+        else None
+    )
+    recognizer: Any
+    if model_type == LBPH_MODEL_TYPE:
+        recognizer = create_lbph_recognizer()
+        recognizer.read(str(args.model.resolve()))
+    elif model_type == GRAY_NN_MODEL_TYPE:
+        recognizer, stored_threshold, stored_image_size = load_gray_nn_model(args.model.resolve())
+        if args.distance_threshold is None:
+            threshold = stored_threshold
+        image_size = stored_image_size
+    else:
+        print(f"Unsupported face model type: {model_type}", file=sys.stderr)
+        return 1
     detector = create_detector()
 
     source_value = parse_source(args.source)
@@ -471,7 +502,17 @@ def main() -> int:
 
             frame_counter += 1
             if frame_counter % max(1, args.process_every_nth_frame) == 0:
-                latest_detections = recognize_frame(frame, recognizer, detector, labels, image_size, threshold, args)
+                latest_detections = recognize_frame(
+                    frame,
+                    recognizer,
+                    detector,
+                    labels,
+                    image_size,
+                    threshold,
+                    score_margin_threshold,
+                    centroid_margin_threshold,
+                    args,
+                )
                 current_labels = {
                     detection.label.folder_name
                     for detection in latest_detections
@@ -532,14 +573,15 @@ def main() -> int:
         if not args.no_display:
             cv2.destroyAllWindows()
 
-    write_session_summary(
-        summary_path,
-        source_label,
-        len([label for label in labels.values() if label.included_in_training]),
-        threshold,
-        session_started_at,
-        session_attendance,
-    )
+        write_session_summary(
+            summary_path,
+            source_label,
+            len([label for label in labels.values() if label.included_in_training]),
+            threshold,
+            session_started_at,
+            session_attendance,
+            model_type,
+        )
     print(f"Attendance events: {event_log_path}")
     print(f"Session summary: {summary_path}")
     print(f"Employees marked this session: {len(session_attendance)}")

@@ -14,6 +14,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { detectLiveTrackingFaces, isFaceDetectorAvailable } from "@/lib/biometrics";
+import type { LiveTrackedFaceDetection } from "@/lib/biometrics";
 import { fetchRfidActiveTags, fetchRfidTags, rfidQueryKeys } from "@/lib/rfid";
 import { cn } from "@/lib/utils";
 import {
@@ -34,21 +35,38 @@ import {
 
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
-const GATE_FRAME_COUNT = 3;
-const GATE_FRAME_DELAY_MS = 20;
+// Direction inference needs multiple spaced face positions, not just a few back-to-back frames.
+const GATE_FRAME_COUNT = 5;
+const GATE_FRAME_DELAY_MS = 90;
 const GATE_MAX_FRAME_WIDTH = 480;
 const GATE_FRAME_JPEG_QUALITY = 0.55;
 const LIVE_TRACKING_INTERVAL_MS = 120;
 const LIVE_TRACKING_BUSY_INTERVAL_MS = 190;
-const LIVE_RECOGNITION_INTERVAL_MS = 650;
-const LIVE_RECOGNITION_IDLE_DELAY_MS = 260;
+const LIVE_TRACKING_MIN_FACE_SCORE = 0.58;
+const LIVE_TRACKING_MIN_BOX_SCORE = 0.55;
+const LIVE_TRACKING_MIN_QUALITY = 0.52;
+const LIVE_TRACKING_MIN_STABLE_HITS = 2;
+const LIVE_TRACKING_MIN_WIDTH_RATIO = 0.08;
+const LIVE_TRACKING_MAX_WIDTH_RATIO = 0.58;
+const LIVE_TRACKING_MIN_HEIGHT_RATIO = 0.14;
+const LIVE_TRACKING_MAX_HEIGHT_RATIO = 0.78;
+const LIVE_TRACKING_MIN_ASPECT_RATIO = 0.55;
+const LIVE_TRACKING_MAX_ASPECT_RATIO = 1.28;
+const LIVE_TRACKING_MIN_CENTER_X = 0.16;
+const LIVE_TRACKING_MAX_CENTER_X = 0.84;
+const LIVE_TRACKING_MIN_CENTER_Y = 0.14;
+const LIVE_TRACKING_MAX_CENTER_Y = 0.88;
+const LIVE_RECOGNITION_INTERVAL_MS = 320;
+const LIVE_RECOGNITION_IDLE_DELAY_MS = 140;
+const LIVE_RECOGNITION_BUSY_BACKOFF_MS = 80;
 const LIVE_RECOGNITION_MAX_FRAME_WIDTH = 640;
 const LIVE_RECOGNITION_JPEG_QUALITY = 0.6;
 const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.68;
-const LIVE_RECOGNITION_STABLE_HITS = 3;
-const LIVE_RECOGNITION_TTL_MS = 2200;
+const LIVE_RECOGNITION_STABLE_HITS = 2;
+const LIVE_RECOGNITION_TTL_MS = 1200;
 const LIVE_RECOGNITION_MATCH_DISTANCE = 0.12;
 const SENSOR_ACTIVE_WINDOW_MS = 4500;
+const READER_EVENT_MEMORY_MS = 15000;
 
 type PythonFaceStatus = "training" | "trained" | "failed";
 
@@ -102,6 +120,14 @@ type LiveTrackedFace = ProjectedLiveFace & {
   lastSeenAt?: number;
 };
 
+type LiveTrackAnchor = {
+  trackId: number;
+  centerX: number;
+  centerY: number;
+  stableHits: number;
+  lastSeenAt: number;
+};
+
 type LiveRecognitionAssignment = {
   trackId: number;
   label: string;
@@ -112,6 +138,14 @@ type LiveRecognitionAssignment = {
   verified: true;
   stableHits: number;
   lastSeenAt: number;
+};
+
+type PendingGateScan = {
+  queueKey: string;
+  rfidUid: string;
+  sourceDeviceId: string;
+  source: "manual" | "reader";
+  enqueuedAt: number;
 };
 
 type GateDisplayResult = {
@@ -317,13 +351,14 @@ function mapFaceBoxToViewport(
 
 function buildTrackedFaces(
   projectedFaces: ProjectedLiveFace[],
-  previousTracksRef: MutableRefObject<Array<{ trackId: number; centerX: number; centerY: number }>>,
+  previousTracksRef: MutableRefObject<LiveTrackAnchor[]>,
   nextTrackIdRef: MutableRefObject<number>,
 ): LiveTrackedFace[] {
   const previousTracks = [...previousTracksRef.current];
   const usedTrackIds = new Set<number>();
+  const now = Date.now();
   const nextTrackedFaces = projectedFaces.map((face) => {
-    let matchedTrack = previousTracks.find((track) => {
+    let matchedTrack: LiveTrackAnchor | null = previousTracks.find((track) => {
       if (usedTrackIds.has(track.trackId)) {
         return false;
       }
@@ -331,24 +366,29 @@ function buildTrackedFaces(
       const dx = track.centerX - face.centerX;
       const dy = track.centerY - face.centerY;
       return Math.sqrt(dx * dx + dy * dy) <= 0.18;
-    });
+    }) ?? null;
 
     if (!matchedTrack) {
       matchedTrack = {
         trackId: nextTrackIdRef.current++,
         centerX: face.centerX,
         centerY: face.centerY,
+        stableHits: 0,
+        lastSeenAt: 0,
       };
     }
 
     usedTrackIds.add(matchedTrack.trackId);
     const deltaX = face.centerX - matchedTrack.centerX;
     const movement = deltaX >= 0.015 ? "RIGHT" : deltaX <= -0.015 ? "LEFT" : "STEADY";
+    const stableHits = Math.min(matchedTrack.stableHits + 1, 8);
 
     return {
       ...face,
       trackId: matchedTrack.trackId,
       movement,
+      stableHits,
+      lastSeenAt: now,
     } satisfies LiveTrackedFace;
   });
 
@@ -356,9 +396,56 @@ function buildTrackedFaces(
     trackId: face.trackId,
     centerX: face.centerX,
     centerY: face.centerY,
+    stableHits: face.stableHits ?? 1,
+    lastSeenAt: face.lastSeenAt ?? now,
   }));
 
   return nextTrackedFaces;
+}
+
+function isReliableLiveTrackingDetection(
+  detection: LiveTrackedFaceDetection,
+  video: HTMLVideoElement,
+) {
+  const widthRatio = detection.bounds.width / Math.max(1, video.videoWidth);
+  const heightRatio = detection.bounds.height / Math.max(1, video.videoHeight);
+  const aspectRatio = detection.bounds.width / Math.max(1, detection.bounds.height);
+  const centerX = (detection.bounds.x + detection.bounds.width / 2) / Math.max(1, video.videoWidth);
+  const centerY = (detection.bounds.y + detection.bounds.height / 2) / Math.max(1, video.videoHeight);
+
+  if (detection.faceScore < LIVE_TRACKING_MIN_FACE_SCORE) {
+    return false;
+  }
+
+  if (detection.boxScore < LIVE_TRACKING_MIN_BOX_SCORE) {
+    return false;
+  }
+
+  if (detection.quality < LIVE_TRACKING_MIN_QUALITY) {
+    return false;
+  }
+
+  if (widthRatio < LIVE_TRACKING_MIN_WIDTH_RATIO || widthRatio > LIVE_TRACKING_MAX_WIDTH_RATIO) {
+    return false;
+  }
+
+  if (heightRatio < LIVE_TRACKING_MIN_HEIGHT_RATIO || heightRatio > LIVE_TRACKING_MAX_HEIGHT_RATIO) {
+    return false;
+  }
+
+  if (aspectRatio < LIVE_TRACKING_MIN_ASPECT_RATIO || aspectRatio > LIVE_TRACKING_MAX_ASPECT_RATIO) {
+    return false;
+  }
+
+  if (centerX < LIVE_TRACKING_MIN_CENTER_X || centerX > LIVE_TRACKING_MAX_CENTER_X) {
+    return false;
+  }
+
+  if (centerY < LIVE_TRACKING_MIN_CENTER_Y || centerY > LIVE_TRACKING_MAX_CENTER_Y) {
+    return false;
+  }
+
+  return true;
 }
 
 function getProjectedFaceDistance(leftFace: ProjectedLiveFace, rightFace: ProjectedLiveFace) {
@@ -440,10 +527,10 @@ export default function GateTerminal() {
     refetchInterval: 1500,
   });
   const cameraViewportRef = useRef<HTMLDivElement>(null);
-  const pythonPreviousLiveTracksRef = useRef<Array<{ trackId: number; centerX: number; centerY: number }>>([]);
+  const pythonPreviousLiveTracksRef = useRef<LiveTrackAnchor[]>([]);
   const pythonNextTrackIdRef = useRef(1);
   const pythonMissCountRef = useRef(0);
-  const browserPreviousLiveTracksRef = useRef<Array<{ trackId: number; centerX: number; centerY: number }>>([]);
+  const browserPreviousLiveTracksRef = useRef<LiveTrackAnchor[]>([]);
   const browserNextTrackIdRef = useRef(1);
   const browserMissCountRef = useRef(0);
   const browserTrackedFacesRef = useRef<LiveTrackedFace[]>([]);
@@ -466,16 +553,15 @@ export default function GateTerminal() {
   const [liveTrackerAvailable, setLiveTrackerAvailable] = useState<boolean | null>(null);
   const [liveRecognitionMessage, setLiveRecognitionMessage] = useState<string | null>(null);
   const [sensorWindowOpen, setSensorWindowOpen] = useState(false);
-  const [pendingReaderScan, setPendingReaderScan] = useState<{
-    rfidUid: string;
-    sourceDeviceId: string;
-  } | null>(null);
+  const [pendingScans, setPendingScans] = useState<PendingGateScan[]>([]);
   const [lastResult, setLastResult] = useState<GateDisplayResult | null>(null);
   const [manualTriggerOpen, setManualTriggerOpen] = useState(false);
-  const lastProcessedReaderDetectionRef = useRef<number>(0);
+  const queueDrainActiveRef = useRef(false);
+  const queuedScanKeysRef = useRef(new Set<string>());
+  const seenReaderDetectionsRef = useRef(new Map<string, number>());
 
   const busy = isCapturingFrames || scanMutation.isPending;
-  const sensorWindowActive = sensorWindowOpen || busy;
+  const sensorWindowActive = sensorWindowOpen || busy || pendingScans.length > 0;
   const busyRef = useRef(busy);
   const readerConnected = Boolean(readerTagsQuery.data?.connected && readerTagsQuery.data?.running);
   const readerEndpointLabel = readerTagsQuery.data?.port ?? "UHFReader18";
@@ -583,6 +669,46 @@ export default function GateTerminal() {
     browserTrackedFacesRef.current = browserTrackedFaces;
   }, [browserTrackedFaces]);
 
+  const enqueuePendingScans = useCallback((scans: PendingGateScan[]) => {
+    if (!scans.length) {
+      return;
+    }
+
+    setPendingScans((previous) => {
+      const nextScans = scans.filter((scan) => {
+        return !queuedScanKeysRef.current.has(scan.queueKey);
+      });
+
+      if (!nextScans.length) {
+        return previous;
+      }
+
+      for (const scan of nextScans) {
+        queuedScanKeysRef.current.add(scan.queueKey);
+      }
+
+      return [...previous, ...nextScans];
+    });
+  }, []);
+
+  const rememberReaderDetection = useCallback((detectionKey: string, detectedAtMs: number) => {
+    const seenEvents = seenReaderDetectionsRef.current;
+    const minAllowedTimestamp = detectedAtMs - READER_EVENT_MEMORY_MS;
+
+    for (const [key, timestamp] of Array.from(seenEvents.entries())) {
+      if (timestamp < minAllowedTimestamp) {
+        seenEvents.delete(key);
+      }
+    }
+
+    if (seenEvents.has(detectionKey)) {
+      return false;
+    }
+
+    seenEvents.set(detectionKey, detectedAtMs);
+    return true;
+  }, []);
+
   const armSensorWindow = useCallback((durationMs = SENSOR_ACTIVE_WINDOW_MS) => {
     setSensorWindowOpen(true);
 
@@ -683,7 +809,7 @@ export default function GateTerminal() {
     let timerId: number | null = null;
 
     const scheduleNext = (
-      delayMs = busyRef.current ? LIVE_RECOGNITION_INTERVAL_MS + 180 : LIVE_RECOGNITION_INTERVAL_MS,
+      delayMs = busyRef.current ? LIVE_RECOGNITION_INTERVAL_MS + LIVE_RECOGNITION_BUSY_BACKOFF_MS : LIVE_RECOGNITION_INTERVAL_MS,
     ) => {
       if (cancelled) {
         return;
@@ -719,7 +845,7 @@ export default function GateTerminal() {
       }
 
       if (busyRef.current) {
-        scheduleNext(LIVE_RECOGNITION_INTERVAL_MS + 180);
+        scheduleNext(LIVE_RECOGNITION_INTERVAL_MS + LIVE_RECOGNITION_BUSY_BACKOFF_MS);
         return;
       }
 
@@ -890,7 +1016,6 @@ export default function GateTerminal() {
       || !videoRef.current
       || !cameraViewportRef.current
       || liveTrackerAvailable === false
-      || !sensorWindowActive
     ) {
       setBrowserTrackedFaces([]);
       browserTrackedFacesRef.current = [];
@@ -936,6 +1061,10 @@ export default function GateTerminal() {
         }
 
         const projectedFaces = detections.reduce<ProjectedLiveFace[]>((result, detection) => {
+          if (!isReliableLiveTrackingDetection(detection, videoRef.current!)) {
+            return result;
+          }
+
           const projectedFace = mapRectToViewport(
             detection.bounds.x,
             detection.bounds.y,
@@ -976,8 +1105,11 @@ export default function GateTerminal() {
           browserPreviousLiveTracksRef,
           browserNextTrackIdRef,
         );
-        browserTrackedFacesRef.current = nextTrackedFaces;
-        setBrowserTrackedFaces(nextTrackedFaces);
+        const nextVisibleTrackedFaces = nextTrackedFaces.filter((face) => {
+          return (face.stableHits ?? 0) >= LIVE_TRACKING_MIN_STABLE_HITS;
+        });
+        browserTrackedFacesRef.current = nextVisibleTrackedFaces;
+        setBrowserTrackedFaces(nextVisibleTrackedFaces);
       } catch (error) {
         console.warn("Live motion tracker failed:", error);
         browserMissCountRef.current += 1;
@@ -1003,7 +1135,7 @@ export default function GateTerminal() {
       browserPreviousLiveTracksRef.current = [];
       browserMissCountRef.current = 0;
     };
-  }, [cameraActive, liveTrackerAvailable, sensorWindowActive]);
+  }, [cameraActive, liveTrackerAvailable]);
 
   const captureFrameBurst = useCallback(async () => {
     if (!videoRef.current || !canvasRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
@@ -1083,18 +1215,9 @@ export default function GateTerminal() {
     }
 
     if (visibleFaceCount > 1) {
-      setLastResult({
-        success: false,
-        message: "Multiple people are in view. Keep only one face visible before scanning again.",
-        employee: badgeOwner,
-        badgeOwner,
-        verifiedAt: new Date().toLocaleTimeString(),
-        latencyMs: Math.round(performance.now() - scanStartedAt),
-        previewImage: null,
-        source,
-        previewFrameSize: null,
-      });
-      return;
+      setReaderMessage(
+        `Multiple faces are in view (${visibleFaceCount}). Running queued badge verification in order and letting Python pick the best match.`,
+      );
     }
 
     setIsCapturingFrames(true);
@@ -1162,52 +1285,64 @@ export default function GateTerminal() {
     const sourceDeviceId = readerEndpointLabel;
     setReaderSourceDeviceId(sourceDeviceId);
 
-    if (activeReaderTags.length > 1) {
-      setReaderMessage(
-        `Multiple active UHF tags detected (${activeReaderTags.length}). Keep only one tag in the read zone for face verification.`,
-      );
-      return;
-    }
+    const newQueuedScans = [...activeReaderTags]
+      .sort((left, right) => left.first_seen_at - right.first_seen_at)
+      .reduce<PendingGateScan[]>((result, activeTag) => {
+        const detectionAtMs = Math.round(activeTag.first_seen_at * 1000);
+        const detectionKey = `${activeTag.epc}:${detectionAtMs}`;
 
-    const activeTag = activeReaderTags[0];
-    const detectionKey = Math.round(activeTag.first_seen_at * 1000);
-    if (detectionKey <= lastProcessedReaderDetectionRef.current) {
+        if (!rememberReaderDetection(detectionKey, detectionAtMs)) {
+          return result;
+        }
+
+        result.push({
+          queueKey: detectionKey,
+          rfidUid: activeTag.epc,
+          sourceDeviceId,
+          source: "reader",
+          enqueuedAt: detectionAtMs,
+        });
+        return result;
+      }, []);
+
+    if (!newQueuedScans.length) {
       return;
     }
-    lastProcessedReaderDetectionRef.current = detectionKey;
 
     armSensorWindow();
-    setRfidUid(activeTag.epc);
-    setLiveDetectedUid(activeTag.epc);
-    setReaderMessage(`Live UHF detection captured from ${sourceDeviceId}. Starting face verification.`);
+    setRfidUid(newQueuedScans[0].rfidUid);
+    setLiveDetectedUid(newQueuedScans[newQueuedScans.length - 1].rfidUid);
 
-    if (busy) {
-      setPendingReaderScan({
-        rfidUid: activeTag.epc,
-        sourceDeviceId,
-      });
-      return;
-    }
+    enqueuePendingScans(newQueuedScans);
 
-    void handleScan(activeTag.epc, "reader", sourceDeviceId);
+    setReaderMessage(
+      newQueuedScans.length > 1
+        ? `Queued ${newQueuedScans.length} UHF tags from ${sourceDeviceId} for sequential verification.`
+        : `Live UHF detection captured from ${sourceDeviceId}. Added to the verification queue.`,
+    );
   }, [
     activeReaderTags,
     armSensorWindow,
-    busy,
-    handleScan,
+    enqueuePendingScans,
     readerConnected,
     readerEndpointLabel,
+    rememberReaderDetection,
   ]);
 
   useEffect(() => {
-    if (!pendingReaderScan || busy) {
+    if (busy || !pendingScans.length || queueDrainActiveRef.current) {
       return;
     }
 
-    const queuedScan = pendingReaderScan;
-    setPendingReaderScan(null);
-    void handleScan(queuedScan.rfidUid, "reader", queuedScan.sourceDeviceId);
-  }, [busy, handleScan, pendingReaderScan]);
+    const [queuedScan, ...remainingScans] = pendingScans;
+    queueDrainActiveRef.current = true;
+    queuedScanKeysRef.current.delete(queuedScan.queueKey);
+    setPendingScans(remainingScans);
+
+    void handleScan(queuedScan.rfidUid, queuedScan.source, queuedScan.sourceDeviceId).finally(() => {
+      queueDrainActiveRef.current = false;
+    });
+  }, [busy, handleScan, pendingScans]);
 
   const handleManualSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1244,7 +1379,8 @@ export default function GateTerminal() {
     setRfidUid("");
     setReaderMessage(null);
     setLiveDetectedUid(null);
-    setPendingReaderScan(null);
+    setPendingScans([]);
+    queuedScanKeysRef.current.clear();
   };
 
   return (
@@ -1571,7 +1707,7 @@ export default function GateTerminal() {
                 )}
                 <AlertTitle className="text-foreground">
                   {lastResult?.ignored
-                    ? "Duplicate ignored"
+                    ? "Scan ignored"
                     : lastResult?.success
                       ? "Access granted"
                       : lastResult

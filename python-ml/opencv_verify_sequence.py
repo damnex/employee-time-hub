@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify a burst of gate frames with OpenCV LBPH and infer movement direction."""
+"""Verify a burst of gate frames with OpenCV face recognition and infer movement direction."""
 
 from __future__ import annotations
 
@@ -12,6 +12,13 @@ from typing import Any
 
 import cv2
 import numpy as np
+from opencv_face_backend import (
+    GRAY_NN_MODEL_TYPE,
+    LBPH_MODEL_TYPE,
+    create_lbph_recognizer,
+    load_gray_nn_model,
+    resolve_prediction,
+)
 
 
 @dataclass
@@ -37,7 +44,7 @@ class FramePrediction:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify a burst of gate frames with OpenCV LBPH and infer direction."
+        description="Verify a burst of gate frames with the trained OpenCV face model and infer direction."
     )
     parser.add_argument("--model", required=True, type=Path, help="Path to lbph-model.yml")
     parser.add_argument("--labels", required=True, type=Path, help="Path to lbph-labels.json")
@@ -128,6 +135,8 @@ def predict_frame(
     labels: dict[int, LabelRecord],
     image_size: int,
     distance_threshold: float,
+    score_margin_threshold: float | None,
+    centroid_margin_threshold: float | None,
 ) -> FramePrediction:
     image = cv2.imread(str(frame_path.resolve()))
     if image is None:
@@ -139,9 +148,15 @@ def predict_frame(
         return FramePrediction(label=None, distance=None, box=None, center_x=None, area_ratio=None)
 
     prepared_face, output_box, center_x, area_ratio = prepare_face_crop(gray_frame, face_box, image_size)
-    predicted_label_id, distance = recognizer.predict(prepared_face)
+    predicted_label_id, distance, accepted = resolve_prediction(
+        recognizer,
+        prepared_face,
+        distance_threshold,
+        score_margin_threshold,
+        centroid_margin_threshold,
+    )
     label = labels.get(int(predicted_label_id))
-    if label is None or not label.included_in_training or float(distance) > distance_threshold:
+    if label is None or not label.included_in_training or not accepted:
         return FramePrediction(label=None, distance=float(distance), box=output_box, center_x=center_x, area_ratio=area_ratio)
 
     return FramePrediction(
@@ -254,6 +269,25 @@ def build_response(
     chosen_predictions = [
         prediction for prediction in verified_predictions if prediction.label and prediction.label.folder_name == best_folder_name
     ]
+    min_verified_votes = max(2, min(3, max(1, len(predictions) // 2)))
+    if len(chosen_predictions) < min_verified_votes:
+        best_distance = min(
+            (prediction.distance for prediction in predictions if prediction.distance is not None),
+            default=None,
+        )
+        return {
+            "verified": False,
+            "employee": None,
+            "matchConfidence": 0.0,
+            "bestDistance": round_float(best_distance, 3) if best_distance is not None else None,
+            "distanceThreshold": distance_threshold,
+            "movementDirection": direction,
+            "movementAxis": axis,
+            "movementConfidence": direction_confidence,
+            "framesProcessed": len(predictions),
+            "framesWithFace": len([prediction for prediction in predictions if prediction.box is not None]),
+            "bestBox": None,
+        }
     best_prediction = min(chosen_predictions, key=lambda prediction: prediction.distance or float("inf"))
     average_distance = float(np.mean([prediction.distance for prediction in chosen_predictions if prediction.distance is not None]))
     match_confidence = clamp(1.0 - (average_distance / max(distance_threshold, 1.0)), 0.0, 1.0)
@@ -287,20 +321,48 @@ def build_response(
 
 def main() -> int:
     args = parse_args()
-    if not hasattr(cv2, "face"):
-        raise RuntimeError("OpenCV face module is unavailable.")
 
     labels, labels_payload = load_labels(args.labels)
-    distance_threshold = float(args.distance_threshold) if args.distance_threshold is not None else float(labels_payload.get("threshold", 65.0))
+    model_type = str(labels_payload.get("modelType") or LBPH_MODEL_TYPE)
     image_size = int(labels_payload.get("imageSize", 200))
+    labels_threshold = float(labels_payload.get("threshold", 65.0 if model_type == LBPH_MODEL_TYPE else 0.28))
+    score_margin_threshold = (
+        float(labels_payload["scoreMarginThreshold"])
+        if labels_payload.get("scoreMarginThreshold") is not None
+        else None
+    )
+    centroid_margin_threshold = (
+        float(labels_payload["centroidMarginThreshold"])
+        if labels_payload.get("centroidMarginThreshold") is not None
+        else None
+    )
     request_payload = json.loads(args.input_json.resolve().read_text(encoding="utf-8"))
     frame_paths = [Path(frame_path) for frame_path in request_payload.get("frames", [])]
-    recognizer = cv2.face.LBPHFaceRecognizer_create()
-    recognizer.read(str(args.model.resolve()))
+    recognizer: Any
+    if model_type == LBPH_MODEL_TYPE:
+        recognizer = create_lbph_recognizer()
+        recognizer.read(str(args.model.resolve()))
+    elif model_type == GRAY_NN_MODEL_TYPE:
+        recognizer, stored_threshold, stored_image_size = load_gray_nn_model(args.model.resolve())
+        labels_threshold = stored_threshold
+        image_size = stored_image_size
+    else:
+        raise RuntimeError(f"Unsupported face model type: {model_type}")
+
+    distance_threshold = float(args.distance_threshold) if args.distance_threshold is not None else labels_threshold
     detector = create_detector()
 
     predictions = [
-        predict_frame(frame_path, recognizer, detector, labels, image_size, distance_threshold)
+        predict_frame(
+            frame_path,
+            recognizer,
+            detector,
+            labels,
+            image_size,
+            distance_threshold,
+            score_margin_threshold,
+            centroid_margin_threshold,
+        )
         for frame_path in frame_paths
     ]
 

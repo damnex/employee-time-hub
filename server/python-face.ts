@@ -220,6 +220,19 @@ function getPythonFaceWorkerCameraArgs() {
   ];
 }
 
+function getPythonFaceWorkerDistanceArgs() {
+  loadEnvironment();
+  const distanceThreshold = process.env.PYTHON_FACE_DISTANCE_THRESHOLD?.trim();
+  if (!distanceThreshold) {
+    return [];
+  }
+
+  return [
+    "--distance-threshold",
+    distanceThreshold,
+  ];
+}
+
 export async function appendEmployeeDatasetFrames(args: { folderName: string; frames: string[] }) {
   const { folderName, frames } = args;
   if (!folderName || !frames.length) {
@@ -413,8 +426,7 @@ class PythonFaceWorker {
         "1.04",
         "--min-face-size",
         "24",
-        "--distance-threshold",
-        "120",
+        ...getPythonFaceWorkerDistanceArgs(),
         ...getPythonFaceWorkerCameraArgs(),
       ], {
         cwd: process.cwd(),

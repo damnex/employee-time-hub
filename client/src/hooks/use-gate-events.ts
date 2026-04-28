@@ -38,7 +38,7 @@ export function useGateEvents(filters?: GateEventFilters) {
       const data = await res.json();
       return api.gateEvents.list.responses[200].parse(data);
     },
-    refetchInterval: 5000,
+    refetchInterval: 1500,
     refetchIntervalInBackground: false,
   });
 }

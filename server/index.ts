@@ -1,4 +1,5 @@
 import express, { type Request, Response, NextFunction } from "express";
+import { attachDecisionUiEmitter } from "./decision-engine";
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
 import { createServer } from "http";
@@ -6,6 +7,7 @@ import { verifyDatabaseConnection } from "./db";
 
 const app = express();
 const httpServer = createServer(app);
+attachDecisionUiEmitter(httpServer);
 
 declare module "http" {
   interface IncomingMessage {

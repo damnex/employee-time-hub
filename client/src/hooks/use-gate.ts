@@ -70,7 +70,7 @@ export function useScanRFID() {
 
       if (data.ignored) {
         toast({
-          title: "Duplicate Ignored",
+          title: "Scan Ignored",
           description: data.message,
           className: "bg-amber-50 text-amber-900 border-amber-200",
         });

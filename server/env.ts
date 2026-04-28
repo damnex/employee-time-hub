@@ -126,6 +126,14 @@ export function useTriggeredCameraFaceRecognition() {
   );
 }
 
+export function allowPythonGateFrameAppend() {
+  loadEnvironment();
+  return isTruthyEnvValue(
+    process.env.PYTHON_FACE_APPEND_LIVE_GATE_FRAMES
+    ?? null,
+  );
+}
+
 export function getRfidServiceBaseUrl() {
   loadEnvironment();
   return process.env.RFID_SERVICE_BASE_URL?.trim() || "http://127.0.0.1:8001";

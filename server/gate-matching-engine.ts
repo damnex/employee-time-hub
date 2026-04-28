@@ -673,15 +673,6 @@ export class GateMatchingEngine {
       };
     }
 
-    if (!input.validation.directionPresent) {
-      return {
-        action: "IGNORE",
-        tier: "IGNORE",
-        reason: "Ignoring event because direction is missing from the matched window.",
-        timeoutFallback: false,
-      };
-    }
-
     if (input.confidence.tier === "LOW_CONFIDENCE") {
       return {
         action: "IGNORE",
@@ -710,6 +701,15 @@ export class GateMatchingEngine {
         };
       }
 
+      if (!input.validation.directionPresent) {
+        return {
+          action: "IGNORE",
+          tier: "IGNORE",
+          reason: "Open session kept in PRESENT state until EXIT direction or timeout is observed.",
+          timeoutFallback: false,
+        };
+      }
+
       if (hasEntryDirection) {
         return {
           action: "IGNORE",
@@ -732,6 +732,15 @@ export class GateMatchingEngine {
         action: "REJECT",
         tier: "REJECT",
         reason: "Exit direction was detected, but no active ENTRY session exists for this RFID tag.",
+        timeoutFallback: false,
+      };
+    }
+
+    if (!input.validation.directionPresent) {
+      return {
+        action: "ENTRY",
+        tier: input.confidence.tier,
+        reason: "Entry approved from a strong RFID-face pair even though direction tracking was unavailable.",
         timeoutFallback: false,
       };
     }

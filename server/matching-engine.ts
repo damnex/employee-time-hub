@@ -84,7 +84,7 @@ const DEFAULT_CONFIG: MatchingEngineConfig = {
   pendingTtlMs: 2000,
   faceTtlMs: 2000,
   visionTtlMs: 2000,
-  trackCooldownMs: 1500,
+  trackCooldownMs: 500,
   minStableTrackAgeFrames: 10,
   entryZoneMaxFraction: 0.4,
   exitZoneMinFraction: 0.6,
@@ -212,6 +212,16 @@ export class MatchingEngine {
 
   reserveTrack(deviceId: string, trackId: number, timestampMs: number) {
     this.reservedTracks.set(this.getFaceKey(deviceId, trackId), timestampMs);
+  }
+
+  clearTrackContext(deviceId: string, trackId: number) {
+    const deviceTracks = this.visionByDevice.get(deviceId);
+    deviceTracks?.delete(trackId);
+    if (deviceTracks && !deviceTracks.size) {
+      this.visionByDevice.delete(deviceId);
+    }
+
+    this.faceByDeviceTrack.delete(this.getFaceKey(deviceId, trackId));
   }
 
   getSnapshot(nowMs = Date.now()) {
