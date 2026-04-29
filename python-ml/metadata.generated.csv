@@ -1,3 +1,3 @@
-folder_name,employeeCode,name,department,rfidUid,email,phone,isActive
+﻿"folder_name","employeeCode","name","department","rfidUid","email","phone","isActive"
 "emp-1","emp-1","Dheena","hr","E200001C140E001315008283","dheena20022007@gmail.com","","true"
 "emp-3","emp-3","Dharshith","hr","E200001C140E001114908046","dharsiu@gmail.com","","true"

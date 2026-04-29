@@ -585,8 +585,10 @@ export class GateMatchingEngine {
     }
 
     if (facePresent && !faceMatched) {
-      reasons.push("Face evidence was captured but did not validate against the RFID owner.");
-      hardRejected = true;
+      reasons.push("Face evidence was captured but stayed inconclusive. Keep only the badge owner centered and retry.");
+      if (input.strictFaceRequired ?? true) {
+        tier = "LOW_CONFIDENCE";
+      }
     }
 
     if (!facePresent) {
@@ -626,7 +628,7 @@ export class GateMatchingEngine {
     const total = breakdown.rfid + breakdown.face + breakdown.direction;
     let tier: GateConfidenceTier;
 
-    if (validation.hardRejected || total < 50) {
+    if (validation.hardRejected) {
       tier = "REJECT";
     } else if (total >= 80) {
       tier = "VALID";

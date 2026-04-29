@@ -35,9 +35,8 @@ import {
 
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
-// Direction inference needs multiple spaced face positions, not just a few back-to-back frames.
-const GATE_FRAME_COUNT = 5;
-const GATE_FRAME_DELAY_MS = 90;
+const GATE_FRAME_COUNT = 3;
+const GATE_FRAME_DELAY_MS = 12;
 const GATE_MAX_FRAME_WIDTH = 480;
 const GATE_FRAME_JPEG_QUALITY = 0.55;
 const LIVE_TRACKING_INTERVAL_MS = 120;
@@ -177,6 +176,10 @@ function sleep(durationMs: number) {
   });
 }
 
+function clampValue(value: number, min = 0, max = 1) {
+  return Math.min(max, Math.max(min, value));
+}
+
 function getCameraConstraints(): MediaTrackConstraints {
   return {
     facingMode: "user",
@@ -234,6 +237,12 @@ function captureGateFrame(
   options: {
     maxWidth?: number;
     quality?: number;
+    crop?: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    } | null;
   } = {},
 ) {
   const context = canvas.getContext("2d");
@@ -241,14 +250,30 @@ function captureGateFrame(
     return null;
   }
 
-  const aspectRatio = video.videoHeight / video.videoWidth;
-  const targetWidth = Math.min(video.videoWidth, options.maxWidth ?? GATE_MAX_FRAME_WIDTH);
+  const cropWidth = options.crop?.width ?? video.videoWidth;
+  const cropHeight = options.crop?.height ?? video.videoHeight;
+  const aspectRatio = cropHeight / cropWidth;
+  const targetWidth = Math.min(Math.round(cropWidth), options.maxWidth ?? GATE_MAX_FRAME_WIDTH);
   const targetHeight = Math.round(targetWidth * aspectRatio);
 
   canvas.width = targetWidth;
   canvas.height = targetHeight;
   context.clearRect(0, 0, targetWidth, targetHeight);
-  context.drawImage(video, 0, 0, targetWidth, targetHeight);
+  if (options.crop) {
+    context.drawImage(
+      video,
+      options.crop.x,
+      options.crop.y,
+      options.crop.width,
+      options.crop.height,
+      0,
+      0,
+      targetWidth,
+      targetHeight,
+    );
+  } else {
+    context.drawImage(video, 0, 0, targetWidth, targetHeight);
+  }
 
   return {
     dataUrl: canvas.toDataURL("image/jpeg", options.quality ?? GATE_FRAME_JPEG_QUALITY),
@@ -314,6 +339,61 @@ function mapRectToViewport(
     heightPct: (clampedHeight / viewportHeight) * 100,
     centerX: (clampedLeft + clampedWidth / 2) / viewportWidth,
     centerY: (clampedTop + clampedHeight / 2) / viewportHeight,
+  };
+}
+
+function getTrackedFaceSourceCrop(
+  face: LiveTrackedFace | null,
+  video: HTMLVideoElement,
+  viewport: HTMLDivElement,
+) {
+  if (!face || !video.videoWidth || !video.videoHeight) {
+    return null;
+  }
+
+  const viewportWidth = viewport.clientWidth;
+  const viewportHeight = viewport.clientHeight;
+  if (!viewportWidth || !viewportHeight) {
+    return null;
+  }
+
+  const scale = Math.max(viewportWidth / video.videoWidth, viewportHeight / video.videoHeight);
+  const displayWidth = video.videoWidth * scale;
+  const displayHeight = video.videoHeight * scale;
+  const offsetX = (viewportWidth - displayWidth) / 2;
+  const offsetY = (viewportHeight - displayHeight) / 2;
+
+  const viewportLeft = (face.leftPct / 100) * viewportWidth;
+  const viewportTop = (face.topPct / 100) * viewportHeight;
+  const viewportWidthPx = (face.widthPct / 100) * viewportWidth;
+  const viewportHeightPx = (face.heightPct / 100) * viewportHeight;
+
+  const sourceLeft = (viewportLeft - offsetX) / scale;
+  const sourceTop = (viewportTop - offsetY) / scale;
+  const sourceWidth = viewportWidthPx / scale;
+  const sourceHeight = viewportHeightPx / scale;
+  const centerX = sourceLeft + sourceWidth / 2;
+  const centerY = sourceTop + sourceHeight * 0.54;
+  const cropWidthTarget = Math.min(
+    video.videoWidth,
+    Math.max(sourceWidth * 1.7, video.videoWidth * 0.2),
+  );
+  const cropHeightTarget = Math.min(
+    video.videoHeight,
+    Math.max(sourceHeight * 2.05, video.videoHeight * 0.32),
+  );
+  const cropLeft = clampValue(centerX - cropWidthTarget / 2, 0, video.videoWidth);
+  const cropTop = clampValue(centerY - cropHeightTarget * 0.42, 0, video.videoHeight);
+  const cropRight = clampValue(cropLeft + cropWidthTarget, 0, video.videoWidth);
+  const cropBottom = clampValue(cropTop + cropHeightTarget, 0, video.videoHeight);
+  const cropWidth = Math.max(1, cropRight - cropLeft);
+  const cropHeight = Math.max(1, cropBottom - cropTop);
+
+  return {
+    x: Math.round(cropLeft),
+    y: Math.round(cropTop),
+    width: Math.round(cropWidth),
+    height: Math.round(cropHeight),
   };
 }
 
@@ -1137,7 +1217,14 @@ export default function GateTerminal() {
     };
   }, [cameraActive, liveTrackerAvailable]);
 
-  const captureFrameBurst = useCallback(async () => {
+  const captureFrameBurst = useCallback(async (
+    crop: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    } | null,
+  ) => {
     if (!videoRef.current || !canvasRef.current || !videoRef.current.videoWidth || !videoRef.current.videoHeight) {
       throw new Error("Camera preview is not ready yet.");
     }
@@ -1151,7 +1238,9 @@ export default function GateTerminal() {
         await sleep(GATE_FRAME_DELAY_MS);
       }
 
-      const frame = captureGateFrame(videoRef.current, canvasRef.current);
+      const frame = captureGateFrame(videoRef.current, canvasRef.current, {
+        crop,
+      });
       if (!frame) {
         throw new Error("Frame capture failed. Keep one face visible and retry.");
       }
@@ -1215,16 +1304,35 @@ export default function GateTerminal() {
     }
 
     if (visibleFaceCount > 1) {
+      setLastResult({
+        success: true,
+        ignored: true,
+        message: `Multiple people are in the verification lane (${visibleFaceCount}). Keep only the badge owner centered before scanning again.`,
+        employee: badgeOwner,
+        badgeOwner,
+        verifiedAt: new Date().toLocaleTimeString(),
+        latencyMs: Math.round(performance.now() - scanStartedAt),
+        previewImage: null,
+        source,
+        previewFrameSize: null,
+      });
       setReaderMessage(
-        `Multiple faces are in view (${visibleFaceCount}). Running queued badge verification in order and letting Python pick the best match.`,
+        `Multiple faces are in view (${visibleFaceCount}). Waiting for only the badge owner before verification.`,
       );
+      return;
     }
 
     setIsCapturingFrames(true);
     setCaptureProgress(0);
 
     try {
-      const { frames, previewImage, previewFrameSize } = await captureFrameBurst();
+      const captureTargetFace = liveTrackerAvailable === false
+        ? (pythonTrackedFaces[0] ?? null)
+        : (browserTrackedFacesRef.current[0] ?? null);
+      const crop = videoRef.current && cameraViewportRef.current
+        ? getTrackedFaceSourceCrop(captureTargetFace, videoRef.current, cameraViewportRef.current)
+        : null;
+      const { frames, previewImage, previewFrameSize } = await captureFrameBurst(crop);
       const response = await scanMutation.mutateAsync({
         rfidUid: normalizedUid,
         deviceId: requestDeviceId,

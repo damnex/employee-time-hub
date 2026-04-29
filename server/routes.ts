@@ -836,6 +836,7 @@ async function processPythonRfidScan(args: {
   logAndReturn: LogAndReturnFn;
 }) {
   const { input, employee, now, todayDate, correlation, logAndReturn } = args;
+  const normalizedRfidUid = employee.rfidUid.trim().toUpperCase();
 
   async function salvageBadgeOwnerFromFrames(
     faceFrames: string[],
@@ -979,6 +980,21 @@ async function processPythonRfidScan(args: {
     }
 
     if (!verification.verified || !verification.employee) {
+      if (useTriggeredCameraFaceRecognition()) {
+        const triggeredFallback = await processTriggeredCameraFaceScan({
+          input,
+          employee,
+          normalizedRfidUid,
+          now,
+          todayDate,
+          correlation,
+          logAndReturn,
+        });
+        if (triggeredFallback) {
+          return triggeredFallback;
+        }
+      }
+
       const result = await resolveAttendanceDecision(
         employee,
         now,
