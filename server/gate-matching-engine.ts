@@ -16,7 +16,7 @@ export const UHF_DUPLICATE_WINDOW_MS = 1_200;
 
 const RFID_SCORE = 40;
 const FACE_SCORE = 40;
-const DIRECTION_SCORE = 20;
+const DIRECTION_SCORE = 0;
 
 type RfidSource =
   | "reader_detected"
@@ -585,7 +585,7 @@ export class GateMatchingEngine {
     }
 
     if (facePresent && !faceMatched) {
-      reasons.push("Face evidence was captured but stayed inconclusive. Keep only the badge owner centered and retry.");
+      reasons.push("Face evidence was captured but stayed inconclusive. Keep the RFID owner clearly visible and retry.");
       if (input.strictFaceRequired ?? true) {
         tier = "LOW_CONFIDENCE";
       }
@@ -596,10 +596,6 @@ export class GateMatchingEngine {
       if (input.strictFaceRequired ?? true) {
         tier = "LOW_CONFIDENCE";
       }
-    }
-
-    if (!directionPresent) {
-      reasons.push("Direction evidence is missing for this gate window.");
     }
 
     if (hardRejected) {
@@ -644,15 +640,11 @@ export class GateMatchingEngine {
   }
 
   decideAction(input: GateDecisionInput): GateDecisionResult {
-    const movementDirection = input.movementDirection;
-    const hasExitDirection = movementDirection === "EXIT";
-    const hasEntryDirection = movementDirection === "ENTRY";
-
     if (input.timedOut && input.hasOpenAttendance) {
       return {
-        action: "EXIT",
-        tier: "LOW_CONFIDENCE",
-        reason: `Automatic timeout EXIT after ${SESSION_EXIT_TIMEOUT_MS / 1000} seconds without RFID or face activity.`,
+        action: "IGNORE",
+        tier: "IGNORE",
+        reason: "Automatic timeout exits are disabled. Waiting for the next verified scan to close attendance.",
         timeoutFallback: true,
       };
     }
@@ -694,55 +686,10 @@ export class GateMatchingEngine {
     }
 
     if (input.hasOpenAttendance) {
-      if (hasExitDirection) {
-        return {
-          action: "EXIT",
-          tier: input.confidence.tier,
-          reason: "Exit approved from a valid RFID-face pair with exit direction.",
-          timeoutFallback: false,
-        };
-      }
-
-      if (!input.validation.directionPresent) {
-        return {
-          action: "IGNORE",
-          tier: "IGNORE",
-          reason: "Open session kept in PRESENT state until EXIT direction or timeout is observed.",
-          timeoutFallback: false,
-        };
-      }
-
-      if (hasEntryDirection) {
-        return {
-          action: "IGNORE",
-          tier: "IGNORE",
-          reason: "Duplicate ENTRY ignored because the employee is already present.",
-          timeoutFallback: false,
-        };
-      }
-
       return {
-        action: "IGNORE",
-        tier: "IGNORE",
-        reason: "Open session kept in PRESENT state until EXIT direction or timeout is observed.",
-        timeoutFallback: false,
-      };
-    }
-
-    if (hasExitDirection) {
-      return {
-        action: "REJECT",
-        tier: "REJECT",
-        reason: "Exit direction was detected, but no active ENTRY session exists for this RFID tag.",
-        timeoutFallback: false,
-      };
-    }
-
-    if (!input.validation.directionPresent) {
-      return {
-        action: "ENTRY",
+        action: "EXIT",
         tier: input.confidence.tier,
-        reason: "Entry approved from a strong RFID-face pair even though direction tracking was unavailable.",
+        reason: "Exit approved from a verified RFID-face pair. Attendance now alternates by each successful scan.",
         timeoutFallback: false,
       };
     }
@@ -750,18 +697,16 @@ export class GateMatchingEngine {
     return {
       action: "ENTRY",
       tier: input.confidence.tier,
-      reason: hasEntryDirection
-        ? "Entry approved from a valid RFID-face pair with entry direction."
-        : "Entry approved from a valid RFID-face pair within the matching window.",
+      reason: "Entry approved from a verified RFID-face pair. The first successful scan opens attendance.",
       timeoutFallback: false,
     };
   }
 
   buildTimeoutExitDecision(session: GateSessionSnapshot): GateDecisionResult {
     return {
-      action: "EXIT",
-      tier: "LOW_CONFIDENCE",
-      reason: `Automatic timeout EXIT for ${session.rfidUid} after ${SESSION_EXIT_TIMEOUT_MS / 1000} seconds without RFID or face activity.`,
+      action: "IGNORE",
+      tier: "IGNORE",
+      reason: `Automatic timeout exits are disabled for ${session.rfidUid}. Waiting for the next verified scan instead.`,
       timeoutFallback: true,
     };
   }
@@ -785,15 +730,6 @@ export class GateMatchingEngine {
     }
 
     if (args.occurredAt.getTime() - decisionAtMs > args.session.duplicateWindowMs) {
-      return null;
-    }
-
-    if (
-      args.movementDirection
-      && args.movementDirection !== "UNKNOWN"
-      && args.session.lastAction
-      && args.movementDirection !== args.session.lastAction
-    ) {
       return null;
     }
 

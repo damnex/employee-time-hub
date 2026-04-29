@@ -2,7 +2,11 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { promises as fs } from "fs";
 import { storage } from "./storage";
-import { allowInsecureFaceFallback, useTriggeredCameraFaceRecognition } from "./env";
+import {
+  allowInsecureFaceFallback,
+  allowPythonGateFrameAppend,
+  useTriggeredCameraFaceRecognition,
+} from "./env";
 import { api } from "@shared/routes";
 import {
   faceProfileSchema,
@@ -45,6 +49,7 @@ import { handleVisionIntegration } from "./vision-handler";
 import { handleFaceIntegration } from "./face-handler";
 import { decisionEngine } from "./decision-engine";
 const SESSION_TIMEOUT_SWEEP_MS = 1000;
+const ENABLE_AUTOMATIC_TIMEOUT_EXIT = false;
 type AttendanceAction = "ENTRY" | "EXIT";
 type MovementDirection = AttendanceAction | "UNKNOWN";
 
@@ -368,6 +373,9 @@ const MIN_HUMAN_LIVE_FACE_QUALITY = 0.42;
 const MIN_HUMAN_LIVE_LIVENESS = 0.45;
 const MIN_HUMAN_LIVE_REALNESS = 0.35;
 const DIRECTION_CONFIDENCE_THRESHOLD = 0.58;
+const PYTHON_GATE_MIN_MATCH_CONFIDENCE = 0.86;
+const PYTHON_GATE_MIN_FRAMES_WITH_FACE = 2;
+const PYTHON_GATE_APPEND_MIN_CONFIDENCE = 0.92;
 
 function normalizeScanTechnology(scanTechnology?: ScanTechnology): ScanTechnology {
   return scanTechnology ?? "UHF_RFID";
@@ -409,6 +417,10 @@ async function logGateEvent(args: {
 let timeoutSweepInFlight = false;
 
 async function processTimedOutGateSessions() {
+  if (!ENABLE_AUTOMATIC_TIMEOUT_EXIT) {
+    return;
+  }
+
   if (timeoutSweepInFlight) {
     return;
   }
@@ -474,7 +486,7 @@ async function createFailureAttendance(
   date: string,
   now: Date,
   deviceId: string,
-  verificationStatus: "FAILED_FACE" | "FAILED_DIRECTION",
+  verificationStatus: "FAILED_FACE",
 ) {
   return storage.createAttendance({
     employeeId,
@@ -605,15 +617,12 @@ async function resolveAttendanceDecision(
   }
 
   const openEntry = await storage.getOpenAttendance(employee.id, todayDate);
-  const directionIsConfident =
-    (movementDirection === "ENTRY" || movementDirection === "EXIT")
-    && (movementConfidence ?? 0) >= DIRECTION_CONFIDENCE_THRESHOLD;
   const validation = gateMatchingEngine.validateEvent({
     correlation,
     facePresent,
     faceMatched,
     faceRfidUidHint,
-    directionDetected: directionIsConfident,
+    directionDetected: false,
   });
   const confidence = gateMatchingEngine.calculateConfidence(validation);
   const decision = gateMatchingEngine.decideAction({
@@ -621,7 +630,7 @@ async function resolveAttendanceDecision(
     validation,
     confidence,
     hasOpenAttendance: Boolean(openEntry),
-    movementDirection: directionIsConfident ? movementDirection : undefined,
+    movementDirection: undefined,
   });
   logGateDecisionPipeline({
     correlation,
@@ -632,12 +641,6 @@ async function resolveAttendanceDecision(
   });
 
   if (decision.action === "IGNORE") {
-    if (correlation && openEntry && !directionIsConfident) {
-      gateMatchingEngine.armTimeoutExit({
-        session: correlation.session,
-        occurredAt: now,
-      });
-    }
     rememberSessionOutcome(
       correlation,
       now,
@@ -655,14 +658,12 @@ async function resolveAttendanceDecision(
   }
 
   if (decision.action === "REJECT") {
-    const verificationStatus: "FAILED_FACE" | "FAILED_DIRECTION" =
-      validation.hardRejected ? "FAILED_FACE" : "FAILED_DIRECTION";
     const attendance = await createFailureAttendance(
       employee.id,
       todayDate,
       now,
       deviceId,
-      verificationStatus,
+      "FAILED_FACE",
     );
     rememberSessionOutcome(
       correlation,
@@ -768,6 +769,93 @@ function buildTriggeredCameraMatchDetails(matchConfidence: number): FaceMatchDet
     peakAnchorConfidence: matchConfidence,
     strongAnchorRatio: matchConfidence > 0 ? 1 : 0,
     liveConsistency: matchConfidence,
+  };
+}
+
+function hasStrictPythonGateMatch(input: {
+  verified: boolean;
+  matchConfidence: number;
+  framesProcessed: number;
+  framesWithFace: number;
+}) {
+  const requiredFaceFrames = Math.min(
+    PYTHON_GATE_MIN_FRAMES_WITH_FACE,
+    Math.max(1, input.framesProcessed),
+  );
+
+  return Boolean(
+    input.verified
+    && input.matchConfidence >= PYTHON_GATE_MIN_MATCH_CONFIDENCE
+    && input.framesWithFace >= requiredFaceFrames,
+  );
+}
+
+async function findBadgeOwnerAcrossFrames(args: {
+  faceFrames: string[];
+  employee: Employee;
+}) {
+  const normalizedEmployeeCode = args.employee.employeeCode.trim();
+  const normalizedRfidUid = args.employee.rfidUid.trim().toUpperCase();
+  const requiredMatches = Math.min(
+    PYTHON_GATE_MIN_FRAMES_WITH_FACE,
+    Math.max(1, args.faceFrames.length),
+  );
+  let bestFace: PythonLiveRecognitionFace | null = null;
+  let bestFrameSize: { width: number; height: number } | null = null;
+  let matchedFrameCount = 0;
+  let framesWithFace = 0;
+  let totalFaces = 0;
+
+  for (const frame of args.faceFrames) {
+    try {
+      const recognition = await recognizeLiveFrameWithPython(frame, 12);
+      if (recognition.faces.length) {
+        framesWithFace += 1;
+        totalFaces += recognition.faces.length;
+      }
+
+      const ownerFace = recognition.faces
+        .filter((face) => {
+          const code = face.employeeCode?.trim();
+          const rfidUid = face.rfidUid?.trim().toUpperCase();
+          return Boolean(
+            face.verified
+            && face.confidence >= PYTHON_GATE_MIN_MATCH_CONFIDENCE
+            && (
+              (code && code === normalizedEmployeeCode)
+              || (rfidUid && rfidUid === normalizedRfidUid)
+            ),
+          );
+        })
+        .sort((left, right) => right.confidence - left.confidence)[0];
+
+      if (!ownerFace) {
+        continue;
+      }
+
+      matchedFrameCount += 1;
+      if (!bestFace || ownerFace.confidence > bestFace.confidence) {
+        bestFace = ownerFace;
+        bestFrameSize = {
+          width: recognition.frameWidth,
+          height: recognition.frameHeight,
+        };
+      }
+    } catch (error) {
+      console.warn("[python-face] Multi-face owner recognition failed:", error);
+    }
+  }
+
+  if (!bestFace || matchedFrameCount < requiredMatches) {
+    return null;
+  }
+
+  return {
+    face: bestFace,
+    frameSize: bestFrameSize,
+    matchedFrameCount,
+    framesWithFace,
+    totalFaces,
   };
 }
 
@@ -879,40 +967,6 @@ async function processPythonRfidScan(args: {
   logAndReturn: LogAndReturnFn;
 }) {
   const { input, employee, now, todayDate, correlation, logAndReturn } = args;
-  const normalizedRfidUid = employee.rfidUid.trim().toUpperCase();
-
-  async function salvageBadgeOwnerFromFrames(
-    faceFrames: string[],
-    targetEmployee: Employee,
-  ): Promise<{
-    face: PythonLiveRecognitionFace | null;
-    frameSize: { width: number; height: number } | null;
-  }> {
-    let bestFace: PythonLiveRecognitionFace | null = null;
-    let bestFrameSize: { width: number; height: number } | null = null;
-    for (const frame of faceFrames) {
-      try {
-        const recognition = await recognizeLiveFrameWithPython(frame, 12);
-        for (const face of recognition.faces) {
-          const code = face.employeeCode?.trim();
-          if (!face.verified || !code || code !== targetEmployee.employeeCode) {
-            continue;
-          }
-
-          if (!bestFace || face.confidence > bestFace.confidence) {
-            bestFace = face;
-            bestFrameSize = { width: recognition.frameWidth, height: recognition.frameHeight };
-          }
-        }
-        if (bestFace && (bestFace.confidence ?? 0) >= 0.65) {
-          break;
-        }
-      } catch (err) {
-        console.warn("Salvage frame recognition failed:", err);
-      }
-    }
-    return { face: bestFace, frameSize: bestFrameSize };
-  }
 
   if (!input.faceFrames?.length) {
     const result = await resolveAttendanceDecision(
@@ -963,17 +1017,17 @@ async function processPythonRfidScan(args: {
 
   try {
     const verification = await verifyGateFramesWithPython(input.faceFrames);
-    const matchConfidence = verification.matchConfidence;
-    const matchDetails = buildPythonMatchDetails(matchConfidence);
+    let matchConfidence = verification.matchConfidence;
+    let matchDetails = buildPythonMatchDetails(matchConfidence);
     const resolvedMovement = resolveBestMovementSignal({
       inputDirection: input.movementDirection,
       inputConfidence: input.movementConfidence,
       verificationDirection: verification.movementDirection,
       verificationConfidence: verification.movementConfidence,
     });
-    const detectedFaceLabel = verification.employee?.displayName
+    let detectedFaceLabel = verification.employee?.displayName
       ?? (verification.framesWithFace ? "Unknown Face" : undefined);
-    const detectedFaceBox = verification.bestBox ?? null;
+    let detectedFaceBox = verification.bestBox ?? null;
 
     let matchedEmployeeCode = verification.employee?.employeeCode?.trim();
     let matchedRfidUid = verification.employee?.rfidUid?.trim().toUpperCase();
@@ -981,69 +1035,48 @@ async function processPythonRfidScan(args: {
       (matchedEmployeeCode && matchedEmployeeCode === employee.employeeCode)
       || (matchedRfidUid && matchedRfidUid === employee.rfidUid.toUpperCase()),
     );
+    let strictPythonMatch = hasStrictPythonGateMatch(verification);
 
-    // Salvage multi-face scenes: re-run recognition across all frames and prefer the badge owner.
-    if (!matchesBadgeOwner && input.faceFrames.length) {
-      const { face: salvageFace, frameSize } = await salvageBadgeOwnerFromFrames(input.faceFrames, employee);
-      if (salvageFace) {
-        const goodConfidence = (salvageFace.confidence ?? 0) >= 0.42;
-        const goodDistance = salvageFace.distance !== null && verification.distanceThreshold
-          ? salvageFace.distance <= verification.distanceThreshold * 1.15
-          : false;
-        if (goodConfidence || goodDistance) {
-          matchesBadgeOwner = true;
-          matchedEmployeeCode = employee.employeeCode;
-          matchedRfidUid = employee.rfidUid.toUpperCase();
-          verification.verified = true;
-          verification.employee = {
-            folderName: salvageFace.label,
-            displayName: employee.name,
-            employeeCode: employee.employeeCode,
-            department: employee.department,
-            rfidUid: employee.rfidUid,
-            sampleCount: verification.employee?.sampleCount ?? undefined,
-          };
-          verification.matchConfidence = salvageFace.confidence;
-          verification.bestDistance = salvageFace.distance ?? verification.bestDistance;
-          verification.bestBox = {
-            top: salvageFace.box.top,
-            right: salvageFace.box.right,
-            bottom: salvageFace.box.bottom,
-            left: salvageFace.box.left,
-          };
-          verification.framesWithFace = Math.max(verification.framesWithFace, 1);
-          verification.framesProcessed = Math.max(verification.framesProcessed, input.faceFrames.length);
-          if (frameSize) {
-            verification.previewFrameSize = { width: frameSize.width, height: frameSize.height };
-          }
+    if (!matchesBadgeOwner || !strictPythonMatch || !verification.verified || !verification.employee) {
+      const ownerMatch = await findBadgeOwnerAcrossFrames({
+        faceFrames: input.faceFrames,
+        employee,
+      });
+
+      if (ownerMatch) {
+        matchConfidence = ownerMatch.face.confidence;
+        matchDetails = buildPythonMatchDetails(matchConfidence);
+        matchedEmployeeCode = employee.employeeCode;
+        matchedRfidUid = employee.rfidUid.toUpperCase();
+        matchesBadgeOwner = true;
+        strictPythonMatch = true;
+        verification.verified = true;
+        verification.employee = {
+          folderName: readPythonFaceDescriptorMeta(employee.faceDescriptor)?.folderName || employee.employeeCode,
+          displayName: employee.name,
+          employeeCode: employee.employeeCode,
+          department: employee.department,
+          rfidUid: employee.rfidUid,
+          sampleCount: verification.employee?.sampleCount ?? undefined,
+        };
+        verification.matchConfidence = matchConfidence;
+        verification.bestDistance = ownerMatch.face.distance ?? verification.bestDistance;
+        verification.bestBox = ownerMatch.face.box;
+        verification.framesWithFace = Math.max(
+          verification.framesWithFace,
+          ownerMatch.framesWithFace,
+          ownerMatch.matchedFrameCount,
+        );
+        verification.framesProcessed = Math.max(verification.framesProcessed, input.faceFrames.length);
+        if (ownerMatch.frameSize) {
+          verification.previewFrameSize = ownerMatch.frameSize;
         }
-      } else {
-        // prevent mis-assignment to another person
-        verification.verified = false;
+        detectedFaceLabel = employee.name;
+        detectedFaceBox = ownerMatch.face.box;
       }
-    }
-
-    // enforce confidence floor to avoid weak false matches
-    if (verification.verified && verification.matchConfidence < 0.45) {
-      verification.verified = false;
     }
 
     if (!verification.verified || !verification.employee) {
-      if (useTriggeredCameraFaceRecognition()) {
-        const triggeredFallback = await processTriggeredCameraFaceScan({
-          input,
-          employee,
-          normalizedRfidUid,
-          now,
-          todayDate,
-          correlation,
-          logAndReturn,
-        });
-        if (triggeredFallback) {
-          return triggeredFallback;
-        }
-      }
-
       const result = await resolveAttendanceDecision(
         employee,
         now,
@@ -1072,13 +1105,13 @@ async function processPythonRfidScan(args: {
       });
     }
 
-    if (!matchesBadgeOwner) {
+    if (!matchesBadgeOwner || !strictPythonMatch) {
       const result = await resolveAttendanceDecision(
         employee,
         now,
         todayDate,
         input.deviceId,
-        matchConfidence,
+        verification.matchConfidence,
         correlation,
         true,
         false,
@@ -1089,6 +1122,9 @@ async function processPythonRfidScan(args: {
 
       return logAndReturn({
         ...result,
+        message: !matchesBadgeOwner
+          ? "Face evidence was captured but did not validate against the RFID owner."
+          : `Face match was not strong enough for gate access (${Math.round(verification.matchConfidence * 100)}%). Keep the exact badge owner clearly visible and retry.`,
         matchDetails,
         detectedFaceLabel,
         detectedFaceBox,
@@ -1099,7 +1135,11 @@ async function processPythonRfidScan(args: {
     }
 
     // Enrich training data with the latest gate frames for this employee (non-blocking to avoid latency).
-    if (verification.employee.folderName) {
+    if (
+      allowPythonGateFrameAppend()
+      && verification.matchConfidence >= PYTHON_GATE_APPEND_MIN_CONFIDENCE
+      && verification.employee.folderName
+    ) {
       void appendEmployeeDatasetFrames({
         folderName: verification.employee.folderName,
         frames: input.faceFrames,
@@ -1130,7 +1170,7 @@ async function processPythonRfidScan(args: {
       detectedFaceLabel,
       detectedFaceBox,
     }, {
-      verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_DIRECTION"),
+      verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_FACE"),
       decision: result.action ?? (result.success ? "UNKNOWN" : "REJECTED"),
     });
   } catch (error) {
@@ -1189,6 +1229,8 @@ async function processTriggeredCameraFaceScan(args: {
     const faceMatched = Boolean(
       recognitionIsFresh
       && recognition.status === "MATCH"
+      && recognition.confidence >= PYTHON_GATE_MIN_MATCH_CONFIDENCE
+      && recognition.facesDetected === 1
       && recognizedRfidUid
       && recognizedRfidUid === normalizedRfidUid
     );
@@ -1207,15 +1249,18 @@ async function processTriggeredCameraFaceScan(args: {
       input.movementConfidence,
     );
 
-    const message = !recognitionIsFresh
-      ? "Triggered live face result arrived outside the allowed 2 second window, so the scan stayed low confidence."
-      : recognition.status === "NO_FACE"
-        ? "RFID was detected, but no live face was visible in the camera window."
-        : recognition.status === "UNKNOWN"
-          ? recognition.multipleFaces
-            ? result.message
-            : "A live face was captured after the RFID trigger, but the person could not be verified confidently."
-          : result.message;
+    let message = result.message;
+    if (!recognitionIsFresh) {
+      message = "Triggered live face result arrived outside the allowed 2 second window, so the scan stayed low confidence.";
+    } else if (recognition.status === "NO_FACE") {
+      message = "RFID was detected, but no live face was visible in the camera window.";
+    } else if (recognition.multipleFaces && !faceMatched) {
+      message = "Multiple faces were visible during verification, but the RFID owner was not matched strongly enough.";
+    } else if (recognition.status === "MATCH" && recognition.confidence < PYTHON_GATE_MIN_MATCH_CONFIDENCE) {
+      message = `Face match was not strong enough for gate access (${Math.round(recognition.confidence * 100)}%). Retry with the exact badge owner closer to the camera.`;
+    } else if (recognition.status === "UNKNOWN") {
+      message = "A live face was captured after the RFID trigger, but the person could not be verified confidently.";
+    }
 
     return await logAndReturn({
       ...result,
@@ -1703,7 +1748,7 @@ async function processRfidScan(input: ProcessScanInput): Promise<ProcessedScanRe
     ...result,
     matchDetails,
   }, {
-    verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_DIRECTION"),
+    verificationStatus: result.attendance?.verificationStatus ?? (result.success ? "ENTRY" : "FAILED_FACE"),
     decision: result.action ?? (result.success ? "UNKNOWN" : "REJECTED"),
     liveFaceProfile,
   });
@@ -1720,14 +1765,18 @@ export async function registerRoutes(
     console.warn("[rfid-service] Warm-up skipped:", error);
   });
   registerRfidProxyRoutes(app);
-  const timeoutExitSweep = setInterval(() => {
-    void processTimedOutGateSessions().catch((error) => {
-      console.error("[gate-timeout] Sweep failed:", error);
-    });
-  }, SESSION_TIMEOUT_SWEEP_MS);
+  const timeoutExitSweep = ENABLE_AUTOMATIC_TIMEOUT_EXIT
+    ? setInterval(() => {
+        void processTimedOutGateSessions().catch((error) => {
+          console.error("[gate-timeout] Sweep failed:", error);
+        });
+      }, SESSION_TIMEOUT_SWEEP_MS)
+    : null;
 
   httpServer.once("close", () => {
-    clearInterval(timeoutExitSweep);
+    if (timeoutExitSweep) {
+      clearInterval(timeoutExitSweep);
+    }
     void stopManagedRfidService();
   });
   
@@ -2055,16 +2104,23 @@ export async function registerRoutes(
       }
 
       const recognition = await recognizeLiveFrameWithPython(input.frame, input.maxFaces ?? 50);
-      const faces = recognition.faces.map((face) => ({
-        label: face.verified ? face.label : "Unknown Face",
-        employeeCode: face.verified ? face.employeeCode ?? undefined : undefined,
-        department: face.verified ? face.department ?? undefined : undefined,
-        rfidUid: face.verified ? face.rfidUid ?? undefined : undefined,
-        confidence: face.confidence,
-        distance: face.distance,
-        verified: face.verified,
-        box: face.box,
-      }));
+      const faces = recognition.faces.map((face) => {
+        const verified = Boolean(
+          face.verified
+          && face.confidence >= PYTHON_GATE_MIN_MATCH_CONFIDENCE
+        );
+
+        return {
+          label: verified ? face.label : "Unknown Face",
+          employeeCode: verified ? face.employeeCode ?? undefined : undefined,
+          department: verified ? face.department ?? undefined : undefined,
+          rfidUid: verified ? face.rfidUid ?? undefined : undefined,
+          confidence: face.confidence,
+          distance: face.distance,
+          verified,
+          box: face.box,
+        };
+      });
       const matchedCount = faces.filter((face) => face.verified).length;
       const message = !faces.length
         ? "No faces detected in the live camera frame."

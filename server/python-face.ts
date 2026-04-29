@@ -133,6 +133,7 @@ interface PythonVerifyBurstRequest {
   requestId: string;
   action: "verify_burst";
   frames: string[];
+  maxFaces?: number;
   entryHorizontalDirection: "left-to-right" | "right-to-left";
   entryDepthDirection: "approaching" | "receding";
 }
@@ -497,6 +498,7 @@ class PythonFaceWorker {
       requestId,
       action: "verify_burst",
       frames: faceFrames,
+      maxFaces: 12,
       entryHorizontalDirection: "left-to-right",
       entryDepthDirection: "approaching",
     };

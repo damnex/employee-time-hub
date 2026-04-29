@@ -75,23 +75,44 @@ const FIXED_DATASET_TARGET = 100;
 const MIN_DATASET_SAMPLES = FIXED_DATASET_TARGET;
 const DEFAULT_DATASET_SAMPLES = FIXED_DATASET_TARGET;
 const MAX_DATASET_SAMPLES = FIXED_DATASET_TARGET;
-const DATASET_CAPTURE_DELAY_MS = 180;
-const DATASET_CAPTURE_SIZE = 360;
+const DATASET_CAPTURE_DELAY_MS = 220;
+const DATASET_CAPTURE_SIZE = 448;
 const DATASET_TRACKING_INTERVAL_MS = 140;
-const DATASET_MIN_QUALITY = 0.62;
-const DATASET_MIN_FACE_SCORE = 0.68;
-const DATASET_MIN_BOX_SCORE = 0.67;
-const DATASET_MIN_LIVE_CONFIDENCE = 0.42;
-const DATASET_MIN_REAL_CONFIDENCE = 0.36;
-const DATASET_REQUIRED_STABLE_HITS = 4;
-const DATASET_MAX_ATTEMPTS_MULTIPLIER = 14;
-const DATASET_MAX_ABS_ROLL = 18;
+const DATASET_MIN_QUALITY = 0.72;
+const DATASET_MIN_FACE_SCORE = 0.78;
+const DATASET_MIN_BOX_SCORE = 0.78;
+const DATASET_MIN_LIVE_CONFIDENCE = 0.55;
+const DATASET_MIN_REAL_CONFIDENCE = 0.48;
+const DATASET_REQUIRED_STABLE_HITS = 6;
+const DATASET_MAX_ATTEMPTS_MULTIPLIER = 18;
+const DATASET_MAX_ABS_ROLL = 14;
+const DATASET_MIN_FACE_WIDTH_RATIO = 0.18;
+const DATASET_MAX_FACE_WIDTH_RATIO = 0.5;
+const DATASET_MIN_FACE_HEIGHT_RATIO = 0.26;
+const DATASET_MAX_FACE_HEIGHT_RATIO = 0.7;
+const DATASET_MIN_FACE_ASPECT_RATIO = 0.55;
+const DATASET_MAX_FACE_ASPECT_RATIO = 1.08;
+const DATASET_FACE_EDGE_MARGIN_RATIO = 0.035;
+const DATASET_CROP_SIDE_PADDING_RATIO = 0.18;
+const DATASET_CROP_TOP_PADDING_RATIO = 0.12;
+const DATASET_CROP_BOTTOM_PADDING_RATIO = 0.18;
+const DATASET_MIN_CROP_SHARPNESS = 0.035;
 const VOICE_GUIDANCE_REPEAT_MS = 2600;
 
 type DatasetPoseKey = "front" | "left" | "right" | "up" | "down";
 type DatasetPoseCoverage = Record<DatasetPoseKey, number>;
 
 const DATASET_POSE_SEQUENCE: DatasetPoseKey[] = ["front", "left", "right", "up", "down"];
+
+type DatasetCaptureFrame = {
+  dataUrl: string;
+  sharpness: number;
+  crop: {
+    x: number;
+    y: number;
+    size: number;
+  };
+};
 
 const defaultFormValues = {
   employeeCode: "",
@@ -235,6 +256,7 @@ function mapRectToViewport(
 function getDatasetCaptureBlocker(
   snapshot: FaceTrackingSnapshot | null,
   stableHits: number,
+  video?: HTMLVideoElement | null,
 ) {
   if (!snapshot) {
     return "Starting the live face detector.";
@@ -250,6 +272,37 @@ function getDatasetCaptureBlocker(
 
   if (!snapshot.bounds || snapshot.faceCount === 0 || snapshot.status === "no-face" || snapshot.status === "loading") {
     return snapshot.guidance || "Step into the camera so the face detector can lock on.";
+  }
+
+  if (video?.videoWidth && video.videoHeight) {
+    const widthRatio = snapshot.bounds.width / Math.max(1, video.videoWidth);
+    const heightRatio = snapshot.bounds.height / Math.max(1, video.videoHeight);
+    const aspectRatio = snapshot.bounds.width / Math.max(1, snapshot.bounds.height);
+    const leftMargin = snapshot.bounds.x / Math.max(1, video.videoWidth);
+    const topMargin = snapshot.bounds.y / Math.max(1, video.videoHeight);
+    const rightMargin = (video.videoWidth - (snapshot.bounds.x + snapshot.bounds.width)) / Math.max(1, video.videoWidth);
+    const bottomMargin = (video.videoHeight - (snapshot.bounds.y + snapshot.bounds.height)) / Math.max(1, video.videoHeight);
+
+    if (widthRatio < DATASET_MIN_FACE_WIDTH_RATIO || heightRatio < DATASET_MIN_FACE_HEIGHT_RATIO) {
+      return "Move closer until the face fills the training crop.";
+    }
+
+    if (widthRatio > DATASET_MAX_FACE_WIDTH_RATIO || heightRatio > DATASET_MAX_FACE_HEIGHT_RATIO) {
+      return "Move slightly back. The face is too close for a clean training crop.";
+    }
+
+    if (aspectRatio < DATASET_MIN_FACE_ASPECT_RATIO || aspectRatio > DATASET_MAX_FACE_ASPECT_RATIO) {
+      return "Keep the whole face visible, not just a side edge or partial face.";
+    }
+
+    if (
+      leftMargin < DATASET_FACE_EDGE_MARGIN_RATIO
+      || topMargin < DATASET_FACE_EDGE_MARGIN_RATIO
+      || rightMargin < DATASET_FACE_EDGE_MARGIN_RATIO
+      || bottomMargin < DATASET_FACE_EDGE_MARGIN_RATIO
+    ) {
+      return "Keep the full face away from the camera edge before capturing.";
+    }
   }
 
   if (snapshot.status === "off-center" || snapshot.status === "low-quality") {
@@ -322,24 +375,68 @@ function buildVoiceGuidanceMessage(args: {
   return "Face lock ready.";
 }
 
+function getDatasetCaptureRect(
+  video: HTMLVideoElement,
+  faceBounds: FaceCropBounds,
+) {
+  if (!video.videoWidth || !video.videoHeight) {
+    return null;
+  }
+
+  const desiredLeft = faceBounds.x - (faceBounds.width * DATASET_CROP_SIDE_PADDING_RATIO);
+  const desiredTop = faceBounds.y - (faceBounds.height * DATASET_CROP_TOP_PADDING_RATIO);
+  const desiredRight = faceBounds.x + faceBounds.width + (faceBounds.width * DATASET_CROP_SIDE_PADDING_RATIO);
+  const desiredBottom = faceBounds.y + faceBounds.height + (faceBounds.height * DATASET_CROP_BOTTOM_PADDING_RATIO);
+  const desiredWidth = desiredRight - desiredLeft;
+  const desiredHeight = desiredBottom - desiredTop;
+  const desiredCenterX = (desiredLeft + desiredRight) / 2;
+  const desiredCenterY = (desiredTop + desiredBottom) / 2;
+  const sourceSize = Math.min(
+    Math.min(video.videoWidth, video.videoHeight),
+    Math.max(1, desiredWidth, desiredHeight),
+  );
+  const sourceX = clamp(desiredCenterX - (sourceSize / 2), 0, Math.max(0, video.videoWidth - sourceSize));
+  const sourceY = clamp(desiredCenterY - (sourceSize / 2), 0, Math.max(0, video.videoHeight - sourceSize));
+
+  return {
+    x: sourceX,
+    y: sourceY,
+    size: sourceSize,
+  };
+}
+
+function measureCropSharpness(context: CanvasRenderingContext2D, size: number) {
+  const imageData = context.getImageData(0, 0, size, size).data;
+  const step = 4;
+  let total = 0;
+  let count = 0;
+
+  for (let y = step; y < size - step; y += step) {
+    for (let x = step; x < size - step; x += step) {
+      const index = (y * size + x) * 4;
+      const rightIndex = (y * size + x + step) * 4;
+      const downIndex = ((y + step) * size + x) * 4;
+      const luminance = imageData[index] * 0.299 + imageData[index + 1] * 0.587 + imageData[index + 2] * 0.114;
+      const rightLuminance = imageData[rightIndex] * 0.299 + imageData[rightIndex + 1] * 0.587 + imageData[rightIndex + 2] * 0.114;
+      const downLuminance = imageData[downIndex] * 0.299 + imageData[downIndex + 1] * 0.587 + imageData[downIndex + 2] * 0.114;
+      total += Math.abs(luminance - rightLuminance) + Math.abs(luminance - downLuminance);
+      count += 2;
+    }
+  }
+
+  return count ? total / (count * 255) : 0;
+}
+
 function captureDatasetFrame(
   video: HTMLVideoElement,
   canvas: HTMLCanvasElement,
   faceBounds: FaceCropBounds,
-) {
-  const context = canvas.getContext("2d");
-  if (!context || !video.videoWidth || !video.videoHeight) {
+): DatasetCaptureFrame | null {
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  const crop = getDatasetCaptureRect(video, faceBounds);
+  if (!context || !crop) {
     return null;
   }
-
-  const faceCenterX = faceBounds.x + (faceBounds.width / 2);
-  const faceCenterY = faceBounds.y + (faceBounds.height / 2) + (faceBounds.height * 0.08);
-  const sourceSize = Math.min(
-    Math.min(video.videoWidth, video.videoHeight),
-    Math.max(faceBounds.width * 1.85, faceBounds.height * 1.6),
-  );
-  const sourceX = clamp(faceCenterX - (sourceSize / 2), 0, Math.max(0, video.videoWidth - sourceSize));
-  const sourceY = clamp(faceCenterY - (sourceSize / 2), 0, Math.max(0, video.videoHeight - sourceSize));
 
   canvas.width = DATASET_CAPTURE_SIZE;
   canvas.height = DATASET_CAPTURE_SIZE;
@@ -348,17 +445,21 @@ function captureDatasetFrame(
   context.clearRect(0, 0, DATASET_CAPTURE_SIZE, DATASET_CAPTURE_SIZE);
   context.drawImage(
     video,
-    sourceX,
-    sourceY,
-    sourceSize,
-    sourceSize,
+    crop.x,
+    crop.y,
+    crop.size,
+    crop.size,
     0,
     0,
     DATASET_CAPTURE_SIZE,
     DATASET_CAPTURE_SIZE,
   );
 
-  return canvas.toDataURL("image/jpeg", 0.78);
+  return {
+    dataUrl: canvas.toDataURL("image/jpeg", 0.88),
+    sharpness: measureCropSharpness(context, DATASET_CAPTURE_SIZE),
+    crop,
+  };
 }
 
 function getPythonFaceStatus(faceDescriptor: unknown) {
@@ -440,7 +541,7 @@ export default function Employees() {
   const datasetReady = datasetPhotos.length >= MIN_DATASET_SAMPLES;
   const datasetPoseTargets = buildDatasetPoseTargets(datasetSamplesTarget);
   const nextRequiredDatasetPose = getNextRequiredDatasetPose(datasetPoseCoverage, datasetPoseTargets);
-  const datasetCaptureBlocker = getDatasetCaptureBlocker(trackingSnapshot, trackingStableHits);
+  const datasetCaptureBlocker = getDatasetCaptureBlocker(trackingSnapshot, trackingStableHits, videoRef.current);
   const saveTrainingStageIndex = saveTrainingElapsedMs >= 4800 ? 2 : saveTrainingElapsedMs >= 1600 ? 1 : 0;
   const saveTrainingSteps = [
     {
@@ -854,7 +955,7 @@ export default function Employees() {
       for (let attempt = 1; attempt <= maxAttempts && capturedPhotos.length < datasetSamplesTarget; attempt += 1) {
         const snapshot = trackingSnapshotRef.current;
         const stableHits = trackingStableHitsRef.current;
-        const captureBlocker = getDatasetCaptureBlocker(snapshot, stableHits);
+        const captureBlocker = getDatasetCaptureBlocker(snapshot, stableHits, videoRef.current);
 
         if (captureBlocker) {
           setDatasetRuntimeMessage(captureBlocker);
@@ -863,7 +964,7 @@ export default function Employees() {
         }
 
         if (!snapshot?.bounds) {
-          setDatasetRuntimeMessage("Waiting for the detector to produce a valid face box.");
+          setDatasetRuntimeMessage("Waiting for the detector to produce a valid face crop.");
           await sleep(DATASET_CAPTURE_DELAY_MS);
           continue;
         }
@@ -872,7 +973,7 @@ export default function Employees() {
         const detectedPose = isDatasetPoseKey(snapshot.pose) ? snapshot.pose : null;
 
         if (requiredPose && detectedPose !== requiredPose) {
-          setDatasetRuntimeMessage(`Hold ${describeFacePose(requiredPose)} pose inside the live face box.`);
+          setDatasetRuntimeMessage(`Hold ${describeFacePose(requiredPose)} pose inside the tight face crop.`);
           await sleep(DATASET_CAPTURE_DELAY_MS);
           continue;
         }
@@ -882,7 +983,13 @@ export default function Employees() {
           throw new Error("Dataset frame capture failed. Retry with one face held inside the live detection box.");
         }
 
-        capturedPhotos.push(frame);
+        if (frame.sharpness < DATASET_MIN_CROP_SHARPNESS) {
+          setDatasetRuntimeMessage("Crop is still blurry. Hold still and improve light before the next sample.");
+          await sleep(DATASET_CAPTURE_DELAY_MS);
+          continue;
+        }
+
+        capturedPhotos.push(frame.dataUrl);
         if (detectedPose) {
           capturedCoverage[detectedPose] += 1;
           setLastAcceptedPose(detectedPose);
@@ -892,7 +999,7 @@ export default function Employees() {
         setDatasetPoseCoverage({ ...capturedCoverage });
         setCaptureProgress(capturedPhotos.length);
         setDatasetRuntimeMessage(
-          `${detectedPose ? describeFacePose(detectedPose) : "Face"} sample accepted (${capturedPhotos.length}/${datasetSamplesTarget}).`,
+          `${detectedPose ? describeFacePose(detectedPose) : "Face"} crop accepted (${capturedPhotos.length}/${datasetSamplesTarget}).`,
         );
         await sleep(DATASET_CAPTURE_DELAY_MS);
       }
@@ -902,7 +1009,7 @@ export default function Employees() {
         throw new Error(
           missingCoverage
             ? `Dataset capture stopped before meeting the training plan. Missing: ${missingCoverage}.`
-            : "Dataset capture stopped before meeting the training plan. Keep one well-lit face inside the live detection box and retry.",
+            : "Dataset capture stopped before meeting the training plan. Keep one well-lit face inside the tight crop and retry.",
         );
       }
 
@@ -1038,14 +1145,18 @@ export default function Employees() {
     );
   };
 
-  const enrollmentFaceOverlay = trackingSnapshot?.bounds
+  const enrollmentCropRect = trackingSnapshot?.bounds
+    && videoRef.current
+    ? getDatasetCaptureRect(videoRef.current, trackingSnapshot.bounds)
+    : null;
+  const enrollmentFaceOverlay = enrollmentCropRect
     && videoRef.current
     && cameraViewportRef.current
     ? mapRectToViewport(
-      trackingSnapshot.bounds.x,
-      trackingSnapshot.bounds.y,
-      trackingSnapshot.bounds.width,
-      trackingSnapshot.bounds.height,
+      enrollmentCropRect.x,
+      enrollmentCropRect.y,
+      enrollmentCropRect.size,
+      enrollmentCropRect.size,
       videoRef.current.videoWidth,
       videoRef.current.videoHeight,
       cameraViewportRef.current,
@@ -1055,7 +1166,7 @@ export default function Employees() {
   const enrollmentCaptureGuidance = datasetRuntimeMessage
     ?? datasetCaptureBlocker
     ?? (nextRequiredDatasetPose
-      ? `Hold ${describeFacePose(nextRequiredDatasetPose)} pose inside the live face box.`
+      ? `Hold ${describeFacePose(nextRequiredDatasetPose)} pose inside the tight face crop.`
       : "Face lock is ready. Start dataset capture.");
 
   return (

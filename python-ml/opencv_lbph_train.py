@@ -15,12 +15,22 @@ from typing import Any
 import cv2  # type: ignore
 import numpy as np  # type: ignore
 from opencv_face_backend import (
+    DEFAULT_SFACE_DETECTOR_PATH,
+    DEFAULT_SFACE_RECOGNIZER_PATH,
     GRAY_NN_MODEL_TYPE,
     LBPH_MODEL_TYPE,
+    SFACE_MODEL_TYPE,
+    create_sface_detector,
+    create_sface_recognizer,
     create_lbph_recognizer,
+    detect_sface_faces,
     estimate_gray_nn_threshold,
+    estimate_sface_threshold,
+    extract_sface_embedding,
     face_to_feature_vector,
     has_lbph_support,
+    has_sface_support,
+    save_sface_model,
     save_gray_nn_model,
 )
 from opencv_face_service import (
@@ -44,6 +54,14 @@ class TrainingSample:
 
 
 @dataclass
+class SFaceTrainingSample:
+    label_id: int
+    folder_name: str
+    image_path: Path
+    embedding: np.ndarray
+
+
+@dataclass
 class SkippedImage:
     folder_name: str
     image_path: Path
@@ -63,7 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Train an OpenCV face recognizer using one folder per employee. "
-            "Prefers LBPH when available and falls back to a grayscale nearest-neighbor model."
+            "Prefers SFace embeddings when the OpenCV Zoo models are available, "
+            "then falls back to LBPH or a grayscale nearest-neighbor model."
         )
     )
     parser.add_argument("--dataset", required=True, type=Path, help="Root folder containing one subfolder per employee.")
@@ -88,6 +107,29 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=65.0,
         help="Suggested recognition threshold. Lower prediction distances are better.",
+    )
+    parser.add_argument(
+        "--sface-detector",
+        type=Path,
+        default=DEFAULT_SFACE_DETECTOR_PATH,
+        help="Path to the OpenCV Zoo YuNet face detector ONNX model.",
+    )
+    parser.add_argument(
+        "--sface-recognizer",
+        type=Path,
+        default=DEFAULT_SFACE_RECOGNIZER_PATH,
+        help="Path to the OpenCV Zoo SFace recognition ONNX model.",
+    )
+    parser.add_argument(
+        "--sface-score-threshold",
+        type=float,
+        default=0.78,
+        help="Minimum YuNet face detection confidence used for SFace training.",
+    )
+    parser.add_argument(
+        "--disable-sface",
+        action="store_true",
+        help="Skip SFace training even when the OpenCV Zoo models are available.",
     )
     return parser.parse_args()
 
@@ -188,6 +230,55 @@ def create_detector() -> cv2.CascadeClassifier:
     return detector
 
 
+def create_sface_training_runtime(args: argparse.Namespace) -> tuple[Any, Any] | None:
+    if args.disable_sface:
+        return None
+
+    detector_path = args.sface_detector.resolve()
+    recognizer_path = args.sface_recognizer.resolve()
+    if not has_sface_support(detector_path=detector_path, recognizer_path=recognizer_path):
+        return None
+
+    try:
+        detector = create_sface_detector(
+            detector_path,
+            score_threshold=float(args.sface_score_threshold),
+        )
+        recognizer = create_sface_recognizer(recognizer_path)
+        return detector, recognizer
+    except Exception as error:  # noqa: BLE001
+        print(f"SFace training disabled: {error}", file=sys.stderr)
+        return None
+
+
+def extract_sface_training_embedding(
+    image: np.ndarray,
+    detector: Any,
+    recognizer: Any,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray | None, str | None]:
+    normalized = normalize_lighting(image)
+    detected_faces = detect_sface_faces(
+        normalized,
+        detector,
+        min_face_size=max(18, int(args.min_face_size * 0.6)),
+        max_faces=8,
+    )
+    if not detected_faces:
+        return None, "sface-no-face"
+
+    if len(detected_faces) > 1:
+        best_area = float(detected_faces[0][2] * detected_faces[0][3])
+        second_area = float(detected_faces[1][2] * detected_faces[1][3])
+        if second_area / max(best_area, 1.0) >= 0.35:
+            return None, "sface-ambiguous-multiple-faces"
+
+    try:
+        return extract_sface_embedding(normalized, detected_faces[0], recognizer), None
+    except Exception as error:  # noqa: BLE001
+        return None, f"sface-embedding-error:{error}"
+
+
 def detect_single_face(
     gray_image: np.ndarray,
     detector: cv2.CascadeClassifier,
@@ -280,6 +371,96 @@ def json_dump(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def normalize_embedding(vector: np.ndarray) -> np.ndarray:
+    flattened = np.asarray(vector, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(flattened))
+    if not np.isfinite(norm) or norm <= 1e-6:
+        return np.zeros_like(flattened, dtype=np.float32)
+    return (flattened / norm).astype(np.float32)
+
+
+def build_embedding_centroids(features: np.ndarray, label_ids: np.ndarray) -> dict[int, np.ndarray]:
+    centroids: dict[int, np.ndarray] = {}
+    for label_id in np.unique(label_ids):
+        matching_features = features[label_ids == label_id]
+        centroids[int(label_id)] = normalize_embedding(np.mean(matching_features, axis=0))
+    return centroids
+
+
+def prune_sface_samples(
+    samples: list[SFaceTrainingSample],
+    *,
+    min_samples: int,
+) -> tuple[list[SFaceTrainingSample], list[SkippedImage]]:
+    if not samples:
+        return [], []
+
+    features = np.vstack([sample.embedding for sample in samples]).astype(np.float32)
+    features = np.vstack([normalize_embedding(row) for row in features])
+    label_ids = np.array([sample.label_id for sample in samples], dtype=np.int32)
+    keep_mask = np.ones(len(samples), dtype=bool)
+
+    for _ in range(3):
+        kept_features = features[keep_mask]
+        kept_label_ids = label_ids[keep_mask]
+        if len(np.unique(kept_label_ids)) <= 1:
+            break
+
+        centroids = build_embedding_centroids(kept_features, kept_label_ids)
+        removed_this_round = 0
+        for index, sample in enumerate(samples):
+            if not keep_mask[index]:
+                continue
+
+            label_id = int(sample.label_id)
+            label_keep_count = int(np.sum(keep_mask & (label_ids == label_id)))
+            if label_keep_count <= min_samples:
+                continue
+
+            own_centroid = centroids.get(label_id)
+            if own_centroid is None:
+                continue
+
+            feature = features[index]
+            own_distance = float(1.0 - np.clip(own_centroid @ feature, -1.0, 1.0))
+            other_distances = [
+                float(1.0 - np.clip(centroid @ feature, -1.0, 1.0))
+                for other_label_id, centroid in centroids.items()
+                if int(other_label_id) != label_id
+            ]
+            best_other_distance = min(other_distances) if other_distances else 2.0
+
+            label_distances = np.array(
+                [
+                    float(1.0 - np.clip(own_centroid @ features[candidate_index], -1.0, 1.0))
+                    for candidate_index in range(len(samples))
+                    if keep_mask[candidate_index] and int(label_ids[candidate_index]) == label_id
+                ],
+                dtype=np.float32,
+            )
+            if label_distances.size >= 8:
+                q1 = float(np.percentile(label_distances, 25))
+                q3 = float(np.percentile(label_distances, 75))
+                outlier_cap = max(0.42, min(0.56, q3 + 1.5 * (q3 - q1)))
+            else:
+                outlier_cap = 0.56
+
+            if own_distance > outlier_cap or best_other_distance <= own_distance + 0.03:
+                keep_mask[index] = False
+                removed_this_round += 1
+
+        if removed_this_round == 0:
+            break
+
+    kept_samples = [sample for index, sample in enumerate(samples) if keep_mask[index]]
+    removed_images = [
+        SkippedImage(sample.folder_name, sample.image_path, "sface-identity-outlier")
+        for index, sample in enumerate(samples)
+        if not keep_mask[index]
+    ]
+    return kept_samples, removed_images
+
+
 def main() -> int:
     args: Any = parse_args()
     args.dataset = args.dataset.resolve()  # type: ignore
@@ -291,6 +472,7 @@ def main() -> int:
     args.output.mkdir(parents=True, exist_ok=True)
     detector = create_detector()
     eye_detector = create_eye_detector()
+    sface_runtime = create_sface_training_runtime(args)
     runtime_detection_args = build_runtime_detection_args()
     metadata_rows = load_metadata(args.metadata.resolve() if args.metadata else None)
 
@@ -299,14 +481,18 @@ def main() -> int:
     training_ids: list[int] = []
     validation_faces: list[np.ndarray] = []
     validation_ids: list[int] = []
+    sface_samples: list[SFaceTrainingSample] = []
+    sface_skipped_images: list[SkippedImage] = []
     skipped_images: list[SkippedImage] = []
     skipped_people: list[dict[str, Any]] = []
     label_samples: dict[str, int] = {}
+    sface_label_samples: dict[str, int] = {}
 
     person_sources = build_person_sources(args.dataset, metadata_rows)
     label_source_names: dict[str, list[str]] = {}
     for label_id, (folder_name, source_dirs) in enumerate(person_sources):
         valid_count = 0
+        sface_valid_count = 0
         label_names.append(folder_name)
         label_source_names[folder_name] = [person_dir.name for person_dir in source_dirs]
 
@@ -314,7 +500,29 @@ def main() -> int:
             image = cv2.imread(str(image_path))
             if image is None:
                 skipped_images.append(SkippedImage(folder_name, image_path, "load-error"))
+                sface_skipped_images.append(SkippedImage(folder_name, image_path, "load-error"))
                 continue
+
+            if sface_runtime is not None:
+                sface_detector, sface_recognizer = sface_runtime
+                sface_embedding, sface_skip_reason = extract_sface_training_embedding(
+                    image,
+                    sface_detector,
+                    sface_recognizer,
+                    args,
+                )
+                if sface_embedding is not None:
+                    sface_samples.append(
+                        SFaceTrainingSample(
+                            label_id=label_id,
+                            folder_name=folder_name,
+                            image_path=image_path,
+                            embedding=sface_embedding,
+                        )
+                    )
+                    sface_valid_count += 1
+                elif sface_skip_reason:
+                    sface_skipped_images.append(SkippedImage(folder_name, image_path, sface_skip_reason))
 
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
             face_box = detect_single_face(gray, detector, args)
@@ -358,85 +566,139 @@ def main() -> int:
                 training_faces.append(rotated)
                 training_ids.append(label_id)
         label_samples[folder_name] = valid_count
-
-    valid_labels = {
-        index
-        for index, folder_name in enumerate(label_names)
-        if label_samples.get(folder_name, 0) >= args.min_samples
-    }
-    if not valid_labels:
-        print(
-            "No employee folders met the minimum sample requirement for LBPH training.",
-            file=sys.stderr,
-        )
-        return 1
-
-    filtered_faces: list[np.ndarray] = []
-    filtered_ids: list[int] = []
-    for face_image, label_id in zip(training_faces, training_ids):
-        if label_id in valid_labels:
-            filtered_faces.append(face_image)
-            filtered_ids.append(label_id)  # type: ignore
-
-    filtered_validation_faces: list[np.ndarray] = []
-    filtered_validation_ids: list[int] = []
-    for face_image, label_id in zip(validation_faces, validation_ids):
-        if label_id in valid_labels:
-            filtered_validation_faces.append(face_image)
-            filtered_validation_ids.append(label_id)
-
-    for index, folder_name in enumerate(label_names):
-        if index not in valid_labels:
-            skipped_people.append(
-                {
-                    "folderName": folder_name,
-                    "reason": "not-enough-valid-images",
-                    "validSamples": label_samples.get(folder_name, 0),
-                    "requiredSamples": args.min_samples,
-                }
-            )
+        sface_label_samples[folder_name] = sface_valid_count
 
     model_path = args.output / "lbph-model.yml"
     backend_summary: BackendSummary
-    filtered_id_array = np.array(filtered_ids, dtype=np.int32)
-    if has_lbph_support():
-        recognizer = create_lbph_recognizer(
-            radius=args.lbph_radius,
-            neighbors=args.lbph_neighbors,
-            grid_x=args.lbph_grid_x,
-            grid_y=args.lbph_grid_y,
-            threshold=args.lbph_threshold,
-        )
-        recognizer.train(filtered_faces, filtered_id_array)
-        recognizer.save(str(model_path))
-        backend_summary = BackendSummary(
-            model_type=LBPH_MODEL_TYPE,
-            threshold=float(args.lbph_threshold),
-            training_backend="lbph",
-        )
-    else:
-        feature_rows = np.vstack([face_to_feature_vector(face_image) for face_image in filtered_faces])
-        validation_feature_rows = np.vstack([face_to_feature_vector(face_image) for face_image in filtered_validation_faces])
-        threshold_estimate = estimate_gray_nn_threshold(
-            feature_rows,
-            filtered_id_array,
-            validation_features=validation_feature_rows,
-            validation_label_ids=np.array(filtered_validation_ids, dtype=np.int32),
-        )
-        save_gray_nn_model(
+    backend_valid_labels: set[int]
+    backend_label_samples: dict[str, int]
+    backend_skipped_images: list[SkippedImage]
+    trained_image_count = 0
+
+    pruned_sface_samples, sface_outlier_images = prune_sface_samples(
+        sface_samples,
+        min_samples=args.min_samples,
+    )
+    sface_skipped_images.extend(sface_outlier_images)
+    kept_sface_counts: dict[int, int] = {}
+    for sample in pruned_sface_samples:
+        kept_sface_counts[sample.label_id] = kept_sface_counts.get(sample.label_id, 0) + 1
+    sface_valid_labels = {
+        label_id
+        for label_id, count in kept_sface_counts.items()
+        if count >= args.min_samples
+    }
+
+    if sface_runtime is not None and sface_valid_labels:
+        filtered_sface_samples = [
+            sample
+            for sample in pruned_sface_samples
+            if sample.label_id in sface_valid_labels
+        ]
+        feature_rows = np.vstack([sample.embedding for sample in filtered_sface_samples]).astype(np.float32)
+        filtered_id_array = np.array([sample.label_id for sample in filtered_sface_samples], dtype=np.int32)
+        threshold_estimate = estimate_sface_threshold(feature_rows, filtered_id_array)
+        save_sface_model(
             model_path,
             features=feature_rows,
             label_ids=filtered_id_array,
             threshold=threshold_estimate.threshold,
-            image_size=int(args.image_size),
         )
         backend_summary = BackendSummary(
-            model_type=GRAY_NN_MODEL_TYPE,
+            model_type=SFACE_MODEL_TYPE,
             threshold=threshold_estimate.threshold,
-            training_backend="gray-nearest-neighbor",
+            training_backend="opencv-sface",
             score_margin_threshold=threshold_estimate.score_margin_threshold,
             centroid_margin_threshold=threshold_estimate.centroid_margin_threshold,
         )
+        backend_valid_labels = sface_valid_labels
+        backend_label_samples = {
+            folder_name: kept_sface_counts.get(index, 0)
+            for index, folder_name in enumerate(label_names)
+        }
+        backend_skipped_images = sface_skipped_images
+        trained_image_count = len(filtered_sface_samples)
+    else:
+        valid_labels = {
+            index
+            for index, folder_name in enumerate(label_names)
+            if label_samples.get(folder_name, 0) >= args.min_samples
+        }
+        if not valid_labels:
+            print(
+                "No employee folders met the minimum sample requirement for face training.",
+                file=sys.stderr,
+            )
+            return 1
+
+        filtered_faces: list[np.ndarray] = []
+        filtered_ids: list[int] = []
+        for face_image, label_id in zip(training_faces, training_ids):
+            if label_id in valid_labels:
+                filtered_faces.append(face_image)
+                filtered_ids.append(label_id)  # type: ignore
+
+        filtered_validation_faces: list[np.ndarray] = []
+        filtered_validation_ids: list[int] = []
+        for face_image, label_id in zip(validation_faces, validation_ids):
+            if label_id in valid_labels:
+                filtered_validation_faces.append(face_image)
+                filtered_validation_ids.append(label_id)
+
+        filtered_id_array = np.array(filtered_ids, dtype=np.int32)
+        if has_lbph_support():
+            recognizer = create_lbph_recognizer(
+                radius=args.lbph_radius,
+                neighbors=args.lbph_neighbors,
+                grid_x=args.lbph_grid_x,
+                grid_y=args.lbph_grid_y,
+                threshold=args.lbph_threshold,
+            )
+            recognizer.train(filtered_faces, filtered_id_array)
+            recognizer.save(str(model_path))
+            backend_summary = BackendSummary(
+                model_type=LBPH_MODEL_TYPE,
+                threshold=float(args.lbph_threshold),
+                training_backend="lbph",
+            )
+        else:
+            feature_rows = np.vstack([face_to_feature_vector(face_image) for face_image in filtered_faces])
+            validation_feature_rows = np.vstack([face_to_feature_vector(face_image) for face_image in filtered_validation_faces])
+            threshold_estimate = estimate_gray_nn_threshold(
+                feature_rows,
+                filtered_id_array,
+                validation_features=validation_feature_rows,
+                validation_label_ids=np.array(filtered_validation_ids, dtype=np.int32),
+            )
+            save_gray_nn_model(
+                model_path,
+                features=feature_rows,
+                label_ids=filtered_id_array,
+                threshold=threshold_estimate.threshold,
+                image_size=int(args.image_size),
+            )
+            backend_summary = BackendSummary(
+                model_type=GRAY_NN_MODEL_TYPE,
+                threshold=threshold_estimate.threshold,
+                training_backend="gray-nearest-neighbor",
+                score_margin_threshold=threshold_estimate.score_margin_threshold,
+                centroid_margin_threshold=threshold_estimate.centroid_margin_threshold,
+            )
+        backend_valid_labels = valid_labels
+        backend_label_samples = label_samples
+        backend_skipped_images = skipped_images
+        trained_image_count = len(filtered_faces)
+
+    for index, folder_name in enumerate(label_names):
+        if index not in backend_valid_labels:
+            skipped_people.append(
+                {
+                    "folderName": folder_name,
+                    "reason": "not-enough-valid-images",
+                    "validSamples": backend_label_samples.get(folder_name, 0),
+                    "requiredSamples": args.min_samples,
+                }
+            )
 
     labels_payload = {
         "createdAt": datetime.now(UTC).isoformat(),
@@ -458,8 +720,8 @@ def main() -> int:
                 "phone": metadata_rows.get(folder_name, {}).get("phone") or None,
                 "isActive": parse_bool(metadata_rows.get(folder_name, {}).get("isActive") or "true"),
                 "sourceFolders": label_source_names.get(folder_name, [folder_name]),
-                "sampleCount": label_samples.get(folder_name, 0),
-                "includedInTraining": index in valid_labels,
+                "sampleCount": backend_label_samples.get(folder_name, 0),
+                "includedInTraining": index in backend_valid_labels,
             }
             for index, folder_name in enumerate(label_names)
         ],
@@ -469,9 +731,9 @@ def main() -> int:
         "generatedAt": datetime.now(UTC).isoformat(),
         "datasetRoot": str(args.dataset),
         "outputRoot": str(args.output),
-        "trainedLabels": [folder_name for index, folder_name in enumerate(label_names) if index in valid_labels],
+        "trainedLabels": [folder_name for index, folder_name in enumerate(label_names) if index in backend_valid_labels],
         "sourceFolders": label_source_names,
-        "trainedImageCount": len(filtered_faces),
+        "trainedImageCount": trained_image_count,
         "skippedPeople": skipped_people,
         "skippedImages": [
             {
@@ -479,7 +741,7 @@ def main() -> int:
                 "imagePath": str(item.image_path),
                 "reason": item.reason,
             }
-            for item in skipped_images
+            for item in backend_skipped_images
         ],
         "modelType": backend_summary.model_type,
         "trainingBackend": backend_summary.training_backend,
@@ -490,7 +752,7 @@ def main() -> int:
     }
     json_dump(args.output / "lbph-training-report.json", report_payload)
 
-    print(f"LBPH model: {model_path}")
+    print(f"Face model: {model_path}")
     print(f"Label map: {args.output / 'lbph-labels.json'}")
     print(f"Training backend: {backend_summary.training_backend}")
     trained_count = len([label for label in labels_payload["labels"] if isinstance(label, dict) and label.get("includedInTraining")])

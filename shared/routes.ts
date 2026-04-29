@@ -180,7 +180,7 @@ export const api = {
       input: z.object({
         rfidUid: z.string(),
         deviceId: z.string(),
-        faceFrames: z.array(z.string()).min(3).max(16).optional(),
+        faceFrames: z.array(z.string()).min(2).max(16).optional(),
         faceDescriptor: z.array(z.number()).optional(),
         faceAnchorDescriptors: z.array(z.array(z.number())).optional(),
         faceConsistency: z.number().min(0).max(1).optional(),

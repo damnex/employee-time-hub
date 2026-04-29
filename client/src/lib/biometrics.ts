@@ -387,8 +387,8 @@ const CAPTURE_CONFIG: Partial<Config> = {
     detector: {
       enabled: true,
       rotation: true,
-      maxDetected: 1,
-      minConfidence: 0.35,
+      maxDetected: 3,
+      minConfidence: 0.55,
       skipFrames: 0,
       skipTime: 0,
     },

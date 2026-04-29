@@ -3,15 +3,18 @@ import { useQuery } from "@tanstack/react-query";
 import type { Employee } from "@shared/schema";
 import { fetchLiveFaceRecognition, useScanRFID } from "@/hooks/use-gate";
 import { useEmployees } from "@/hooks/use-employees";
+import { useGateEvents } from "@/hooks/use-gate-events";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { detectLiveTrackingFaces, isFaceDetectorAvailable } from "@/lib/biometrics";
+import type { LiveTrackedFaceDetection } from "@/lib/biometrics";
 import { fetchRfidActiveTags, fetchRfidTags, rfidQueryKeys } from "@/lib/rfid";
 import { cn } from "@/lib/utils";
 import {
@@ -19,48 +22,50 @@ import {
   ArrowLeftRight,
   Camera,
   CheckCircle2,
+  Clock,
   KeyRound,
   Loader2,
-  MoveHorizontal,
   RefreshCcw,
   ScanLine,
   ShieldCheck,
-  UserCircle2,
+  Users,
   Wifi,
   WifiOff,
 } from "lucide-react";
 
 
 const GATE_DEVICE_ID = "GATE-TERMINAL-01";
-const GATE_FRAME_COUNT = 3;
-const GATE_FRAME_DELAY_MS = 12;
-const GATE_MAX_FRAME_WIDTH = 480;
-const GATE_FRAME_JPEG_QUALITY = 0.55;
+const GATE_FRAME_COUNT = 2;
+const GATE_FRAME_DELAY_MS = 6;
+const GATE_MAX_FRAME_WIDTH = 720;
+const GATE_FRAME_JPEG_QUALITY = 0.62;
 const LIVE_TRACKING_INTERVAL_MS = 120;
-const LIVE_TRACKING_BUSY_INTERVAL_MS = 170;
+const LIVE_TRACKING_BUSY_INTERVAL_MS = 190;
+const LIVE_TRACKING_MIN_FACE_SCORE = 0.58;
+const LIVE_TRACKING_MIN_BOX_SCORE = 0.55;
+const LIVE_TRACKING_MIN_QUALITY = 0.52;
+const LIVE_TRACKING_MIN_STABLE_HITS = 2;
+const LIVE_TRACKING_MIN_WIDTH_RATIO = 0.08;
+const LIVE_TRACKING_MAX_WIDTH_RATIO = 0.58;
+const LIVE_TRACKING_MIN_HEIGHT_RATIO = 0.14;
+const LIVE_TRACKING_MAX_HEIGHT_RATIO = 0.78;
+const LIVE_TRACKING_MIN_ASPECT_RATIO = 0.55;
+const LIVE_TRACKING_MAX_ASPECT_RATIO = 1.28;
+const LIVE_TRACKING_MIN_CENTER_X = 0;
+const LIVE_TRACKING_MAX_CENTER_X = 1;
+const LIVE_TRACKING_MIN_CENTER_Y = 0;
+const LIVE_TRACKING_MAX_CENTER_Y = 1;
 const LIVE_RECOGNITION_INTERVAL_MS = 320;
-const LIVE_RECOGNITION_IDLE_DELAY_MS = 180;
+const LIVE_RECOGNITION_IDLE_DELAY_MS = 140;
+const LIVE_RECOGNITION_BUSY_BACKOFF_MS = 80;
 const LIVE_RECOGNITION_MAX_FRAME_WIDTH = 640;
 const LIVE_RECOGNITION_JPEG_QUALITY = 0.6;
-const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.72;
+const LIVE_RECOGNITION_MIN_CONFIDENCE = 0.86;
 const LIVE_RECOGNITION_STABLE_HITS = 2;
-const LIVE_RECOGNITION_TTL_MS = 1400;
+const LIVE_RECOGNITION_TTL_MS = 1200;
 const LIVE_RECOGNITION_MATCH_DISTANCE = 0.12;
 const SENSOR_ACTIVE_WINDOW_MS = 4500;
-const TRACK_MATCH_DISTANCE = 0.18;
-const TRACK_MOVEMENT_DELTA = 0.015;
-const TRACK_READY_STABLE_HITS = 2;
-const BROWSER_FACE_SCORE_THRESHOLD = 0.52;
-const BROWSER_BOX_SCORE_THRESHOLD = 0.68;
-const BROWSER_FACE_QUALITY_THRESHOLD = 0.34;
-const BROWSER_MIN_FACE_WIDTH_PCT = 7;
-const BROWSER_MIN_FACE_HEIGHT_PCT = 12;
-const BROWSER_MAX_FACE_AREA_RATIO = 0.48;
-const SCAN_TARGET_MIN_WIDTH_PCT = 10;
-const SCAN_TARGET_MIN_HEIGHT_PCT = 16;
-const SCAN_TARGET_MIN_SCORE = 0.58;
-const SCAN_TARGET_AMBIGUITY_GAP = 0.08;
-const SCAN_TARGET_EDGE_MARGIN_PCT = 3;
+const READER_EVENT_MEMORY_MS = 15000;
 
 type PythonFaceStatus = "training" | "trained" | "failed";
 
@@ -105,17 +110,21 @@ type ProjectedLiveFace = {
   department?: string;
   rfidUid?: string;
   source: RecognitionSource;
-  quality?: number;
-  faceScore?: number;
-  boxScore?: number;
 };
 
 type LiveTrackedFace = ProjectedLiveFace & {
   trackId: number;
   movement: "LEFT" | "RIGHT" | "STEADY";
-  movementMagnitude?: number;
   stableHits?: number;
   lastSeenAt?: number;
+};
+
+type LiveTrackAnchor = {
+  trackId: number;
+  centerX: number;
+  centerY: number;
+  stableHits: number;
+  lastSeenAt: number;
 };
 
 type LiveRecognitionAssignment = {
@@ -128,6 +137,14 @@ type LiveRecognitionAssignment = {
   verified: true;
   stableHits: number;
   lastSeenAt: number;
+};
+
+type PendingGateScan = {
+  queueKey: string;
+  rfidUid: string;
+  sourceDeviceId: string;
+  source: "manual" | "reader";
+  enqueuedAt: number;
 };
 
 type GateDisplayResult = {
@@ -163,9 +180,6 @@ function clampValue(value: number, min = 0, max = 1) {
   return Math.min(max, Math.max(min, value));
 }
 
-function roundMetric(value: number, digits = 3) {
-  return Number(value.toFixed(digits));
-}
 function getCameraConstraints(): MediaTrackConstraints {
   return {
     facingMode: "user",
@@ -270,7 +284,7 @@ function captureGateFrame(
 
 function getCaptureMessage(progress: number) {
   if (progress <= 2) {
-    return "Hold the face centered while the UHF event starts the burst.";
+    return "Hold steady while the gate captures all visible faces.";
   }
 
   if (progress <= 5) {
@@ -278,24 +292,6 @@ function getCaptureMessage(progress: number) {
   }
 
   return "Hold steady for the final verification frames.";
-}
-
-function getFaceBoxStyle(
-  faceBox: FaceBox | null | undefined,
-  frameSize: { width: number; height: number } | null | undefined,
-) {
-  if (!faceBox || !frameSize || !frameSize.width || !frameSize.height) {
-    return null;
-  }
-
-  const width = faceBox.right - faceBox.left;
-  const height = faceBox.bottom - faceBox.top;
-  return {
-    left: `${(faceBox.left / frameSize.width) * 100}%`,
-    top: `${(faceBox.top / frameSize.height) * 100}%`,
-    width: `${(width / frameSize.width) * 100}%`,
-    height: `${(height / frameSize.height) * 100}%`,
-  };
 }
 
 function mapRectToViewport(
@@ -433,32 +429,24 @@ function mapFaceBoxToViewport(
   );
 }
 
-type PreviousTrackedFace = {
-  trackId: number;
-  centerX: number;
-  centerY: number;
-  stableHits: number;
-  lastSeenAt: number;
-};
-
 function buildTrackedFaces(
   projectedFaces: ProjectedLiveFace[],
-  previousTracksRef: MutableRefObject<PreviousTrackedFace[]>,
+  previousTracksRef: MutableRefObject<LiveTrackAnchor[]>,
   nextTrackIdRef: MutableRefObject<number>,
 ): LiveTrackedFace[] {
-  const now = Date.now();
   const previousTracks = [...previousTracksRef.current];
   const usedTrackIds = new Set<number>();
+  const now = Date.now();
   const nextTrackedFaces = projectedFaces.map((face) => {
-    let matchedTrack = previousTracks.find((track) => {
+    let matchedTrack: LiveTrackAnchor | null = previousTracks.find((track) => {
       if (usedTrackIds.has(track.trackId)) {
         return false;
       }
 
       const dx = track.centerX - face.centerX;
       const dy = track.centerY - face.centerY;
-      return Math.sqrt(dx * dx + dy * dy) <= TRACK_MATCH_DISTANCE;
-    });
+      return Math.sqrt(dx * dx + dy * dy) <= 0.18;
+    }) ?? null;
 
     if (!matchedTrack) {
       matchedTrack = {
@@ -466,20 +454,19 @@ function buildTrackedFaces(
         centerX: face.centerX,
         centerY: face.centerY,
         stableHits: 0,
-        lastSeenAt: now,
+        lastSeenAt: 0,
       };
     }
 
     usedTrackIds.add(matchedTrack.trackId);
     const deltaX = face.centerX - matchedTrack.centerX;
-    const movement = deltaX >= TRACK_MOVEMENT_DELTA ? "RIGHT" : deltaX <= -TRACK_MOVEMENT_DELTA ? "LEFT" : "STEADY";
-    const stableHits = Math.min((matchedTrack.stableHits ?? 0) + 1, 12);
+    const movement = deltaX >= 0.015 ? "RIGHT" : deltaX <= -0.015 ? "LEFT" : "STEADY";
+    const stableHits = Math.min(matchedTrack.stableHits + 1, 8);
 
     return {
       ...face,
       trackId: matchedTrack.trackId,
       movement,
-      movementMagnitude: Math.abs(deltaX),
       stableHits,
       lastSeenAt: now,
     } satisfies LiveTrackedFace;
@@ -496,162 +483,49 @@ function buildTrackedFaces(
   return nextTrackedFaces;
 }
 
-function isReliableBrowserTrackedFace(face: {
-  leftPct: number;
-  topPct: number;
-  widthPct: number;
-  heightPct: number;
-  centerY: number;
-}) {
-  const aspectRatio = face.widthPct / Math.max(face.heightPct, 0.01);
-  const areaRatio = (face.widthPct * face.heightPct) / 10000;
-
-  return aspectRatio >= 0.42
-    && aspectRatio <= 1.25
-    && face.widthPct >= BROWSER_MIN_FACE_WIDTH_PCT
-    && face.heightPct >= BROWSER_MIN_FACE_HEIGHT_PCT
-    && areaRatio <= BROWSER_MAX_FACE_AREA_RATIO
-    && face.centerY >= 0.1
-    && face.centerY <= 0.93;
-}
-
-function scoreTrackedFaceForScan(face: LiveTrackedFace, badgeOwnerRfid?: string | null) {
-  const normalizedBadgeOwnerRfid = badgeOwnerRfid?.trim().toUpperCase() ?? null;
-  const centerDistance = Math.hypot(face.centerX - 0.5, face.centerY - 0.54);
-  const centeredScore = clampValue(1 - centerDistance / 0.58);
-  const sizeScore = clampValue(
-    Math.min(face.widthPct / 24, face.heightPct / 34),
-  );
-  const stableScore = clampValue(((face.stableHits ?? 1) - 1) / 4);
-  const movementScore = face.movement === "STEADY"
-    ? clampValue((face.movementMagnitude ?? 0) / TRACK_MOVEMENT_DELTA) * 0.4
-    : clampValue((face.movementMagnitude ?? 0) / 0.055);
-  const recognitionScore = face.verified
-    ? clampValue(face.confidence ?? 0)
-    : clampValue((face.faceScore ?? face.confidence ?? 0.35) * 0.8 + (face.boxScore ?? 0.45) * 0.2);
-  const badgeOwnerScore = normalizedBadgeOwnerRfid && face.rfidUid?.trim().toUpperCase() === normalizedBadgeOwnerRfid
-    ? 1
-    : 0;
-  const edgeSafe = face.leftPct >= SCAN_TARGET_EDGE_MARGIN_PCT
-    && face.topPct >= SCAN_TARGET_EDGE_MARGIN_PCT
-    && face.leftPct + face.widthPct <= 100 - SCAN_TARGET_EDGE_MARGIN_PCT
-    && face.topPct + face.heightPct <= 100 - SCAN_TARGET_EDGE_MARGIN_PCT;
-  const edgeScore = edgeSafe ? 1 : 0;
-
-  return roundMetric(
-    badgeOwnerScore * 0.42
-    + centeredScore * 0.18
-    + sizeScore * 0.14
-    + stableScore * 0.12
-    + movementScore * 0.08
-    + recognitionScore * 0.04
-    + edgeScore * 0.02,
-  );
-}
-
-function selectPrimaryScanFace(
-  faces: LiveTrackedFace[],
-  badgeOwnerRfid?: string | null,
+function isReliableLiveTrackingDetection(
+  detection: LiveTrackedFaceDetection,
+  video: HTMLVideoElement,
 ) {
-  const candidates = faces.filter((face) => {
-    return (face.stableHits ?? 1) >= TRACK_READY_STABLE_HITS
-      && face.widthPct >= SCAN_TARGET_MIN_WIDTH_PCT
-      && face.heightPct >= SCAN_TARGET_MIN_HEIGHT_PCT
-      && face.leftPct >= 0
-      && face.topPct >= 0;
-  }).map((face) => ({
-    face,
-    score: scoreTrackedFaceForScan(face, badgeOwnerRfid),
-  })).sort((left, right) => right.score - left.score);
+  const widthRatio = detection.bounds.width / Math.max(1, video.videoWidth);
+  const heightRatio = detection.bounds.height / Math.max(1, video.videoHeight);
+  const aspectRatio = detection.bounds.width / Math.max(1, detection.bounds.height);
+  const centerX = (detection.bounds.x + detection.bounds.width / 2) / Math.max(1, video.videoWidth);
+  const centerY = (detection.bounds.y + detection.bounds.height / 2) / Math.max(1, video.videoHeight);
 
-  if (!candidates.length) {
-    return {
-      target: null as LiveTrackedFace | null,
-      candidateCount: 0,
-      reason: "Keep one face closer to the camera and fully inside the frame before scanning.",
-    };
+  if (detection.faceScore < LIVE_TRACKING_MIN_FACE_SCORE) {
+    return false;
   }
 
-  const [best, second] = candidates;
-  const bestMatchesBadgeOwner = Boolean(
-    badgeOwnerRfid
-    && best.face.rfidUid?.trim().toUpperCase() === badgeOwnerRfid.trim().toUpperCase(),
-  );
-
-  if (best.score < SCAN_TARGET_MIN_SCORE) {
-    return {
-      target: null as LiveTrackedFace | null,
-      candidateCount: candidates.length,
-      reason: "Move closer and keep the face centered so the gate can lock onto a stronger target.",
-    };
+  if (detection.boxScore < LIVE_TRACKING_MIN_BOX_SCORE) {
+    return false;
   }
 
-  if (
-    second
-    && !bestMatchesBadgeOwner
-  ) {
-    return {
-      target: null as LiveTrackedFace | null,
-      candidateCount: candidates.length,
-      reason: "Multiple people are in the verification lane. Keep only the badge owner centered before scanning.",
-    };
+  if (detection.quality < LIVE_TRACKING_MIN_QUALITY) {
+    return false;
   }
 
-  if (
-    second
-    && best.score - second.score < SCAN_TARGET_AMBIGUITY_GAP
-  ) {
-    return {
-      target: null as LiveTrackedFace | null,
-      candidateCount: candidates.length,
-      reason: "Two faces look equally likely. Keep the badge owner closest to the camera before scanning.",
-    };
+  if (widthRatio < LIVE_TRACKING_MIN_WIDTH_RATIO || widthRatio > LIVE_TRACKING_MAX_WIDTH_RATIO) {
+    return false;
   }
 
-  return {
-    target: best.face,
-    candidateCount: candidates.length,
-    reason: null as string | null,
-  };
-}
-
-function getTrackedFaceMovement(face: LiveTrackedFace | null) {
-  if (!face || (face.stableHits ?? 0) < TRACK_READY_STABLE_HITS) {
-    return {
-      movementDirection: "UNKNOWN" as const,
-      movementAxis: "none" as const,
-      movementConfidence: 0,
-    };
+  if (heightRatio < LIVE_TRACKING_MIN_HEIGHT_RATIO || heightRatio > LIVE_TRACKING_MAX_HEIGHT_RATIO) {
+    return false;
   }
 
-  const magnitudeScore = clampValue(((face.movementMagnitude ?? 0) - 0.008) / 0.05);
-  const stabilityScore = clampValue(((face.stableHits ?? 1) - 1) / 4);
-  const recognitionScore = face.verified ? clampValue(face.confidence ?? 0.65) : 0.55;
-  const movementConfidence = roundMetric(
-    clampValue(magnitudeScore * 0.5 + stabilityScore * 0.3 + recognitionScore * 0.2),
-  );
-
-  if (face.movement === "RIGHT") {
-    return {
-      movementDirection: "ENTRY" as const,
-      movementAxis: "horizontal" as const,
-      movementConfidence,
-    };
+  if (aspectRatio < LIVE_TRACKING_MIN_ASPECT_RATIO || aspectRatio > LIVE_TRACKING_MAX_ASPECT_RATIO) {
+    return false;
   }
 
-  if (face.movement === "LEFT") {
-    return {
-      movementDirection: "EXIT" as const,
-      movementAxis: "horizontal" as const,
-      movementConfidence,
-    };
+  if (centerX < LIVE_TRACKING_MIN_CENTER_X || centerX > LIVE_TRACKING_MAX_CENTER_X) {
+    return false;
   }
 
-  return {
-    movementDirection: "UNKNOWN" as const,
-    movementAxis: "none" as const,
-    movementConfidence,
-  };
+  if (centerY < LIVE_TRACKING_MIN_CENTER_Y || centerY > LIVE_TRACKING_MAX_CENTER_Y) {
+    return false;
+  }
+
+  return true;
 }
 
 function getProjectedFaceDistance(leftFace: ProjectedLiveFace, rightFace: ProjectedLiveFace) {
@@ -733,10 +607,10 @@ export default function GateTerminal() {
     refetchInterval: 1500,
   });
   const cameraViewportRef = useRef<HTMLDivElement>(null);
-  const pythonPreviousLiveTracksRef = useRef<PreviousTrackedFace[]>([]);
+  const pythonPreviousLiveTracksRef = useRef<LiveTrackAnchor[]>([]);
   const pythonNextTrackIdRef = useRef(1);
   const pythonMissCountRef = useRef(0);
-  const browserPreviousLiveTracksRef = useRef<PreviousTrackedFace[]>([]);
+  const browserPreviousLiveTracksRef = useRef<LiveTrackAnchor[]>([]);
   const browserNextTrackIdRef = useRef(1);
   const browserMissCountRef = useRef(0);
   const browserTrackedFacesRef = useRef<LiveTrackedFace[]>([]);
@@ -759,38 +633,36 @@ export default function GateTerminal() {
   const [liveTrackerAvailable, setLiveTrackerAvailable] = useState<boolean | null>(null);
   const [liveRecognitionMessage, setLiveRecognitionMessage] = useState<string | null>(null);
   const [sensorWindowOpen, setSensorWindowOpen] = useState(false);
-  const [pendingReaderScan, setPendingReaderScan] = useState<{
-    rfidUid: string;
-    sourceDeviceId: string;
-  } | null>(null);
+  const [pendingScans, setPendingScans] = useState<PendingGateScan[]>([]);
   const [lastResult, setLastResult] = useState<GateDisplayResult | null>(null);
-  const lastProcessedReaderDetectionRef = useRef<number>(0);
+  const [manualTriggerOpen, setManualTriggerOpen] = useState(false);
+  const queueDrainActiveRef = useRef(false);
+  const queuedScanKeysRef = useRef(new Set<string>());
+  const seenReaderDetectionsRef = useRef(new Map<string, number>());
 
   const busy = isCapturingFrames || scanMutation.isPending;
-  const sensorWindowActive = sensorWindowOpen || busy;
+  const sensorWindowActive = sensorWindowOpen || busy || pendingScans.length > 0;
   const busyRef = useRef(busy);
   const readerConnected = Boolean(readerTagsQuery.data?.connected && readerTagsQuery.data?.running);
   const readerEndpointLabel = readerTagsQuery.data?.port ?? "UHFReader18";
+  const now = new Date();
+  const todayString = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const gateEventsTodayQuery = useGateEvents({ date: todayString, deviceId: GATE_DEVICE_ID });
+  const matchesToday = (gateEventsTodayQuery.data ?? []).filter((event) => {
+    return event?.decision === "ENTRY" || event?.decision === "EXIT";
+  }).length;
+  const comPortLabel = readerTagsQuery.data?.port ?? "COM3";
   const normalizedRfidUid = rfidUid.trim().toUpperCase();
   const selectedBadgeOwner = employees?.find((employee) => {
     return employee.rfidUid.toUpperCase() === normalizedRfidUid;
   });
   const latestEmployee = lastResult?.employee ?? lastResult?.badgeOwner ?? selectedBadgeOwner;
-  const [hasProfilePhoto, setHasProfilePhoto] = useState<boolean | null>(null);
   const [profileNonce, setProfileNonce] = useState<number>(0);
   const latestProfileImage = latestEmployee
     ? `/api/employees/${latestEmployee.id}/photo${profileNonce ? `?t=${profileNonce}` : ""}`
     : lastResult?.previewImage ?? null;
-  const latestFaceMeta = latestEmployee ? getPythonFaceMeta(latestEmployee.faceDescriptor) : null;
   const activeReaderTags = readerActiveTagsQuery.data?.active_tags ?? [];
-  const pythonRosterCount = (employees ?? []).filter((employee) => {
-    return Boolean(getPythonFaceMeta(employee.faceDescriptor));
-  }).length;
-  const pythonTrainedCount = (employees ?? []).filter((employee) => {
-    return getPythonFaceMeta(employee.faceDescriptor)?.status === "trained";
-  }).length;
   const lastDetectedDisplay = liveDetectedUid ?? (normalizedRfidUid || "--");
-  const detectedFaceBoxStyle = getFaceBoxStyle(lastResult?.detectedFaceBox, lastResult?.previewFrameSize);
   const stableRecognitionAssignments = liveRecognitionAssignments.filter((assignment) => {
     return Date.now() - assignment.lastSeenAt <= LIVE_RECOGNITION_TTL_MS
       && assignment.stableHits >= LIVE_RECOGNITION_STABLE_HITS;
@@ -834,9 +706,14 @@ export default function GateTerminal() {
   }, []);
 
   useEffect(() => {
+    const handleOpen = () => setManualTriggerOpen(true);
+    window.addEventListener("gate:open-manual-trigger", handleOpen);
+    return () => window.removeEventListener("gate:open-manual-trigger", handleOpen);
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     if (!latestEmployee?.id) {
-      setHasProfilePhoto(null);
       return;
     }
 
@@ -848,12 +725,10 @@ export default function GateTerminal() {
         }
         const data = await res.json();
         if (!cancelled) {
-          setHasProfilePhoto(Boolean(data?.hasProfilePhoto));
           setProfileNonce(Date.now());
         }
       } catch {
         if (!cancelled) {
-          setHasProfilePhoto(false);
           setProfileNonce(Date.now());
         }
       }
@@ -873,6 +748,46 @@ export default function GateTerminal() {
   useEffect(() => {
     browserTrackedFacesRef.current = browserTrackedFaces;
   }, [browserTrackedFaces]);
+
+  const enqueuePendingScans = useCallback((scans: PendingGateScan[]) => {
+    if (!scans.length) {
+      return;
+    }
+
+    setPendingScans((previous) => {
+      const nextScans = scans.filter((scan) => {
+        return !queuedScanKeysRef.current.has(scan.queueKey);
+      });
+
+      if (!nextScans.length) {
+        return previous;
+      }
+
+      for (const scan of nextScans) {
+        queuedScanKeysRef.current.add(scan.queueKey);
+      }
+
+      return [...previous, ...nextScans];
+    });
+  }, []);
+
+  const rememberReaderDetection = useCallback((detectionKey: string, detectedAtMs: number) => {
+    const seenEvents = seenReaderDetectionsRef.current;
+    const minAllowedTimestamp = detectedAtMs - READER_EVENT_MEMORY_MS;
+
+    for (const [key, timestamp] of Array.from(seenEvents.entries())) {
+      if (timestamp < minAllowedTimestamp) {
+        seenEvents.delete(key);
+      }
+    }
+
+    if (seenEvents.has(detectionKey)) {
+      return false;
+    }
+
+    seenEvents.set(detectionKey, detectedAtMs);
+    return true;
+  }, []);
 
   const armSensorWindow = useCallback((durationMs = SENSOR_ACTIVE_WINDOW_MS) => {
     setSensorWindowOpen(true);
@@ -974,7 +889,7 @@ export default function GateTerminal() {
     let timerId: number | null = null;
 
     const scheduleNext = (
-      delayMs = busyRef.current ? LIVE_RECOGNITION_INTERVAL_MS + 180 : LIVE_RECOGNITION_INTERVAL_MS,
+      delayMs = busyRef.current ? LIVE_RECOGNITION_INTERVAL_MS + LIVE_RECOGNITION_BUSY_BACKOFF_MS : LIVE_RECOGNITION_INTERVAL_MS,
     ) => {
       if (cancelled) {
         return;
@@ -1010,7 +925,7 @@ export default function GateTerminal() {
       }
 
       if (busyRef.current) {
-        scheduleNext(LIVE_RECOGNITION_INTERVAL_MS + 180);
+        scheduleNext(LIVE_RECOGNITION_INTERVAL_MS + LIVE_RECOGNITION_BUSY_BACKOFF_MS);
         return;
       }
 
@@ -1181,7 +1096,6 @@ export default function GateTerminal() {
       || !videoRef.current
       || !cameraViewportRef.current
       || liveTrackerAvailable === false
-      || !sensorWindowActive
     ) {
       setBrowserTrackedFaces([]);
       browserTrackedFacesRef.current = [];
@@ -1227,6 +1141,10 @@ export default function GateTerminal() {
         }
 
         const projectedFaces = detections.reduce<ProjectedLiveFace[]>((result, detection) => {
+          if (!isReliableLiveTrackingDetection(detection, videoRef.current!)) {
+            return result;
+          }
+
           const projectedFace = mapRectToViewport(
             detection.bounds.x,
             detection.bounds.y,
@@ -1240,23 +1158,11 @@ export default function GateTerminal() {
             return result;
           }
 
-          if (
-            detection.faceScore < BROWSER_FACE_SCORE_THRESHOLD
-            || detection.boxScore < BROWSER_BOX_SCORE_THRESHOLD
-            || detection.quality < BROWSER_FACE_QUALITY_THRESHOLD
-            || !isReliableBrowserTrackedFace(projectedFace)
-          ) {
-            return result;
-          }
-
           result.push({
             ...projectedFace,
             label: "Tracking Face",
             verified: false,
             confidence: detection.faceScore,
-            quality: detection.quality,
-            faceScore: detection.faceScore,
-            boxScore: detection.boxScore,
             source: "browser",
           });
           return result;
@@ -1279,8 +1185,11 @@ export default function GateTerminal() {
           browserPreviousLiveTracksRef,
           browserNextTrackIdRef,
         );
-        browserTrackedFacesRef.current = nextTrackedFaces;
-        setBrowserTrackedFaces(nextTrackedFaces);
+        const nextVisibleTrackedFaces = nextTrackedFaces.filter((face) => {
+          return (face.stableHits ?? 0) >= LIVE_TRACKING_MIN_STABLE_HITS;
+        });
+        browserTrackedFacesRef.current = nextVisibleTrackedFaces;
+        setBrowserTrackedFaces(nextVisibleTrackedFaces);
       } catch (error) {
         console.warn("Live motion tracker failed:", error);
         browserMissCountRef.current += 1;
@@ -1306,7 +1215,7 @@ export default function GateTerminal() {
       browserPreviousLiveTracksRef.current = [];
       browserMissCountRef.current = 0;
     };
-  }, [cameraActive, liveTrackerAvailable, sensorWindowActive]);
+  }, [cameraActive, liveTrackerAvailable]);
 
   const captureFrameBurst = useCallback(async (
     crop: {
@@ -1371,9 +1280,13 @@ export default function GateTerminal() {
     const badgeOwner = employees?.find((employee) => {
       return employee.rfidUid.toUpperCase() === normalizedUid;
     });
-    const requestDeviceId = sourceDeviceId ?? readerSourceDeviceId ?? GATE_DEVICE_ID;
+    // Keep backend events consistent per terminal; COM port stays a UI/detail concern.
+    const requestDeviceId = GATE_DEVICE_ID;
+    const sourceLabel = sourceDeviceId ?? comPortLabel ?? GATE_DEVICE_ID;
     const scanStartedAt = performance.now();
-    const scanTarget = selectPrimaryScanFace(liveTrackedFaces, normalizedUid);
+    const visibleFaceCount = liveTrackerAvailable === false
+      ? pythonTrackedFaces.length
+      : browserTrackedFacesRef.current.length;
 
     if (!cameraActive) {
       setLastResult({
@@ -1390,64 +1303,28 @@ export default function GateTerminal() {
       return;
     }
 
-    if (scanTarget.candidateCount > 1) {
-      setLastResult({
-        success: true,
-        ignored: true,
-        message: `Multiple people are in the verification lane (${scanTarget.candidateCount}). Keep only the badge owner centered before scanning again.`,
-        employee: badgeOwner,
-        badgeOwner,
-        verifiedAt: new Date().toLocaleTimeString(),
-        latencyMs: Math.round(performance.now() - scanStartedAt),
-        previewImage: null,
-        source,
-        previewFrameSize: null,
-      });
+    if (visibleFaceCount > 1) {
       setReaderMessage(
-        `Multiple faces are in view (${scanTarget.candidateCount}). Waiting for only the badge owner before verification.`,
+        `Multiple faces are in view (${visibleFaceCount}). Capturing the full scene and verifying the RFID owner among all visible faces.`,
       );
-      return;
-    }
-
-    if (!scanTarget.target) {
-      setLastResult({
-        success: true,
-        ignored: true,
-        message: scanTarget.reason ?? "Keep one clear face in view before scanning again.",
-        employee: badgeOwner,
-        badgeOwner,
-        verifiedAt: new Date().toLocaleTimeString(),
-        latencyMs: Math.round(performance.now() - scanStartedAt),
-        previewImage: null,
-        source,
-        previewFrameSize: null,
-      });
-      return;
     }
 
     setIsCapturingFrames(true);
     setCaptureProgress(0);
 
     try {
-      const movement = getTrackedFaceMovement(scanTarget.target);
-      const crop = videoRef.current && cameraViewportRef.current
-        ? getTrackedFaceSourceCrop(scanTarget.target, videoRef.current, cameraViewportRef.current)
-        : null;
-      const { frames, previewImage, previewFrameSize } = await captureFrameBurst(crop);
+      const { frames, previewImage, previewFrameSize } = await captureFrameBurst(null);
       const response = await scanMutation.mutateAsync({
         rfidUid: normalizedUid,
         deviceId: requestDeviceId,
         scanTechnology,
         faceFrames: frames,
-        movementDirection: movement.movementDirection,
-        movementAxis: movement.movementAxis,
-        movementConfidence: movement.movementConfidence,
       });
 
-      setReaderSourceDeviceId(requestDeviceId);
+      setReaderSourceDeviceId(sourceLabel);
       setReaderMessage(
         source === "reader"
-          ? `UHF reader event received from ${requestDeviceId}. Python verification completed.`
+          ? `UHF reader event received from ${sourceLabel}. Python verification completed.`
           : `Manual verification sent through ${requestDeviceId}.`,
       );
       setLastResult({
@@ -1480,10 +1357,11 @@ export default function GateTerminal() {
     busy,
     cameraActive,
     cameraError,
+    comPortLabel,
     captureFrameBurst,
     employees,
-    liveTrackedFaces,
-    readerSourceDeviceId,
+    liveTrackerAvailable,
+    pythonTrackedFaces,
     scanMutation,
     scanTechnology,
   ]);
@@ -1496,495 +1374,518 @@ export default function GateTerminal() {
     const sourceDeviceId = readerEndpointLabel;
     setReaderSourceDeviceId(sourceDeviceId);
 
-    if (activeReaderTags.length > 1) {
-      setReaderMessage(
-        `Multiple active UHF tags detected (${activeReaderTags.length}). Keep only one tag in the read zone for face verification.`,
-      );
-      return;
-    }
+    const newQueuedScans = [...activeReaderTags]
+      .sort((left, right) => left.first_seen_at - right.first_seen_at)
+      .reduce<PendingGateScan[]>((result, activeTag) => {
+        const detectionAtMs = Math.round(activeTag.first_seen_at * 1000);
+        const detectionKey = `${activeTag.epc}:${detectionAtMs}`;
 
-    const activeTag = activeReaderTags[0];
-    const detectionKey = Math.round(activeTag.first_seen_at * 1000);
-    if (detectionKey <= lastProcessedReaderDetectionRef.current) {
+        if (!rememberReaderDetection(detectionKey, detectionAtMs)) {
+          return result;
+        }
+
+        result.push({
+          queueKey: detectionKey,
+          rfidUid: activeTag.epc,
+          sourceDeviceId,
+          source: "reader",
+          enqueuedAt: detectionAtMs,
+        });
+        return result;
+      }, []);
+
+    if (!newQueuedScans.length) {
       return;
     }
-    lastProcessedReaderDetectionRef.current = detectionKey;
 
     armSensorWindow();
-    setRfidUid(activeTag.epc);
-    setLiveDetectedUid(activeTag.epc);
-    setReaderMessage(`Live UHF detection captured from ${sourceDeviceId}. Starting face verification.`);
+    setRfidUid(newQueuedScans[0].rfidUid);
+    setLiveDetectedUid(newQueuedScans[newQueuedScans.length - 1].rfidUid);
 
-    if (busy) {
-      setPendingReaderScan({
-        rfidUid: activeTag.epc,
-        sourceDeviceId,
-      });
-      return;
-    }
+    enqueuePendingScans(newQueuedScans);
 
-    void handleScan(activeTag.epc, "reader", sourceDeviceId);
+    setReaderMessage(
+      newQueuedScans.length > 1
+        ? `Queued ${newQueuedScans.length} UHF tags from ${sourceDeviceId} for sequential verification.`
+        : `Live UHF detection captured from ${sourceDeviceId}. Added to the verification queue.`,
+    );
   }, [
     activeReaderTags,
     armSensorWindow,
-    busy,
-    handleScan,
+    enqueuePendingScans,
     readerConnected,
     readerEndpointLabel,
+    rememberReaderDetection,
   ]);
 
   useEffect(() => {
-    if (!pendingReaderScan || busy) {
+    if (busy || !pendingScans.length || queueDrainActiveRef.current) {
       return;
     }
 
-    const queuedScan = pendingReaderScan;
-    setPendingReaderScan(null);
-    void handleScan(queuedScan.rfidUid, "reader", queuedScan.sourceDeviceId);
-  }, [busy, handleScan, pendingReaderScan]);
+    const [queuedScan, ...remainingScans] = pendingScans;
+    queueDrainActiveRef.current = true;
+    queuedScanKeysRef.current.delete(queuedScan.queueKey);
+    setPendingScans(remainingScans);
+
+    void handleScan(queuedScan.rfidUid, queuedScan.source, queuedScan.sourceDeviceId).finally(() => {
+      queueDrainActiveRef.current = false;
+    });
+  }, [busy, handleScan, pendingScans]);
 
   const handleManualSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    void handleScan(normalizedRfidUid, "manual");
+    if (busy || !normalizedRfidUid || !cameraActive) {
+      return;
+    }
+
+    void handleScan(normalizedRfidUid, "manual").finally(() => {
+      setManualTriggerOpen(false);
+    });
   };
 
   const cameraFrameTone = !cameraActive
-    ? "border-slate-300 shadow-none"
+    ? "border-border/70 shadow-none"
     : lastResult?.ignored
-      ? "border-amber-300 shadow-[0_0_0_1px_rgba(253,224,71,0.82),0_0_28px_rgba(253,224,71,0.24)]"
+      ? "border-amber-500/60 shadow-[0_0_0_1px_rgba(245,158,11,0.35),0_0_42px_rgba(245,158,11,0.12)]"
     : lastResult?.success
-      ? "border-emerald-400 shadow-[0_0_0_1px_rgba(74,222,128,0.82),0_0_28px_rgba(74,222,128,0.28)]"
+      ? "border-primary/60 shadow-[0_0_0_1px_rgba(34,197,94,0.45),0_0_60px_rgba(34,197,94,0.16)]"
       : lastResult
-        ? "border-rose-400 shadow-[0_0_0_1px_rgba(251,113,133,0.82),0_0_28px_rgba(251,113,133,0.24)]"
+        ? "border-rose-500/60 shadow-[0_0_0_1px_rgba(244,63,94,0.38),0_0_46px_rgba(244,63,94,0.14)]"
         : busy
-          ? "border-amber-300 shadow-[0_0_0_1px_rgba(253,224,71,0.78),0_0_24px_rgba(253,224,71,0.22)]"
-          : "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.78),0_0_24px_rgba(34,211,238,0.22)]";
+          ? "border-amber-500/50 shadow-[0_0_0_1px_rgba(245,158,11,0.26),0_0_40px_rgba(245,158,11,0.1)]"
+          : "border-primary/45 shadow-[0_0_0_1px_rgba(34,197,94,0.18),0_0_36px_rgba(34,197,94,0.08)]";
   const lastResultTone = !lastResult
-    ? "border-slate-200 bg-white/90"
+    ? "border-border bg-card/95"
     : lastResult.ignored
-      ? "border-amber-200 bg-amber-50/90"
+      ? "border-amber-500/35 bg-amber-500/10"
     : lastResult.success
-      ? "border-emerald-200 bg-emerald-50/90"
-      : "border-rose-200 bg-rose-50/90";
+      ? "border-primary/35 bg-primary/10"
+      : "border-rose-500/35 bg-rose-500/10";
+
+  const handleReadyForNext = () => {
+    setLastResult(null);
+    setRfidUid("");
+    setReaderMessage(null);
+    setLiveDetectedUid(null);
+    setPendingScans([]);
+    queuedScanKeysRef.current.clear();
+  };
 
   return (
-    <div className="flex h-[calc(100vh-60px)] flex-col gap-2 px-6 md:px-8 lg:px-10 xl:px-12 py-3 animate-in fade-in duration-300 overflow-hidden">
-      <Card className="overflow-hidden border-border/60 bg-white/90 shadow-sm">
-        <CardContent className="flex flex-wrap items-center justify-between gap-2 p-3">
-          <div className="flex items-baseline gap-2">
-            <h1 className="text-2xl font-semibold tracking-tight text-foreground">Gate Monitor</h1>
-            <p className="text-sm text-muted-foreground">Continuous UHF RFID + live face verification in one view.</p>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge
-              variant={readerConnected ? "secondary" : "outline"}
-              className={cn(
-                readerConnected
-                  ? "bg-emerald-100 text-emerald-800 border-emerald-200"
-                  : "border-slate-300 text-slate-600",
+    <div className="relative h-full min-h-0 overflow-hidden p-2 md:p-3">
+      <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] gap-3">
+        <div className="min-h-0 overflow-hidden">
+          <div className="flex min-w-0 gap-3 overflow-x-auto pb-1 hide-scrollbar">
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className={cn(
+                "flex h-9 w-9 items-center justify-center rounded-xl border border-border",
+                readerConnected ? "bg-primary/10 text-primary" : "bg-rose-500/10 text-rose-300",
               )}
-            >
-              {readerConnected ? "Reader Online" : "Reader Offline"}
-            </Badge>
-            <Badge
-              variant={cameraActive ? "secondary" : "outline"}
-              className={cn(
-                cameraActive ? "bg-cyan-100 text-cyan-800" : "border-slate-300 text-slate-600",
-              )}
-            >
-              {cameraActive ? "Camera Ready" : "Camera Blocked"}
-            </Badge>
-            <Badge variant="outline" className="border-slate-200 text-slate-700">
-              {pythonTrainedCount} trained / {pythonRosterCount} enrolled
-            </Badge>
-          </div>
-        </CardContent>
-      </Card>
-
-      <div className="grid flex-1 min-h-0 gap-2 xl:grid-cols-[1.65fr_0.85fr]">
-        <Card className="h-full overflow-hidden border-border/60 shadow-sm">
-          <CardContent className="flex h-full flex-col gap-2 p-3">
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-              <h2 className="text-xl font-semibold text-foreground">Live gate camera</h2>
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                {readerConnected ? <Wifi className="size-4 text-emerald-600" /> : <WifiOff className="size-4" />}
-                <span>{readerSourceDeviceId ?? readerEndpointLabel}</span>
+              >
+                {readerConnected ? <Wifi className="size-4.5" /> : <WifiOff className="size-4.5" />}
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Reader State</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{readerConnected ? "Online" : "Offline"}</p>
               </div>
             </div>
 
-            <div className="relative flex-1 overflow-hidden rounded-[1.6rem] border border-border/60 bg-slate-950 min-h-[320px]">
-              <div ref={cameraViewportRef} className="h-full w-full overflow-hidden">
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  muted
-                  playsInline
-                  className={`h-full w-full object-cover transition-opacity duration-300 ${
-                    cameraActive ? "opacity-100" : "opacity-0"
-                  }`}
-                />
-                {!cameraActive && (
-                  <div className="absolute inset-0 flex h-full items-center justify-center px-6 text-center text-white/80">
-                    <div className="space-y-3">
-                      <Camera className="mx-auto size-8 text-white/65" />
-                      <p>{cameraError ?? "Starting the webcam preview..."}</p>
-                      {cameraError && (
-                        <Button type="button" variant="secondary" onClick={() => setCameraRetryToken((value) => value + 1)}>
-                          <RefreshCcw className="mr-2 size-4" />
-                          Retry Camera
-                        </Button>
-                      )}
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className={cn(
+                "flex h-9 w-9 items-center justify-center rounded-xl border border-border",
+                cameraActive ? "bg-primary/10 text-primary" : "bg-rose-500/10 text-rose-300",
+              )}
+              >
+                <Camera className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Camera Status</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{cameraActive ? "Live" : "Blocked"}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-sky-500/10 text-sky-300">
+                <ShieldCheck className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Gate State</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{busy ? "Verifying" : sensorWindowActive ? "Active" : "Ready"}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-violet-500/10 text-violet-300">
+                <Clock className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Last Detection</p>
+                <p className="mt-1 truncate font-mono text-base font-semibold text-foreground">{lastDetectedDisplay}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-amber-500/10 text-amber-300">
+                <Users className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">People in View</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{liveTrackedFaces.length}</p>
+              </div>
+            </div>
+
+            <div className="flex min-w-[160px] flex-1 items-center gap-3 rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl border border-border bg-primary/10 text-primary">
+                <CheckCircle2 className="size-4.5" />
+              </div>
+              <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Matches Today</p>
+                <p className="mt-1 text-base font-semibold text-foreground">{gateEventsTodayQuery.isLoading ? "--" : matchesToday}</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid min-h-0 grid-cols-[minmax(0,7fr)_minmax(0,3fr)] gap-4">
+          <div className="grid min-h-0 grid-rows-[minmax(0,1fr)_auto] gap-3">
+            <Card className="panel-card min-h-0 overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+              <CardContent className="flex h-full min-h-0 flex-col gap-2 p-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Live Gate View</p>
+                  <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                    <span className={cn("h-2 w-2 rounded-full", cameraActive ? "bg-primary" : "bg-muted-foreground/60")} />
+                    {cameraActive ? "Streaming" : "Offline"}
+                  </div>
+                </div>
+
+                <div className={cn("relative min-h-0 flex-1 overflow-hidden rounded-xl border bg-black", cameraFrameTone)}>
+                  <div ref={cameraViewportRef} className="h-full w-full overflow-hidden">
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      className={`h-full w-full object-cover transition-opacity duration-300 ${
+                        cameraActive ? "opacity-100" : "opacity-0"
+                      }`}
+                    />
+                    {!cameraActive && (
+                      <div className="absolute inset-0 flex h-full items-center justify-center px-6 text-center text-white/80">
+                        <div className="grid gap-3">
+                          <Camera className="mx-auto size-8 text-white/65" />
+                          <p>{cameraError ?? "Starting the webcam preview..."}</p>
+                          {cameraError && (
+                            <Button type="button" variant="secondary" onClick={() => setCameraRetryToken((value) => value + 1)}>
+                              <RefreshCcw className="mr-2 size-4" />
+                              Retry Camera
+                            </Button>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                    <canvas ref={canvasRef} className="hidden" />
+                  </div>
+
+                  <div className="pointer-events-none absolute inset-0">
+                    {liveTrackedFaces.map((face) => (
+                      <div
+                        key={`track-${face.trackId}`}
+                        className={cn(
+                          "absolute rounded-xl border-[3px] transition-all duration-150",
+                          face.verified || face.source === "python"
+                            ? "border-primary shadow-[0_0_0_1px_rgba(34,197,94,0.35),0_0_24px_rgba(34,197,94,0.16)]"
+                            : "border-sky-300 shadow-[0_0_0_1px_rgba(125,211,252,0.25),0_0_20px_rgba(56,189,248,0.12)]",
+                        )}
+                        style={{
+                          left: `${face.leftPct}%`,
+                          top: `${face.topPct}%`,
+                          width: `${face.widthPct}%`,
+                          height: `${face.heightPct}%`,
+                        }}
+                      >
+                        <div className="absolute left-0 top-0 max-w-[calc(100%+7rem)] -translate-y-[calc(100%+0.42rem)] rounded-full bg-black/75 px-3 py-1 text-[10px] font-semibold tracking-[0.14em] text-white shadow-lg">
+                          {face.verified || face.source === "python"
+                            ? `${face.label}${face.employeeCode ? ` ${face.employeeCode}` : ""} ${face.movement}${typeof face.confidence === "number" ? ` ${formatPercent(face.confidence)}` : ""}`
+                            : `TRACK ${String(face.trackId).padStart(2, "0")} ${face.movement}`}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {cameraActive && (
+                    <div className="pointer-events-none absolute left-3 top-3 flex items-center gap-2 rounded-lg bg-black/60 px-3 py-2 text-xs font-semibold text-white/90">
+                      <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
+                      REC
+                    </div>
+                  )}
+
+                  <div className="pointer-events-none absolute right-2 top-2 flex items-center gap-2">
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-semibold text-white/90">{comPortLabel}</div>
+                    <div className="flex items-center gap-2 rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-semibold text-white/90">
+                      <span className={cn("h-2.5 w-2.5 rounded-full", cameraActive ? "bg-primary" : "bg-muted-foreground/60")} />
+                      Live
                     </div>
                   </div>
+
+                  <div className="pointer-events-none absolute bottom-2 left-2 flex items-center gap-2">
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">Mode: Normal</div>
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">Tags: {activeReaderTags.length}</div>
+                  </div>
+
+                  <div className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-2">
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">People: {liveTrackedFaces.length}</div>
+                    <div className="rounded-lg bg-black/60 px-2.5 py-1.5 text-[11px] font-medium text-white/85">Matches: {liveMatchedCount}</div>
+                  </div>
+
+                  {busy && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/42 backdrop-blur-[2px]">
+                      <div className="rounded-2xl bg-black/70 px-5 py-4 text-center text-sm text-white shadow-lg">
+                        <div className="flex items-center justify-center gap-2">
+                          <Loader2 className="size-4 animate-spin" />
+                          <span>
+                            {isCapturingFrames
+                              ? `Capturing frame ${captureProgress} / ${GATE_FRAME_COUNT}`
+                              : "Sending frames to Python verifier"}
+                          </span>
+                        </div>
+                        {isCapturingFrames && (
+                          <p className="mt-2 text-xs text-white/70">{getCaptureMessage(captureProgress)}</p>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {!cameraActive && cameraError && (
+                  <Alert className="rounded-xl border-amber-500/30 bg-amber-500/10">
+                    <AlertCircle className="size-4 text-amber-200" />
+                    <AlertTitle>Camera access is required</AlertTitle>
+                    <AlertDescription>{cameraError}</AlertDescription>
+                  </Alert>
                 )}
-                <canvas ref={canvasRef} className="hidden" />
-              </div>
+              </CardContent>
+            </Card>
 
-              <div className="pointer-events-none absolute inset-0">
-                {liveTrackedFaces.map((face) => (
-                  <div
-                    key={`track-${face.trackId}`}
-                    className={cn(
-                      "absolute rounded-[1.35rem] border-[3px] shadow-[0_0_0_1px_rgba(255,255,255,0.18),0_0_22px_rgba(15,23,42,0.14)] transition-all duration-150",
-                      face.verified || face.source === "python"
-                        ? "border-emerald-300 shadow-[0_0_0_1px_rgba(110,231,183,0.5),0_0_24px_rgba(16,185,129,0.2)]"
-                        : "border-cyan-300 shadow-[0_0_0_1px_rgba(34,211,238,0.45),0_0_22px_rgba(34,211,238,0.18)]",
-                    )}
-                    style={{
-                      left: `${face.leftPct}%`,
-                      top: `${face.topPct}%`,
-                      width: `${face.widthPct}%`,
-                      height: `${face.heightPct}%`,
-                    }}
-                  >
-                    <div className="absolute left-0 top-0 max-w-[calc(100%+7rem)] -translate-y-[calc(100%+0.42rem)] rounded-full bg-black/80 px-3 py-1 text-[10px] font-semibold tracking-[0.12em] text-white shadow-lg">
-                      {face.verified || face.source === "python"
-                        ? `${face.label}${face.employeeCode ? ` ${face.employeeCode}` : ""} ${face.movement}${typeof face.confidence === "number" ? ` ${formatPercent(face.confidence)}` : ""}`
-                        : `TRACK ${String(face.trackId).padStart(2, "0")} ${face.movement}`}
-                    </div>
-                  </div>
-                ))}
-                <div className="absolute left-1/2 top-4 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-[10px] font-semibold tracking-[0.28em] text-white/90">
-                  {liveRecognitionMode === "python"
-                    ? "FAST TRACKER + PYTHON NAMES"
-                    : liveTrackerAvailable === false
-                      ? "PYTHON LIVE RECOGNITION"
-                      : "FAST LIVE FACE TRACKER"}
+            <div className="grid gap-3 lg:grid-cols-[minmax(260px,420px)_140px_140px]">
+              <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+                <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+                  <span className="font-semibold uppercase tracking-[0.14em]">Scan Progress</span>
+                  <span className="font-mono">{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "Idle"}</span>
+                </div>
+                <div className="mt-2">
+                  <Progress
+                    className="h-1"
+                    value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0}
+                  />
                 </div>
               </div>
 
-              {busy && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/40 backdrop-blur-[2px]">
-                  <div className="rounded-2xl bg-black/70 px-5 py-4 text-center text-sm text-white shadow-lg">
-                    <div className="flex items-center justify-center gap-2">
-                      <Loader2 className="size-4 animate-spin" />
-                      <span>
-                        {isCapturingFrames
-                          ? `Capturing frame ${captureProgress} / ${GATE_FRAME_COUNT}`
-                          : "Sending frames to Python verifier"}
-                      </span>
-                    </div>
-                    {isCapturingFrames && (
-                      <p className="mt-2 text-xs text-white/70">{getCaptureMessage(captureProgress)}</p>
-                    )}
-                  </div>
-                </div>
-              )}
+              <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">People</p>
+                <p className="mt-1 text-xl font-semibold text-foreground">{liveTrackedFaces.length}</p>
+              </div>
+
+              <div className="rounded-xl border border-border bg-card px-3 py-2 shadow-sm">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Matches</p>
+                <p className="mt-1 text-xl font-semibold text-foreground">{liveMatchedCount}</p>
+              </div>
             </div>
+          </div>
 
-            <div className="space-y-2 text-xs text-muted-foreground overflow-auto">
+          <Card className={cn("panel-card min-h-0 overflow-hidden rounded-xl border border-border bg-card shadow-sm", lastResultTone)}>
+            <CardContent className="flex h-full min-h-0 flex-col p-4">
               <div className="flex items-center justify-between">
-                <span>Scan progress</span>
-                <span>{isCapturingFrames ? `${captureProgress}/${GATE_FRAME_COUNT}` : "Idle"}</span>
+                <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Current Verification</p>
+                <Badge
+                  variant="outline"
+                  className={cn(
+                    "rounded-full px-3 py-1.5",
+                    !lastResult
+                      ? "border-border bg-background/10 text-muted-foreground"
+                      : lastResult.ignored
+                        ? "border-amber-500/35 bg-amber-500/10 text-amber-200"
+                        : lastResult.success
+                          ? "border-primary/35 bg-primary/10 text-primary"
+                          : "border-rose-500/35 bg-rose-500/10 text-rose-200",
+                  )}
+                >
+                  {lastResult
+                    ? lastResult.ignored
+                      ? "Ignored"
+                      : lastResult.success
+                        ? lastResult.action ?? "Approved"
+                        : "Denied"
+                    : "Idle"}
+                </Badge>
               </div>
-              <Progress value={isCapturingFrames ? (captureProgress / GATE_FRAME_COUNT) * 100 : 0} />
-              <p>
-                {liveTrackerAvailable === false
-                  ? `${liveRecognitionMessage ?? "Python live recognition is active."} Faces: ${liveTrackedFaces.length}, names: ${liveMatchedCount}.`
-                  : liveRecognitionMode === "python"
-                    ? `${liveRecognitionMessage ?? "Tracking with Python names."} Tracks: ${browserTrackedFaces.length}, names: ${liveMatchedCount}.`
-                    : `${liveRecognitionMessage ?? "Tracking locally while Python samples frames."} Tracks: ${browserTrackedFaces.length}, names: ${liveMatchedCount}.`}
-              </p>
-            </div>
 
-            <div className="grid gap-2 sm:grid-cols-3">
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Detection</p>
-                <p className="mt-1 font-mono text-sm text-foreground">{lastDetectedDisplay}</p>
-              </div>
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Queue</p>
-                <p className="mt-1 text-sm text-foreground">
-                  {pendingReaderScan ? `Waiting ${pendingReaderScan.rfidUid}` : "No queued UHF tag"}
-                </p>
-              </div>
-              <div className="rounded-2xl border border-border/60 bg-muted/20 px-3 py-2">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Reader Channel</p>
-                <p className="mt-1 text-sm text-foreground">{readerConnected ? `Live (${activeReaderTags.length} active)` : "Offline"}</p>
-              </div>
-            </div>
-
-            <div className="rounded-2xl border border-border/60 bg-muted/15 px-3 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <p className="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Active Reader Tags</p>
-                <Badge variant="outline">{activeReaderTags.length}</Badge>
-              </div>
-              {!activeReaderTags.length ? (
-                <p className="mt-2 text-sm text-muted-foreground">No active UHF tags in the read zone.</p>
-              ) : (
-                <div className="mt-2 space-y-2">
-                  {activeReaderTags.slice(0, 4).map((tag) => (
-                    <div
-                      key={tag.epc}
-                      className="flex items-center justify-between gap-3 rounded-xl border border-border/50 bg-white/80 px-3 py-2"
-                    >
-                      <p className="min-w-0 truncate font-mono text-xs text-foreground">{tag.epc}</p>
-                      <p className="shrink-0 text-[11px] text-muted-foreground">{tag.idle_seconds.toFixed(1)}s idle</p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-
-        <div className="space-y-3 w-full xl:max-w-[360px] xl:justify-self-end min-h-0 overflow-auto hide-scrollbar">
-          <Card className={cn("border shadow-sm", lastResultTone)}>
-            <CardContent className="space-y-2 p-3">
-              <div className="flex items-start gap-4 md:gap-5">
-                <Avatar className="size-28 rounded-[2rem] border border-white/60 shadow-sm">
-                  <AvatarImage src={latestProfileImage ?? undefined} alt={latestEmployee?.name ?? "Latest gate preview"} />
-                  <AvatarFallback className="rounded-[2rem] bg-slate-200 text-lg font-semibold text-slate-700">
+              <div className="mt-4 flex items-center gap-4">
+                <Avatar className="size-16 rounded-full border border-border shadow-sm">
+                  <AvatarImage src={latestProfileImage ?? undefined} alt={latestEmployee?.name ?? "Current verification"} />
+                  <AvatarFallback className="rounded-full bg-background/30 text-base font-semibold text-foreground">
                     {getEmployeeInitials(latestEmployee)}
                   </AvatarFallback>
                 </Avatar>
-
                 <div className="min-w-0 flex-1">
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                        Latest Verification
-                      </p>
-                      <h2 className="truncate text-lg font-semibold text-foreground leading-tight">
-                        {latestEmployee?.name ?? "Waiting for the next UHF detection"}
-                      </h2>
-                      <p className="truncate text-sm text-muted-foreground">
-                        {latestEmployee
-                          ? `${latestEmployee.employeeCode} - ${latestEmployee.department}`
-                          : "Present a UHF tag or enter an EPC manually to start the Python face scan."}
-                      </p>
-                    </div>
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        "shrink-0",
-                        !lastResult
-                          ? "border-slate-300 text-slate-600"
-                          : lastResult.ignored
-                            ? "border-amber-300 bg-amber-100 text-amber-700"
-                          : lastResult.success
-                            ? "border-emerald-300 bg-emerald-100 text-emerald-700"
-                            : "border-rose-300 bg-rose-100 text-rose-700",
-                      )}
-                    >
-                      {lastResult
-                        ? lastResult.ignored
-                          ? "IGNORED"
-                          : lastResult.success
-                          ? lastResult.action ?? "MATCHED"
-                          : "REJECTED"
-                        : "IDLE"}
-                    </Badge>
+                  <p className="text-xl font-semibold text-foreground">
+                    {latestEmployee?.name ?? "Waiting for a scan"}
+                  </p>
+                  <p className="mt-1 truncate text-sm text-muted-foreground">
+                    {latestEmployee
+                      ? `${latestEmployee.employeeCode} - ${latestEmployee.department}`
+                      : "Present a badge or use Manual Trigger."}
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 overflow-hidden rounded-xl border border-border bg-background/5">
+                <div className="grid grid-cols-2">
+                  <div className="col-span-2 min-w-0 border-b border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Badge ID</p>
+                    <p className="mt-2 whitespace-normal font-mono text-sm leading-snug text-foreground [overflow-wrap:anywhere] [word-break:break-word]">
+                      {(lastResult?.badgeOwner?.rfidUid ?? normalizedRfidUid) || "--"}
+                    </p>
+                  </div>
+                  <div className="min-w-0 border-b border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Latency</p>
+                    <p className="mt-2 whitespace-nowrap text-sm font-semibold text-foreground">{lastResult ? `${lastResult.latencyMs} ms` : "--"}</p>
                   </div>
 
-                  <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Badge</p>
-                      <p className="mt-1 font-mono text-foreground">
-                        {(lastResult?.badgeOwner?.rfidUid ?? normalizedRfidUid) || "--"}
-                      </p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Latency</p>
-                      <p className="mt-1 font-mono text-foreground">
-                        {lastResult ? `${lastResult.latencyMs} ms` : "--"}
-                      </p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Match</p>
-                      <p className="mt-1 font-mono text-foreground">{formatPercent(lastResult?.matchConfidence)}</p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Direction</p>
-                      <p className="mt-1 font-mono text-foreground">
-                        {lastResult?.movementDirection ?? "--"} {lastResult ? `(${formatPercent(lastResult.movementConfidence)})` : ""}
-                      </p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Verified At</p>
-                      <p className="mt-1 font-mono text-foreground">{lastResult?.verifiedAt ?? "--"}</p>
-                    </div>
-                    <div className="rounded-xl bg-white/80 p-2">
-                      <p className="uppercase tracking-[0.18em] text-muted-foreground">Source</p>
-                      <p className="mt-1 font-mono text-foreground">{lastResult?.source ?? "--"}</p>
-                    </div>
+                  <div className="min-w-0 border-b border-l border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Direction</p>
+                    <p className="mt-2 truncate text-sm font-semibold text-foreground">{lastResult?.movementDirection ?? "--"}</p>
+                  </div>
+                  <div className="min-w-0 border-b border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Face Match</p>
+                    <p className="mt-2 whitespace-nowrap text-sm font-semibold text-foreground">{formatPercent(lastResult?.matchConfidence)}</p>
+                  </div>
+
+                  <div className="min-w-0 border-b border-l border-border p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Verified At</p>
+                    <p className="mt-2 truncate text-sm font-semibold text-foreground">{lastResult?.verifiedAt ?? "--"}</p>
+                  </div>
+                  <div className="col-span-2 min-w-0 p-3">
+                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">Source</p>
+                    <p className="mt-2 truncate text-sm font-semibold capitalize text-foreground">{lastResult?.source ?? "--"}</p>
                   </div>
                 </div>
               </div>
 
               <Alert className={cn(
+                "mt-4 rounded-xl border",
                 !lastResult
-                  ? "border-slate-200 bg-white/75"
+                  ? "border-border bg-background/10"
                   : lastResult.ignored
-                    ? "border-amber-200 bg-amber-50"
-                  : lastResult.success
-                    ? "border-emerald-200 bg-emerald-50"
-                    : "border-rose-200 bg-rose-50",
-              )}>
+                    ? "border-amber-500/30 bg-amber-500/10"
+                    : lastResult.success
+                      ? "border-primary/30 bg-primary/10"
+                      : "border-rose-500/30 bg-rose-500/10",
+              )}
+              >
                 {lastResult ? (
                   lastResult.ignored ? (
-                    <AlertCircle className="size-4 text-amber-700" />
+                    <AlertCircle className="size-4 text-amber-200" />
                   ) : lastResult.success ? (
-                    <CheckCircle2 className="size-4 text-emerald-600" />
+                    <CheckCircle2 className="size-4 text-primary" />
                   ) : (
-                    <AlertCircle className="size-4 text-rose-600" />
+                    <AlertCircle className="size-4 text-rose-200" />
                   )
                 ) : (
-                  <ShieldCheck className="size-4 text-slate-500" />
+                  <ShieldCheck className="size-4 text-muted-foreground" />
                 )}
-                <AlertTitle>
+                <AlertTitle className="text-foreground">
                   {lastResult?.ignored
-                    ? "Duplicate ignored"
+                    ? "Scan ignored"
                     : lastResult?.success
                       ? "Access granted"
                       : lastResult
                         ? "Access denied"
                         : "Ready for next employee"}
                 </AlertTitle>
-                {lastResult?.message && (
-                  <AlertDescription>{lastResult.message}</AlertDescription>
-                )}
+                {lastResult?.message && <AlertDescription className="text-muted-foreground">{lastResult.message}</AlertDescription>}
               </Alert>
 
-              {lastResult?.matchDetails && (
-                <div className="rounded-2xl border border-border/60 bg-white/75 px-4 py-3 font-mono text-[11px] leading-6 text-muted-foreground">
-                  Primary {formatPercent(lastResult.matchDetails.primaryConfidence)} | Anchor avg {formatPercent(lastResult.matchDetails.anchorAverage)} | Stable {formatPercent(lastResult.matchDetails.liveConsistency)}
-                </div>
-              )}
-
-              {latestFaceMeta && (
-                <div className="rounded-2xl border border-border/60 bg-white/70 px-4 py-3 text-sm">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="font-medium text-foreground">Roster profile</span>
-                    <Badge
-                      variant="outline"
-                      className={cn(
-                        latestFaceMeta.status === "trained"
-                          ? "border-emerald-300 bg-emerald-100 text-emerald-700"
-                          : latestFaceMeta.status === "training"
-                            ? "border-sky-300 bg-sky-100 text-sky-700"
-                            : "border-amber-300 bg-amber-100 text-amber-700",
-                      )}
-                    >
-                      {latestFaceMeta.status}
-                    </Badge>
-                  </div>
-                  <p className="mt-2 text-muted-foreground">
-                    {latestFaceMeta.datasetSampleCount} dataset photos enrolled for this employee.
-                  </p>
-                  {latestFaceMeta.lastTrainingMessage && (
-                    <p className="mt-1 text-xs text-muted-foreground">{latestFaceMeta.lastTrainingMessage}</p>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          <Card className="border-border/60 shadow-sm">
-            <CardContent className="space-y-3 p-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
-                  Manual Trigger
-                </p>
-                <h2 className="mt-1 text-xl font-semibold text-foreground">UHF event + face burst</h2>
-              </div>
-
-              <form className="space-y-4" onSubmit={handleManualSubmit}>
-                <div className="space-y-2">
-                  <Label htmlFor="gate-scan-technology">RFID Technology</Label>
-                  <div
-                    id="gate-scan-technology"
-                    className="flex min-h-10 items-center rounded-md border border-border/70 bg-muted/20 px-3 text-sm font-medium text-foreground"
-                  >
-                    UHF RFID continuous stream
-                  </div>
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="gate-rfid" className="flex items-center gap-2">
-                    <KeyRound className="size-4" />
-                    RFID UID
-                  </Label>
-                  <Input
-                    id="gate-rfid"
-                    placeholder="Present a tag or type E2..."
-                    className="font-mono uppercase tracking-[0.2em]"
-                    value={rfidUid}
-                    onChange={(event) => setRfidUid(event.target.value.toUpperCase())}
-                    disabled={busy}
-                  />
-                </div>
-
-                {!!readerMessage && (
-                  <div className="rounded-2xl border border-dashed border-border/70 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
-                    <div className="flex items-start gap-2">
-                      <ScanLine className="mt-0.5 size-4 shrink-0" />
-                      <div className="space-y-1">
-                        <p>{readerMessage}</p>
-                        <p className="text-[11px] uppercase tracking-[0.16em] text-muted-foreground">
-                          Source: {readerSourceDeviceId ?? readerEndpointLabel}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                <Button
-                  type="submit"
-                  size="lg"
-                  className="w-full"
-                  disabled={busy || !normalizedRfidUid || !cameraActive}
-                >
-                  {isCapturingFrames ? (
-                    <>
-                      <Loader2 className="mr-2 size-4 animate-spin" />
-                      Capturing Frames...
-                    </>
-                  ) : scanMutation.isPending ? (
-                    <>
-                      <Loader2 className="mr-2 size-4 animate-spin" />
-                      Verifying in Python...
-                    </>
-                  ) : (
-                    <>
-                      <ArrowLeftRight className="mr-2 size-4" />
-                      Scan Badge and Verify Face
-                    </>
-                  )}
+              <div className="mt-auto pt-4">
+                <Button type="button" size="lg" className="w-full rounded-xl" onClick={handleReadyForNext}>
+                  Ready for next employee
                 </Button>
-              </form>
+              </div>
             </CardContent>
           </Card>
-
-          {!cameraActive && cameraError && (
-            <Alert className="border-amber-200 bg-amber-50">
-              <AlertCircle className="size-4 text-amber-700" />
-              <AlertTitle>Camera access is required</AlertTitle>
-              <AlertDescription>{cameraError}</AlertDescription>
-            </Alert>
-          )}
         </div>
       </div>
+
+      <Dialog open={manualTriggerOpen} onOpenChange={setManualTriggerOpen}>
+        <DialogContent className="max-w-md rounded-xl border-border bg-card p-0 text-foreground shadow-[0_30px_120px_rgba(0,0,0,0.65)]">
+          <div className="border-b border-border px-5 py-4">
+            <DialogHeader className="space-y-1 text-left">
+              <DialogTitle className="text-lg font-semibold text-foreground">Manual Trigger</DialogTitle>
+              <DialogDescription className="text-sm text-muted-foreground">
+                Enter a badge ID to run verification on demand.
+              </DialogDescription>
+            </DialogHeader>
+          </div>
+          <div className="px-5 py-5">
+            <form className="grid gap-4" onSubmit={handleManualSubmit}>
+              <div className="grid gap-2">
+                <Label htmlFor="gate-rfid" className="flex items-center gap-2">
+                  <KeyRound className="size-4" />
+                  RFID UID
+                </Label>
+                <Input
+                  id="gate-rfid"
+                  placeholder="Type badge ID"
+                  className="h-11 font-mono uppercase tracking-[0.18em]"
+                  value={rfidUid}
+                  onChange={(event) => setRfidUid(event.target.value.toUpperCase())}
+                  disabled={busy}
+                />
+              </div>
+
+              {!!readerMessage && (
+                <div className="rounded-xl border border-dashed border-border bg-background/10 px-4 py-3 text-sm text-muted-foreground">
+                  <div className="flex items-start gap-2">
+                    <ScanLine className="mt-0.5 size-4 shrink-0" />
+                    <p>{readerMessage}</p>
+                  </div>
+                </div>
+              )}
+
+              <Button
+                type="submit"
+                size="lg"
+                className="w-full rounded-xl"
+                disabled={busy || !normalizedRfidUid || !cameraActive}
+              >
+                {isCapturingFrames ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    Capturing Frames...
+                  </>
+                ) : scanMutation.isPending ? (
+                  <>
+                    <Loader2 className="mr-2 size-4 animate-spin" />
+                    Verifying in Python...
+                  </>
+                ) : (
+                  <>
+                    <ArrowLeftRight className="mr-2 size-4" />
+                    Verify Badge and Face
+                  </>
+                )}
+              </Button>
+            </form>
+          </div>
+        </DialogContent>
+      </Dialog>
+
     </div>
   );
 }
+
+
+
+
+
+
