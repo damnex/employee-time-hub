@@ -535,6 +535,16 @@ function selectPrimaryScanFace(
   if (
     second
     && !bestMatchesBadgeOwner
+  ) {
+    return {
+      target: null as LiveTrackedFace | null,
+      candidateCount: candidates.length,
+      reason: "Multiple people are in the verification lane. Keep only the badge owner centered before scanning.",
+    };
+  }
+
+  if (
+    second
     && best.score - second.score < SCAN_TARGET_AMBIGUITY_GAP
   ) {
     return {
@@ -620,17 +630,20 @@ function getTrackedFaceSourceCrop(
   const sourceTop = (viewportTop - offsetY) / scale;
   const sourceWidth = viewportWidthPx / scale;
   const sourceHeight = viewportHeightPx / scale;
-  const sourceRight = sourceLeft + sourceWidth;
-  const sourceBottom = sourceTop + sourceHeight;
-
-  const horizontalPadding = sourceWidth * 0.6;
-  const topPadding = sourceHeight * 0.5;
-  const bottomPadding = sourceHeight * 0.95;
-
-  const cropLeft = clampValue(sourceLeft - horizontalPadding, 0, video.videoWidth);
-  const cropTop = clampValue(sourceTop - topPadding, 0, video.videoHeight);
-  const cropRight = clampValue(sourceRight + horizontalPadding, 0, video.videoWidth);
-  const cropBottom = clampValue(sourceBottom + bottomPadding, 0, video.videoHeight);
+  const centerX = sourceLeft + sourceWidth / 2;
+  const centerY = sourceTop + sourceHeight * 0.54;
+  const cropWidthTarget = Math.min(
+    video.videoWidth,
+    Math.max(sourceWidth * 1.7, video.videoWidth * 0.2),
+  );
+  const cropHeightTarget = Math.min(
+    video.videoHeight,
+    Math.max(sourceHeight * 2.05, video.videoHeight * 0.32),
+  );
+  const cropLeft = clampValue(centerX - cropWidthTarget / 2, 0, video.videoWidth);
+  const cropTop = clampValue(centerY - cropHeightTarget * 0.42, 0, video.videoHeight);
+  const cropRight = clampValue(cropLeft + cropWidthTarget, 0, video.videoWidth);
+  const cropBottom = clampValue(cropTop + cropHeightTarget, 0, video.videoHeight);
   const cropWidth = Math.max(1, cropRight - cropLeft);
   const cropHeight = Math.max(1, cropBottom - cropTop);
 
@@ -1380,7 +1393,8 @@ export default function GateTerminal() {
 
     if (!scanTarget.target) {
       setLastResult({
-        success: false,
+        success: true,
+        ignored: true,
         message: scanTarget.reason ?? "Keep one clear face in view before scanning again.",
         employee: badgeOwner,
         badgeOwner,
