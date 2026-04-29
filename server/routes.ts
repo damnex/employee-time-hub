@@ -2,7 +2,7 @@ import type { Express } from "express";
 import type { Server } from "http";
 import { promises as fs } from "fs";
 import { storage } from "./storage";
-import { allowInsecureFaceFallback, allowPythonGateFrameAppend, useTriggeredCameraFaceRecognition } from "./env";
+import { allowInsecureFaceFallback, useTriggeredCameraFaceRecognition } from "./env";
 import { api } from "@shared/routes";
 import {
   faceProfileSchema,
@@ -43,8 +43,6 @@ import { stopManagedRfidService, warmRfidService } from "./rfid-service";
 import { handleRfidIntegration } from "./rfid-handler";
 import { handleVisionIntegration } from "./vision-handler";
 import { handleFaceIntegration } from "./face-handler";
-import { addRFID } from "./buffer";
-import { refreshScoreMatrix } from "./score-matrix";
 import { decisionEngine } from "./decision-engine";
 const SESSION_TIMEOUT_SWEEP_MS = 1000;
 type AttendanceAction = "ENTRY" | "EXIT";
@@ -773,6 +771,51 @@ function buildTriggeredCameraMatchDetails(matchConfidence: number): FaceMatchDet
   };
 }
 
+function resolveBestMovementSignal(args: {
+  inputDirection?: MovementDirection;
+  inputConfidence?: number;
+  verificationDirection?: MovementDirection;
+  verificationConfidence?: number;
+}): {
+  movementDirection: MovementDirection;
+  movementConfidence: number;
+} {
+  const inputDirection = args.inputDirection === "ENTRY" || args.inputDirection === "EXIT"
+    ? args.inputDirection
+    : "UNKNOWN";
+  const verificationDirection = args.verificationDirection === "ENTRY" || args.verificationDirection === "EXIT"
+    ? args.verificationDirection
+    : "UNKNOWN";
+  const inputConfidence = inputDirection === "UNKNOWN" ? 0 : args.inputConfidence ?? 0;
+  const verificationConfidence = verificationDirection === "UNKNOWN" ? 0 : args.verificationConfidence ?? 0;
+
+  if (inputConfidence >= DIRECTION_CONFIDENCE_THRESHOLD && inputConfidence >= verificationConfidence) {
+    return {
+      movementDirection: inputDirection,
+      movementConfidence: roundMetric(inputConfidence),
+    };
+  }
+
+  if (verificationConfidence > 0) {
+    return {
+      movementDirection: verificationDirection,
+      movementConfidence: roundMetric(verificationConfidence),
+    };
+  }
+
+  if (inputConfidence > 0) {
+    return {
+      movementDirection: inputDirection,
+      movementConfidence: roundMetric(inputConfidence),
+    };
+  }
+
+  return {
+    movementDirection: verificationDirection !== "UNKNOWN" ? verificationDirection : inputDirection,
+    movementConfidence: roundMetric(Math.max(inputConfidence, verificationConfidence)),
+  };
+}
+
 async function syncPythonFaceMetadataForEmployees(
   employees: Employee[],
   options: {
@@ -922,6 +965,12 @@ async function processPythonRfidScan(args: {
     const verification = await verifyGateFramesWithPython(input.faceFrames);
     const matchConfidence = verification.matchConfidence;
     const matchDetails = buildPythonMatchDetails(matchConfidence);
+    const resolvedMovement = resolveBestMovementSignal({
+      inputDirection: input.movementDirection,
+      inputConfidence: input.movementConfidence,
+      verificationDirection: verification.movementDirection,
+      verificationConfidence: verification.movementConfidence,
+    });
     const detectedFaceLabel = verification.employee?.displayName
       ?? (verification.framesWithFace ? "Unknown Face" : undefined);
     const detectedFaceBox = verification.bestBox ?? null;
@@ -942,26 +991,26 @@ async function processPythonRfidScan(args: {
           ? salvageFace.distance <= verification.distanceThreshold * 1.15
           : false;
         if (goodConfidence || goodDistance) {
-        matchesBadgeOwner = true;
-        matchedEmployeeCode = employee.employeeCode;
-        matchedRfidUid = employee.rfidUid.toUpperCase();
-        verification.verified = true;
-        verification.employee = {
-          folderName: salvageFace.label,
-          displayName: employee.name,
-          employeeCode: employee.employeeCode,
-          department: employee.department,
-          rfidUid: employee.rfidUid,
-          sampleCount: verification.employee?.sampleCount ?? undefined,
-        };
-        verification.matchConfidence = salvageFace.confidence;
-        verification.bestDistance = salvageFace.distance ?? verification.bestDistance;
-        verification.bestBox = {
-          top: salvageFace.box.top,
-          right: salvageFace.box.right,
-          bottom: salvageFace.box.bottom,
-          left: salvageFace.box.left,
-        };
+          matchesBadgeOwner = true;
+          matchedEmployeeCode = employee.employeeCode;
+          matchedRfidUid = employee.rfidUid.toUpperCase();
+          verification.verified = true;
+          verification.employee = {
+            folderName: salvageFace.label,
+            displayName: employee.name,
+            employeeCode: employee.employeeCode,
+            department: employee.department,
+            rfidUid: employee.rfidUid,
+            sampleCount: verification.employee?.sampleCount ?? undefined,
+          };
+          verification.matchConfidence = salvageFace.confidence;
+          verification.bestDistance = salvageFace.distance ?? verification.bestDistance;
+          verification.bestBox = {
+            top: salvageFace.box.top,
+            right: salvageFace.box.right,
+            bottom: salvageFace.box.bottom,
+            left: salvageFace.box.left,
+          };
           verification.framesWithFace = Math.max(verification.framesWithFace, 1);
           verification.framesProcessed = Math.max(verification.framesProcessed, input.faceFrames.length);
           if (frameSize) {
@@ -1005,8 +1054,8 @@ async function processPythonRfidScan(args: {
         verification.framesWithFace > 0,
         false,
         verification.employee?.rfidUid ?? null,
-        verification.movementDirection,
-        verification.movementConfidence,
+        resolvedMovement.movementDirection,
+        resolvedMovement.movementConfidence,
       );
 
       return logAndReturn({
@@ -1021,22 +1070,22 @@ async function processPythonRfidScan(args: {
         verificationStatus: "FAILED_FACE",
         decision: result.action ?? (result.ignored ? "UNKNOWN" : "REJECTED"),
       });
-      }
+    }
 
-      if (!matchesBadgeOwner) {
-        const result = await resolveAttendanceDecision(
-          employee,
-          now,
-          todayDate,
-          input.deviceId,
-          matchConfidence,
-          correlation,
-          true,
-          false,
-          matchedRfidUid ?? verification.employee.rfidUid ?? null,
-          verification.movementDirection,
-          verification.movementConfidence,
-        );
+    if (!matchesBadgeOwner) {
+      const result = await resolveAttendanceDecision(
+        employee,
+        now,
+        todayDate,
+        input.deviceId,
+        matchConfidence,
+        correlation,
+        true,
+        false,
+        matchedRfidUid ?? verification.employee.rfidUid ?? null,
+        resolvedMovement.movementDirection,
+        resolvedMovement.movementConfidence,
+      );
 
       return logAndReturn({
         ...result,
@@ -1049,8 +1098,8 @@ async function processPythonRfidScan(args: {
       });
     }
 
-    // Only opt in to live gate frame enrichment when explicitly enabled.
-    if (allowPythonGateFrameAppend() && verification.employee.folderName) {
+    // Enrich training data with the latest gate frames for this employee (non-blocking to avoid latency).
+    if (verification.employee.folderName) {
       void appendEmployeeDatasetFrames({
         folderName: verification.employee.folderName,
         frames: input.faceFrames,
@@ -1069,15 +1118,15 @@ async function processPythonRfidScan(args: {
       true,
       true,
       matchedRfidUid,
-      verification.movementDirection,
-      verification.movementConfidence,
+      resolvedMovement.movementDirection,
+      resolvedMovement.movementConfidence,
     );
 
     return logAndReturn({
       ...result,
       matchDetails,
-      movementDirection: verification.movementDirection,
-      movementConfidence: verification.movementConfidence,
+      movementDirection: resolvedMovement.movementDirection,
+      movementConfidence: resolvedMovement.movementConfidence,
       detectedFaceLabel,
       detectedFaceBox,
     }, {
@@ -2136,14 +2185,6 @@ export async function registerRoutes(
       }).parse(req.body);
 
       const normalizedRfidUid = input.rfidUid.trim().toUpperCase();
-      const timestampMs = Date.now();
-
-      addRFID({
-        tag: normalizedRfidUid,
-        timestamp: timestampMs,
-      });
-      refreshScoreMatrix(timestampMs);
-
       const detection = gateMatchingEngine.recordRfidDetection({
         deviceId: input.deviceId,
         rfidUid: normalizedRfidUid,
@@ -2153,7 +2194,6 @@ export async function registerRoutes(
       const fusion = await decisionEngine.ingestRfid({
         deviceId: input.deviceId,
         rfidTag: normalizedRfidUid,
-        timestampMs,
         scanTechnology: input.scanTechnology ?? "UHF_RFID",
       });
       const employee = await storage.getEmployeeByRfid(normalizedRfidUid);
@@ -2250,7 +2290,3 @@ export async function registerRoutes(
 
   return httpServer;
 }
-
-
-
-
